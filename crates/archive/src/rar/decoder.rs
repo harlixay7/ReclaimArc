@@ -1,9 +1,10 @@
-﻿//! FFI wrapper around the official UnRAR library (`unrar_sys`, which vendors
-//! the official RARLab source).
+//! FFI wrapper around the official UnRAR library (`unrar_sys`, which vendors
+//! the official RARLab source version 7.2.7 / RAR 7.23 portable release;
+//! source SHA-256: 01d903a7dcf413cb2925696d7796e48e38d471f79bfe7ef3ad2aebf6c12dbefd).
 //!
 //! This module owns all `unsafe` calls into the C library. The license
 //! boundary is explicit: the vendored UnRAR source keeps its own license
-//! (`unrar_sys/vendor/unrar/license.txt`) and is never re-licensed.
+//! (`vendor/unrar-ng-sys/vendor/unrar/license.txt`) and is never re-licensed.
 //!
 //! Safety model:
 //! - The library is driven strictly sequentially from the first volume.
@@ -15,18 +16,18 @@
 
 use std::ffi::c_int;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use crate::error::ArchiveError;
 use crate::model::ProgressEvent;
 
 use unrar_sys::{
-    Handle, HeaderDataEx, OpenArchiveDataEx, LPARAM, RARCloseArchive, RAROpenArchiveEx,
-    RARProcessFileW, RARReadHeaderEx, UINT, UCM_CHANGEVOLUMEW, UCM_NEEDPASSWORDW, UCM_PROCESSDATA,
-    ERAR_BAD_ARCHIVE, ERAR_BAD_DATA, ERAR_BAD_PASSWORD, ERAR_ECREATE, ERAR_END_ARCHIVE, ERAR_EOPEN,
-    ERAR_EREAD, ERAR_EREFERENCE, ERAR_EWRITE, ERAR_MISSING_PASSWORD, ERAR_UNKNOWN, ERAR_UNKNOWN_FORMAT,
-    RAR_EXTRACT, RAR_OM_EXTRACT, RAR_OM_LIST, RAR_SKIP, RAR_TEST,
+    Handle, HeaderDataEx, OpenArchiveDataEx, RARCloseArchive, RAROpenArchiveEx, RARProcessFileW,
+    RARReadHeaderEx, ERAR_BAD_ARCHIVE, ERAR_BAD_DATA, ERAR_BAD_PASSWORD, ERAR_ECREATE,
+    ERAR_END_ARCHIVE, ERAR_EOPEN, ERAR_EREAD, ERAR_EREFERENCE, ERAR_EWRITE, ERAR_MISSING_PASSWORD,
+    ERAR_UNKNOWN, ERAR_UNKNOWN_FORMAT, LPARAM, RAR_EXTRACT, RAR_OM_EXTRACT, RAR_OM_LIST, RAR_SKIP,
+    RAR_TEST, UCM_CHANGEVOLUMEW, UCM_NEEDPASSWORDW, UCM_PROCESSDATA, UINT,
 };
 
 /// One header as reported by the C library (ground truth for validation).
@@ -87,7 +88,7 @@ extern "C" fn unrar_callback(msg: UINT, user_data: LPARAM, p1: LPARAM, p2: LPARA
     // and the callback is invoked synchronously on the driving thread.
     let ctx: &mut CallbackCtx = unsafe { &mut *(user_data as *mut CallbackCtx) };
     match msg {
-UCM_PROCESSDATA => {
+        UCM_PROCESSDATA => {
             // p1 = unpacked data buffer, p2 = byte count.
             if let Some(cancel) = &ctx.cancel {
                 if cancel.load(Ordering::Relaxed) {
@@ -126,7 +127,7 @@ UCM_PROCESSDATA => {
                 -1
             }
         }
-UCM_CHANGEVOLUMEW => {
+        UCM_CHANGEVOLUMEW => {
             // p1 = next volume name (wide, NUL-terminated).
             // Reject the name when the file does not exist: the DLL would
             // otherwise retry the same open forever (its merge loop accepts
@@ -152,11 +153,14 @@ UCM_CHANGEVOLUMEW => {
     }
 }
 
+static UNRAR_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Open archive handle.
 pub struct Unrar {
     handle: *const Handle,
     ctx: *mut CallbackCtx,
     open_mode: u32,
+    _guard: std::sync::MutexGuard<'static, ()>,
 }
 
 // The handle is only used from one thread at a time.
@@ -172,6 +176,7 @@ impl Unrar {
         password: Option<String>,
         cancel: Option<Arc<AtomicBool>>,
     ) -> Result<Unrar, ArchiveError> {
+        let guard = UNRAR_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let ctx = Box::new(CallbackCtx {
             cancel,
             progress: None,
@@ -183,17 +188,21 @@ impl Unrar {
         });
         let ctx_ptr = Box::into_raw(ctx);
 
-let wide_name = to_wide(&first_volume.to_string_lossy());
+        let wide_name = to_wide(&first_volume.to_string_lossy());
         // Plain RAR_OM_LIST (not _INCSPLIT): the DLL then auto-skips
         // split-before continuation headers, yielding exactly one header per
         // logical file — matching our parser, which merges parts. (INCSPLIT
         // would report every part as a separate header and break the
         // parser↔decoder cross-validation for multipart archives.)
-        let mut data = OpenArchiveDataEx::new(wide_name.as_ptr(), if mode == OpenMode::List {
-            RAR_OM_LIST
-        } else {
-            RAR_OM_EXTRACT
-        });
+        let mut data = OpenArchiveDataEx::new(
+            wide_name.as_ptr(),
+            if mode == OpenMode::List {
+                RAR_OM_LIST
+            } else {
+                RAR_OM_EXTRACT
+            },
+        );
+        data.op_flags |= unrar_sys::ROADOF_SHARED;
         data.callback = Some(unrar_callback);
         data.user_data = ctx_ptr as LPARAM;
 
@@ -211,11 +220,12 @@ let wide_name = to_wide(&first_volume.to_string_lossy());
                 RAR_OM_LIST
             } else {
                 RAR_OM_EXTRACT
-            }
+            },
+            _guard: guard,
         })
     }
 
-/// Read the next file header. Returns `Ok(None)` at end of archive.
+    /// Read the next file header. Returns `Ok(None)` at end of archive.
     pub fn read_header(&mut self) -> Result<Option<RawHeader>, ArchiveError> {
         let h = HeaderDataEx::default();
         let code = unsafe { RARReadHeaderEx(self.handle, &h) };
@@ -225,7 +235,8 @@ let wide_name = to_wide(&first_volume.to_string_lossy());
         if code != 0 {
             return Err(map_process_error(code, "read header"));
         }
-        let name = read_wide(&h.filename_w);
+        let filename_w = h.filename_w;
+        let name = read_wide(&filename_w);
         let pack = ((h.pack_size_high as u64) << 32) | h.pack_size as u64;
         let unp = ((h.unp_size_high as u64) << 32) | h.unp_size as u64;
         Ok(Some(RawHeader {
@@ -261,9 +272,8 @@ let wide_name = to_wide(&first_volume.to_string_lossy());
             // SAFETY: the lifetime of the caller's closure is erased here and
             // restored when the callback dereferences it. The pointer is only
             // valid while process_file is executing (cleared below).
-            let erased: *mut dyn FnMut(ProgressEvent) -> bool = unsafe {
-                std::mem::transmute::<*mut dyn FnMut(ProgressEvent) -> bool, _>(f)
-            };
+            let erased: *mut dyn FnMut(ProgressEvent) -> bool =
+                unsafe { std::mem::transmute::<*mut dyn FnMut(ProgressEvent) -> bool, _>(f) };
             erased
         });
 
@@ -278,12 +288,18 @@ let wide_name = to_wide(&first_volume.to_string_lossy());
             RARProcessFileW(
                 self.handle,
                 op,
-                path_w.as_ref().map(|v| v.as_ptr()).unwrap_or(std::ptr::null()),
-                name_w.as_ref().map(|v| v.as_ptr()).unwrap_or(std::ptr::null()),
+                path_w
+                    .as_ref()
+                    .map(|v| v.as_ptr())
+                    .unwrap_or(std::ptr::null()),
+                name_w
+                    .as_ref()
+                    .map(|v| v.as_ptr())
+                    .unwrap_or(std::ptr::null()),
             )
         };
 
-let ctx = unsafe { &mut *self.ctx };
+        let ctx = unsafe { &mut *self.ctx };
         ctx.progress = None;
 
         if code == 0 {
@@ -334,7 +350,10 @@ fn map_open_error(code: c_int, path: &Path) -> ArchiveError {
         ERAR_BAD_PASSWORD | ERAR_MISSING_PASSWORD => {
             ArchiveError::Password("archive requires a password".into())
         }
-        _ => ArchiveError::open(format!("cannot open archive '{}' (code {code})", path.display())),
+        _ => ArchiveError::open(format!(
+            "cannot open archive '{}' (code {code})",
+            path.display()
+        )),
     }
 }
 
@@ -362,12 +381,9 @@ mod tests {
 
     #[test]
     fn wide_conversion_roundtrip() {
-        let s = "hÃ©llo wÃ¶rld";
+        let s = "héllo wörld";
         let v = to_wide(s);
         let back = String::from_utf16_lossy(&v[..v.len() - 1]);
         assert_eq!(back, s);
     }
 }
-
-
-

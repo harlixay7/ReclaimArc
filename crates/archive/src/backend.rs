@@ -5,8 +5,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use crate::error::ArchiveError;
 use crate::model::*;
@@ -42,13 +42,13 @@ pub struct OpenOptions {
 /// Progress callback signature used by the engine to surface events.
 pub type ProgressFn<'a> = &'a mut dyn FnMut(ProgressEvent) -> bool;
 
-/// One file extracted by a streaming pass.
+/// One file processed by a streaming pass.
 #[derive(Debug, Clone)]
 pub struct ExtractedFile {
     /// Entry index in the archive.
     pub index: u64,
-    /// Absolute path of the written partial file.
-    pub partial_path: PathBuf,
+    /// Absolute path of the written partial file (None if skipped by policy, e.g. redirection).
+    pub partial_path: Option<PathBuf>,
 }
 
 /// The archive backend interface.
@@ -88,7 +88,11 @@ pub trait ArchiveBackend: Send {
     ///
     /// This avoids the O(n²) re-walks of per-unit passes and is the fast path
     /// for archives whose recovery units are single files.
-    fn begin_extraction(&mut self, options: &ExtractOptions, stop_at: u64) -> Result<(), ArchiveError>;
+    fn begin_extraction(
+        &mut self,
+        options: &ExtractOptions,
+        stop_at: u64,
+    ) -> Result<(), ArchiveError>;
 
     /// Extract the next file of the streaming pass. Returns `None` when the
     /// archive is exhausted. Entries before `stop_at` are skipped (seek, or

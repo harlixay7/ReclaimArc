@@ -1,4 +1,4 @@
-﻿//! Volume discovery: find all parts of a multi-volume RAR archive by name
+//! Volume discovery: find all parts of a multi-volume RAR archive by name
 //! convention, and normalize to the first volume.
 
 use std::path::{Path, PathBuf};
@@ -86,7 +86,7 @@ pub fn discover_volumes(first_or_any: &Path) -> Result<VolumeSet, ArchiveError> 
         )));
     };
 
-let entries = std::fs::read_dir(&dir).map_err(|e| {
+    let entries = std::fs::read_dir(&dir).map_err(|e| {
         ArchiveError::open(format!("cannot list directory '{}': {e}", dir.display()))
     })?;
 
@@ -171,7 +171,11 @@ let entries = std::fs::read_dir(&dir).map_err(|e| {
 pub fn describe(set: &VolumeSet) -> String {
     set.paths
         .iter()
-        .map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
+        .map(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        })
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -180,7 +184,7 @@ pub fn describe(set: &VolumeSet) -> String {
 mod tests {
     use super::*;
 
-#[test]
+    #[test]
     fn numbering_parsers() {
         assert_eq!(
             parse_new_numbering("movie.part01.rar"),
@@ -190,13 +194,28 @@ mod tests {
             parse_new_numbering("movie.part10.rar"),
             Some(("movie".to_string(), 10))
         );
-        assert_eq!(parse_new_numbering("movie.part1.rar"), Some(("movie".to_string(), 1)));
+        assert_eq!(
+            parse_new_numbering("movie.part1.rar"),
+            Some(("movie".to_string(), 1))
+        );
         assert_eq!(parse_new_numbering("movie.rar"), None);
         // Old scheme part indexes: .rar = 0, .r00 = 1, .r01 = 2, .r99 = 100.
-        assert_eq!(parse_old_numbering("movie.rar"), Some(("movie".to_string(), 0)));
-        assert_eq!(parse_old_numbering("movie.r00"), Some(("movie".to_string(), 1)));
-        assert_eq!(parse_old_numbering("movie.r01"), Some(("movie".to_string(), 2)));
-        assert_eq!(parse_old_numbering("movie.r99"), Some(("movie".to_string(), 100)));
+        assert_eq!(
+            parse_old_numbering("movie.rar"),
+            Some(("movie".to_string(), 0))
+        );
+        assert_eq!(
+            parse_old_numbering("movie.r00"),
+            Some(("movie".to_string(), 1))
+        );
+        assert_eq!(
+            parse_old_numbering("movie.r01"),
+            Some(("movie".to_string(), 2))
+        );
+        assert_eq!(
+            parse_old_numbering("movie.r99"),
+            Some(("movie".to_string(), 100))
+        );
         assert_eq!(parse_old_numbering("movie.txt"), None);
     }
 
@@ -226,7 +245,7 @@ mod tests {
         assert!(matches!(err, ArchiveError::MissingVolume(_)), "got: {err}");
     }
 
-#[test]
+    #[test]
     fn discover_sorts_old_numbering() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("c.rar"), b"x").unwrap();

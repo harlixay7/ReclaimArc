@@ -1,4 +1,4 @@
-﻿//! Test fixture writer: creates small RAR4/RAR5 archives with **stored**
+//! Test fixture writer: creates small RAR4/RAR5 archives with **stored**
 //! (uncompressed) entries.
 //!
 //! This exists so the test suite can construct exact, controlled corpora:
@@ -21,6 +21,7 @@ pub struct FixtureFile {
     /// solid even if the archive is "solid").
     pub break_solid: bool,
     pub is_directory: bool,
+    pub redirection: Option<crate::model::Redirection>,
 }
 
 impl FixtureFile {
@@ -30,6 +31,7 @@ impl FixtureFile {
             data: data.to_vec(),
             break_solid: false,
             is_directory: false,
+            redirection: None,
         }
     }
     pub fn dir(name: &str) -> Self {
@@ -38,6 +40,19 @@ impl FixtureFile {
             data: Vec::new(),
             break_solid: false,
             is_directory: true,
+            redirection: None,
+        }
+    }
+    pub fn symlink(name: &str, target: &str, kind: crate::model::RedirectionKind) -> Self {
+        FixtureFile {
+            name: name.to_string(),
+            data: Vec::new(),
+            break_solid: false,
+            is_directory: false,
+            redirection: Some(crate::model::Redirection {
+                kind,
+                target: target.to_string(),
+            }),
         }
     }
     /// Force a non-solid boundary before this file (starts a new chain).
@@ -62,7 +77,7 @@ pub struct FixtureOptions {
     pub corrupt: Option<(u64, u8)>,
     /// Truncate the archive to this length (simulates an incomplete archive).
     pub truncate_to: Option<u64>,
-/// Add a CRC32 field to RAR5 file headers (default true).
+    /// Add a CRC32 field to RAR5 file headers (default true).
     pub include_crc32: bool,
     /// Split a single file's data across volumes even if it fits (tests the
     /// split-file path). The file must be larger than 0.
@@ -138,9 +153,42 @@ struct Rar5Block {
     bytes: Vec<u8>,
 }
 
-fn rar5_header(fields: Vec<u8>, data_size: Option<u64>, split_before: bool, split_after: bool) -> Rar5Block {
+fn rar5_extra_redirection(r: &crate::model::Redirection) -> Vec<u8> {
+    let type_code = match r.kind {
+        crate::model::RedirectionKind::UnixSymlink => 0x01,
+        crate::model::RedirectionKind::WindowsSymlink => 0x02,
+        crate::model::RedirectionKind::Junction => 0x03,
+        crate::model::RedirectionKind::Hardlink => 0x04,
+        crate::model::RedirectionKind::FileCopy => 0x05,
+    };
+    let mut rec_payload = Vec::new();
+    put_varint(&mut rec_payload, type_code);
+    put_varint(&mut rec_payload, 0); // flags
+    let target_bytes = r.target.as_bytes();
+    put_varint(&mut rec_payload, target_bytes.len() as u64);
+    rec_payload.extend_from_slice(target_bytes);
+
+    let mut record = Vec::new();
+    let mut type_and_payload = Vec::new();
+    put_varint(&mut type_and_payload, 0x05); // EXTRA5_REDIR
+    type_and_payload.extend_from_slice(&rec_payload);
+    put_varint(&mut record, type_and_payload.len() as u64);
+    record.extend_from_slice(&type_and_payload);
+    record
+}
+
+fn rar5_header(
+    fields: Vec<u8>,
+    extra: Option<&[u8]>,
+    data_size: Option<u64>,
+    split_before: bool,
+    split_after: bool,
+) -> Rar5Block {
     let mut head = Vec::new();
     let mut flags: u64 = 0;
+    if extra.is_some() {
+        flags |= 0x0001; // HFL_EXTRA
+    }
     if data_size.is_some() {
         flags |= 0x0002; // HFL_DATA
     }
@@ -152,10 +200,16 @@ fn rar5_header(fields: Vec<u8>, data_size: Option<u64>, split_before: bool, spli
     }
     head.push(2u8); // HEAD_FILE
     put_varint(&mut head, flags);
+    if let Some(e) = extra {
+        put_varint(&mut head, e.len() as u64);
+    }
     if let Some(ds) = data_size {
         put_varint(&mut head, ds);
     }
     head.extend_from_slice(&fields);
+    if let Some(e) = extra {
+        head.extend_from_slice(e);
+    }
 
     let block_size = head.len() as u64;
     let mut block = Vec::new();
@@ -174,13 +228,16 @@ fn rar5_header(fields: Vec<u8>, data_size: Option<u64>, split_before: bool, spli
 
 /// Build the full logical byte stream of a RAR5 (or RAR4) archive and the
 /// per-entry offsets needed for volume splitting.
-fn build_archive_stream(files: &[FixtureFile], opts: &FixtureOptions) -> (Vec<u8>, Vec<(usize, usize)>) {
+fn build_archive_stream(
+    files: &[FixtureFile],
+    opts: &FixtureOptions,
+) -> (Vec<u8>, Vec<(usize, usize)>) {
     // Returns (stream, per-entry (data_start, data_end) offsets).
     let mut stream = Vec::new();
     let mut offsets = Vec::new();
 
     if opts.rar5 {
-stream.extend_from_slice(&[0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00]);
+        stream.extend_from_slice(&[0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00]);
         // Main header.
         let mut main = Vec::new();
         main.push(1u8); // HEAD_MAIN
@@ -202,7 +259,7 @@ stream.extend_from_slice(&[0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00]);
         hdr.extend_from_slice(&block);
         stream.extend_from_slice(&hdr);
 
-for f in files {
+        for f in files {
             // A file is solid when the archive is solid and it does not
             // request a chain break.
             let solid_bit = if f.is_directory || f.break_solid || !opts.solid_archive {
@@ -232,7 +289,14 @@ for f in files {
             put_varint(&mut fields, f.name.len() as u64);
             fields.extend_from_slice(f.name.as_bytes());
 
-let block = rar5_header(fields, Some(f.data.len() as u64), false, false);
+            let extra = f.redirection.as_ref().map(rar5_extra_redirection);
+            let block = rar5_header(
+                fields,
+                extra.as_deref(),
+                Some(f.data.len() as u64),
+                false,
+                false,
+            );
             let data_start = stream.len() + block.bytes.len();
             stream.extend_from_slice(&block.bytes);
             stream.extend_from_slice(&f.data);
@@ -253,7 +317,7 @@ let block = rar5_header(fields, Some(f.data.len() as u64), false, false);
         put_u32(&mut hdr, crc32(&block));
         hdr.extend_from_slice(&block);
         stream.extend_from_slice(&hdr);
-} else {
+    } else {
         // RAR4
         stream.extend_from_slice(&[0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00]);
         // Main header (0x73): 13 bytes.
@@ -302,7 +366,7 @@ let block = rar5_header(fields, Some(f.data.len() as u64), false, false);
             fields.push(0x30u8); // method: stored
             put_u16(&mut fields, f.name.len() as u16); // name size
             put_u32(&mut fields, 0x20u32); // attr
-fields.extend_from_slice(f.name.as_bytes());
+            fields.extend_from_slice(f.name.as_bytes());
 
             // RAR4 block CRC covers everything after the 2-byte CRC field,
             // i.e. the type byte and all fields.
@@ -311,7 +375,7 @@ fields.extend_from_slice(f.name.as_bytes());
             let mut hdr = Vec::new();
             put_u16(&mut hdr, crc16(&hdr_body));
             hdr.extend_from_slice(&hdr_body);
-let data_start = stream.len() + hdr.len();
+            let data_start = stream.len() + hdr.len();
             stream.extend_from_slice(&hdr);
             stream.extend_from_slice(&f.data);
             offsets.push((data_start, data_start + f.data.len()));
@@ -335,10 +399,15 @@ let data_start = stream.len() + hdr.len();
 /// Write a fixture archive (possibly multipart) into `dir`.
 ///
 /// Returns the ordered list of volume paths (first = part 1).
-pub fn write_rar(dir: &Path, name: &str, files: &[FixtureFile], opts: &FixtureOptions) -> Result<Vec<PathBuf>, ArchiveError> {
+pub fn write_rar(
+    dir: &Path,
+    name: &str,
+    files: &[FixtureFile],
+    opts: &FixtureOptions,
+) -> Result<Vec<PathBuf>, ArchiveError> {
     let (stream, offsets) = build_archive_stream(files, opts);
 
-// Split into volumes.
+    // Split into volumes.
     // When a mid-file split is forced, build the two volumes directly.
     let mut volumes: Vec<Vec<u8>> = if let Some(split_idx) = opts.force_split_file {
         build_split_streams(files, opts, split_idx)?
@@ -346,7 +415,7 @@ pub fn write_rar(dir: &Path, name: &str, files: &[FixtureFile], opts: &FixtureOp
         split_at_file_boundaries(&stream, &offsets, opts)
     };
 
-// Every volume except the last must end with an end-archive header that
+    // Every volume except the last must end with an end-archive header that
     // sets the next-volume flag, so the decoder continues to the next part.
     // (build_split_streams already includes its own end-arc headers; appending
     // again would corrupt the layout, so only do it for boundary splitting.)
@@ -390,7 +459,7 @@ pub fn write_rar(dir: &Path, name: &str, files: &[FixtureFile], opts: &FixtureOp
 /// configured names. They carry a small dummy payload.
 fn emit_service_headers_r5(stream: &mut Vec<u8>, opts: &FixtureOptions) {
     for (n, name) in opts.service_headers.iter().enumerate() {
-        let payload = vec![0x5A; 8 + n as usize % 4];
+        let payload = vec![0x5A; 8 + n % 4];
         let mut fields = Vec::new();
         put_varint(&mut fields, 0u64); // file flags
         put_varint(&mut fields, 0u64); // unp size
@@ -401,7 +470,7 @@ fn emit_service_headers_r5(stream: &mut Vec<u8>, opts: &FixtureOptions) {
         fields.extend_from_slice(name.as_bytes());
         let mut head = Vec::new();
         head.push(3u8); // HEAD_SERVICE
-        put_varint(&mut head, 0x0002u64); // HFL_DATA
+        put_varint(&mut head, 0x0006u64); // HFL_DATA (0x0002) | HFL_SKIPPED (0x0004)
         put_varint(&mut head, payload.len() as u64);
         head.extend_from_slice(&fields);
         let block_size = head.len() as u64;
@@ -420,7 +489,7 @@ fn emit_service_headers_r5(stream: &mut Vec<u8>, opts: &FixtureOptions) {
 /// configured names. They carry a small dummy payload.
 fn emit_service_headers_r4(stream: &mut Vec<u8>, opts: &FixtureOptions) {
     for (n, name) in opts.service_headers.iter().enumerate() {
-        let payload = vec![0xA5; 8 + n as usize % 4];
+        let payload = vec![0xA5; 8 + n % 4];
         let mut fields = Vec::new();
         put_u16(&mut fields, 0x0000); // flags
         put_u16(&mut fields, (7 + 25 + name.len()) as u16); // head size
@@ -447,7 +516,11 @@ fn emit_service_headers_r4(stream: &mut Vec<u8>, opts: &FixtureOptions) {
 /// Simple splitting at file data boundaries: keep files intact, fill volumes
 /// up to volume_size. Volumes must end at a file boundary for this writer
 /// (mid-file splitting is handled by `build_split_streams`).
-fn split_at_file_boundaries(stream: &[u8], offsets: &[(usize, usize)], opts: &FixtureOptions) -> Vec<Vec<u8>> {
+fn split_at_file_boundaries(
+    stream: &[u8],
+    offsets: &[(usize, usize)],
+    opts: &FixtureOptions,
+) -> Vec<Vec<u8>> {
     let volume_size = opts.volume_size.unwrap_or(stream.len() as u64 + 1);
     let mut volumes: Vec<Vec<u8>> = Vec::new();
     if stream.len() as u64 <= volume_size {
@@ -462,7 +535,9 @@ fn split_at_file_boundaries(stream: &[u8], offsets: &[(usize, usize)], opts: &Fi
         let header_begin = if idx == 0 { 0 } else { offsets[idx - 1].1 };
         let header = &stream[header_begin..*start];
         let data = &stream[*start..*end];
-        if current.len() as u64 + header.len() as u64 + data.len() as u64 > volume_size && !current.is_empty() {
+        if current.len() as u64 + header.len() as u64 + data.len() as u64 > volume_size
+            && !current.is_empty()
+        {
             volumes.push(current);
             current = Vec::new();
         }
@@ -472,7 +547,9 @@ fn split_at_file_boundaries(stream: &[u8], offsets: &[(usize, usize)], opts: &Fi
     }
     // Trailing end-arc header.
     if cursor < stream.len() {
-        if current.len() as u64 + (stream.len() - cursor) as u64 > volume_size && !current.is_empty() {
+        if current.len() as u64 + (stream.len() - cursor) as u64 > volume_size
+            && !current.is_empty()
+        {
             volumes.push(current);
             current = Vec::new();
         }
@@ -487,9 +564,15 @@ fn split_at_file_boundaries(stream: &[u8], offsets: &[(usize, usize)], opts: &Fi
 /// the repeated continuation header. The continuation header's data size is
 /// the remaining bytes in its volume (matching what the official decoder
 /// expects).
-fn build_split_streams(files: &[FixtureFile], opts: &FixtureOptions, split_idx: usize) -> Result<Vec<Vec<u8>>, ArchiveError> {
+fn build_split_streams(
+    files: &[FixtureFile],
+    opts: &FixtureOptions,
+    split_idx: usize,
+) -> Result<Vec<Vec<u8>>, ArchiveError> {
     if split_idx >= files.len() || files[split_idx].data.is_empty() {
-        return Err(ArchiveError::invalid("force_split_file out of range or empty"));
+        return Err(ArchiveError::invalid(
+            "force_split_file out of range or empty",
+        ));
     }
     let data = &files[split_idx].data;
     let mid = data.len() / 2;
@@ -505,18 +588,37 @@ fn build_split_streams(files: &[FixtureFile], opts: &FixtureOptions, split_idx: 
         v2.extend_from_slice(&main_header_r5(opts, Some(1)));
         for (i, f) in files.iter().enumerate() {
             let (fields, crc) = rar5_file_fields(f, opts);
+            let extra = f.redirection.as_ref().map(rar5_extra_redirection);
             if i == split_idx {
                 // Per-part data sizes: the DLL reads exactly the header's
                 // data size from each volume before merging to the next.
-                let block = rar5_header(fields.clone(), Some(first.len() as u64), false, true);
+                let block = rar5_header(
+                    fields.clone(),
+                    extra.as_deref(),
+                    Some(first.len() as u64),
+                    false,
+                    true,
+                );
                 v1.extend_from_slice(&block.bytes);
                 v1.extend_from_slice(first);
                 // Continuation: remaining size + SPLITBEFORE.
-                let block2 = rar5_header(fields, Some(second.len() as u64), true, false);
+                let block2 = rar5_header(
+                    fields,
+                    extra.as_deref(),
+                    Some(second.len() as u64),
+                    true,
+                    false,
+                );
                 v2.extend_from_slice(&block2.bytes);
                 v2.extend_from_slice(second);
             } else {
-                let block = rar5_header(fields, Some(f.data.len() as u64), false, false);
+                let block = rar5_header(
+                    fields,
+                    extra.as_deref(),
+                    Some(f.data.len() as u64),
+                    false,
+                    false,
+                );
                 let target = if i < split_idx { &mut v1 } else { &mut v2 };
                 target.extend_from_slice(&block.bytes);
                 target.extend_from_slice(&f.data);
@@ -536,15 +638,36 @@ fn build_split_streams(files: &[FixtureFile], opts: &FixtureOptions, split_idx: 
         for (i, f) in files.iter().enumerate() {
             if i == split_idx {
                 // Per-part pack sizes (see RAR5 case above).
-                let h = rar4_file_header(&f.name, first.len(), data.len(), 0x0002, crc32(data), f.is_directory);
+                let h = rar4_file_header(
+                    &f.name,
+                    first.len(),
+                    data.len(),
+                    0x0002,
+                    crc32(data),
+                    f.is_directory,
+                );
                 v1.extend_from_slice(&h);
                 v1.extend_from_slice(first);
                 // Continuation: remaining size + LHD_SPLIT_BEFORE.
-                let h2 = rar4_file_header(&f.name, second.len(), data.len(), 0x0001, crc32(data), f.is_directory);
+                let h2 = rar4_file_header(
+                    &f.name,
+                    second.len(),
+                    data.len(),
+                    0x0001,
+                    crc32(data),
+                    f.is_directory,
+                );
                 v2.extend_from_slice(&h2);
                 v2.extend_from_slice(second);
             } else {
-                let h = rar4_file_header(&f.name, f.data.len(), f.data.len(), 0, crc32(&f.data), f.is_directory);
+                let h = rar4_file_header(
+                    &f.name,
+                    f.data.len(),
+                    f.data.len(),
+                    0,
+                    crc32(&f.data),
+                    f.is_directory,
+                );
                 let target = if i < split_idx { &mut v1 } else { &mut v2 };
                 target.extend_from_slice(&h);
                 target.extend_from_slice(&f.data);
@@ -598,7 +721,14 @@ fn main_header_r4(flags: u16) -> Vec<u8> {
 }
 
 /// RAR4 file header with explicit sizes and flags.
-fn rar4_file_header(name: &str, pack: usize, unp: usize, flags: u16, data_crc: u32, is_directory: bool) -> Vec<u8> {
+fn rar4_file_header(
+    name: &str,
+    pack: usize,
+    unp: usize,
+    flags: u16,
+    data_crc: u32,
+    is_directory: bool,
+) -> Vec<u8> {
     let mut fields = Vec::new();
     put_u16(&mut fields, flags);
     put_u16(&mut fields, (7 + 25 + name.len()) as u16); // head size
@@ -633,11 +763,19 @@ fn rar5_file_fields(f: &FixtureFile, opts: &FixtureOptions) -> (Vec<u8>, u32) {
     put_varint(&mut fields, file_flags);
     put_varint(&mut fields, f.data.len() as u64);
     put_varint(&mut fields, 0x20u64);
-    let crc = if opts.include_crc32 && !f.is_directory { crc32(&f.data) } else { 0 };
+    let crc = if opts.include_crc32 && !f.is_directory {
+        crc32(&f.data)
+    } else {
+        0
+    };
     if opts.include_crc32 && !f.is_directory {
         put_u32(&mut fields, crc);
     }
-    let solid_bit = if f.is_directory || f.break_solid || !opts.solid_archive { 0 } else { 0x40 };
+    let solid_bit = if f.is_directory || f.break_solid || !opts.solid_archive {
+        0
+    } else {
+        0x40
+    };
     put_varint(&mut fields, solid_bit as u64);
     put_varint(&mut fields, 0u64);
     put_varint(&mut fields, f.name.len() as u64);
@@ -732,7 +870,13 @@ fn prefix_volume_header(volume_body: &[u8], opts: &FixtureOptions, vol_number: u
     out
 }
 
-fn volume_path(dir: &Path, name: &str, index: usize, total: usize, opts: &FixtureOptions) -> PathBuf {
+fn volume_path(
+    dir: &Path,
+    name: &str,
+    index: usize,
+    total: usize,
+    opts: &FixtureOptions,
+) -> PathBuf {
     if total == 1 {
         return dir.join(format!("{name}.rar"));
     }
@@ -767,7 +911,10 @@ mod tests {
         assert_eq!(paths.len(), 1);
         assert!(paths[0].exists());
         let bytes = std::fs::read(&paths[0]).unwrap();
-        assert_eq!(&bytes[..8], &[0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00]);
+        assert_eq!(
+            &bytes[..8],
+            &[0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00]
+        );
     }
 
     #[test]
@@ -793,11 +940,12 @@ mod tests {
     fn writes_rar4() {
         let dir = tempfile::tempdir().unwrap();
         let files = vec![FixtureFile::new("a.txt", b"rar4 hello")];
-        let opts = FixtureOptions { rar5: false, ..Default::default() };
+        let opts = FixtureOptions {
+            rar5: false,
+            ..Default::default()
+        };
         let paths = write_rar(dir.path(), "t4", &files, &opts).unwrap();
         let bytes = std::fs::read(&paths[0]).unwrap();
         assert_eq!(&bytes[..7], &[0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00]);
     }
 }
-
-

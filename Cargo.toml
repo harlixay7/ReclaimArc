@@ -1,4 +1,4 @@
-﻿[workspace]
+[workspace]
 resolver = "2"
 members = [
     "crates/core",
@@ -13,7 +13,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/reclaimarc/reclaimarc"
+repository = "https://github.com/harlixay7/ReclaimArc"
 
 [workspace.dependencies]
 reclaimarc-core = { path = "crates/core" }
@@ -52,3 +52,7 @@ opt-level = 2
 
 [profile.dev.package.libsqlite3-sys]
 opt-level = 2
+
+[patch.crates-io]
+unrar-ng-sys = { path = "vendor/unrar-ng-sys" }
+

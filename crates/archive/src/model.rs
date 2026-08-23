@@ -166,7 +166,11 @@ pub struct UnitExtractReport {
 #[derive(Debug, Clone, Copy)]
 pub enum ProgressEvent {
     /// `current` bytes of `total` processed in the current entry.
-    EntryProgress { entry_index: u64, current: u64, total: u64 },
+    EntryProgress {
+        entry_index: u64,
+        current: u64,
+        total: u64,
+    },
 }
 
 /// Full archive inspection result.

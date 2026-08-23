@@ -2678,12 +2678,13 @@ name = "reclaimarc-archive"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "proptest",
  "reclaimarc-platform",
  "serde",
  "tempfile",
  "thiserror 2.0.20",
  "tracing",
- "unrar_sys",
+ "unrar-ng-sys",
 ]
 
 [[package]]
@@ -2714,6 +2715,7 @@ dependencies = [
  "reclaimarc-core",
  "reclaimarc-journal",
  "reclaimarc-platform",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
@@ -4311,10 +4313,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
 
 [[package]]
-name = "unrar_sys"
-version = "0.5.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b77675b883cfbe6bf41e6b7a5cd6008e0a83ba497de3d96e41a064bbeead765"
+name = "unrar-ng-sys"
+version = "0.7.7"
 dependencies = [
  "cc",
  "libc",

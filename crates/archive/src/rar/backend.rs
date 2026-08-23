@@ -3,8 +3,8 @@
 //! packed ranges, solid chains and recovery units.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use crate::backend::{ArchiveBackend, ExtractOptions, ExtractedFile, OpenOptions};
 use crate::error::ArchiveError;
@@ -43,18 +43,25 @@ impl RarBackend {
 
 /// The partial output path for an entry, derived ONLY from the engine's
 /// validated name map and the engine-chosen per-attempt suffix.
-fn partial_output_path(options: &ExtractOptions, entry_index: u64, entry_name: &str) -> PathBuf {
-    let validated = options
-        .name_map
-        .get(&entry_index)
-        .cloned()
-        .unwrap_or_else(|| entry_name.to_string());
+fn partial_output_path(
+    options: &ExtractOptions,
+    entry_index: u64,
+) -> Result<PathBuf, ArchiveError> {
+    let validated = options.name_map.get(&entry_index).ok_or_else(|| {
+        ArchiveError::invalid(format!(
+            "entry index {entry_index} has no validated output mapping in name_map"
+        ))
+    })?;
     let suffix = if options.partial_suffix.is_empty() {
         format!(".sx-partial-{}", options.job_id)
     } else {
         options.partial_suffix.clone()
     };
-    options.dest_dir.join(format!("{validated}{suffix}"))
+    let path = options.dest_dir.join(format!("{validated}{suffix}"));
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    Ok(path)
 }
 
 impl ArchiveBackend for RarBackend {
@@ -105,18 +112,90 @@ impl ArchiveBackend for RarBackend {
             }
             if h.unp_size != p_entry.unpacked_size {
                 return Err(ArchiveError::invalid(format!(
-                    "parser/decoder unpacked-size mismatch at entry {lib_entries}"
+                    "parser/decoder unpacked-size mismatch at entry {lib_entries}: parser={} decoder={}",
+                    p_entry.unpacked_size, h.unp_size
                 )));
             }
-            if h.flags & 0x10 != 0 && !p_entry.is_solid && p_entry.unpacked_size > 0 {
-                // Decoder says solid, parser disagrees.
+            // Directory flag check (UnRAR HeaderDataEx.Flags bit 0x20 = RHDF_DIRECTORY)
+            let lib_is_dir = (h.flags & 0x20) != 0;
+            if lib_is_dir != p_entry.is_directory {
+                return Err(ArchiveError::invalid(format!(
+                    "parser/decoder directory-flag mismatch at entry {lib_entries}: parser={} decoder={}",
+                    p_entry.is_directory, lib_is_dir
+                )));
+            }
+            // Solid flag check (UnRAR HeaderDataEx.Flags bit 0x10 = RHDF_SOLID)
+            if (h.flags & 0x10 != 0) != p_entry.is_solid && p_entry.unpacked_size > 0 {
                 return Err(ArchiveError::invalid(format!(
                     "parser/decoder solid-flag mismatch at entry {lib_entries}"
                 )));
             }
+            // Encryption check (UnRAR HeaderDataEx.Flags bit 0x04 = RHDF_ENCRYPTED)
+            let lib_encrypted = (h.flags & 0x04) != 0;
+            if lib_encrypted != p_entry.encrypted {
+                return Err(ArchiveError::invalid(format!(
+                    "parser/decoder encryption mismatch at entry {lib_entries}: parser={} decoder={}",
+                    p_entry.encrypted, lib_encrypted
+                )));
+            }
+            // Split flag checks: in single-volume archives, verify split flags directly.
+            // In multipart archives, UnRAR's first-volume header only reflects the first volume's split flags.
+            let lib_split_before = (h.flags & 0x01) != 0;
+            let lib_split_after = (h.flags & 0x02) != 0;
+            if parsed.volumes.len() == 1 {
+                if lib_split_before != p_entry.split_before {
+                    return Err(ArchiveError::invalid(format!(
+                        "parser/decoder split-before mismatch at entry {lib_entries}: parser={} decoder={}",
+                        p_entry.split_before, lib_split_before
+                    )));
+                }
+                if lib_split_after != p_entry.split_after {
+                    return Err(ArchiveError::invalid(format!(
+                        "parser/decoder split-after mismatch at entry {lib_entries}: parser={} decoder={}",
+                        p_entry.split_after, lib_split_after
+                    )));
+                }
+            }
+            // File CRC check when both have non-zero CRC32
+            if let Some(p_crc) = p_entry.crc32 {
+                if h.file_crc != 0 && p_crc != h.file_crc {
+                    return Err(ArchiveError::invalid(format!(
+                        "parser/decoder file CRC mismatch at entry {lib_entries}: parser=0x{p_crc:08x} decoder=0x{:08x}",
+                        h.file_crc
+                    )));
+                }
+            }
+            // For non-split single volume files, verify packed size matches UnRAR pack_size
+            if !p_entry.split_before
+                && !p_entry.split_after
+                && parsed.volumes.len() == 1
+                && h.pack_size != p_entry.packed_size
+            {
+                return Err(ArchiveError::invalid(format!(
+                    "parser/decoder packed-size mismatch at entry {lib_entries}: parser={} decoder={}",
+                    p_entry.packed_size, h.pack_size
+                )));
+            }
+            // File CRC check when both have non-zero CRC32
+            if let Some(p_crc) = p_entry.crc32 {
+                if h.file_crc != 0 && p_crc != h.file_crc {
+                    return Err(ArchiveError::invalid(format!(
+                        "parser/decoder file CRC mismatch at entry {lib_entries}: parser=0x{p_crc:08x} decoder=0x{:08x}",
+                        h.file_crc
+                    )));
+                }
+            }
+
             // Advance the decoder to the next header (DLL contract: every
             // ReadHeader must be followed by a ProcessFile).
-            decoder.process_file(Operation::Skip, None, None, None, lib_entries as u64, h.pack_size)?;
+            decoder.process_file(
+                Operation::Skip,
+                None,
+                None,
+                None,
+                lib_entries as u64,
+                h.pack_size,
+            )?;
             lib_entries += 1;
         }
         drop(decoder);
@@ -191,38 +270,43 @@ impl ArchiveBackend for RarBackend {
         cancel: Option<Arc<AtomicBool>>,
         progress: Option<&'p mut (dyn FnMut(ProgressEvent) -> bool + 'c)>,
     ) -> Result<IntegrityReport, ArchiveError> {
-        let info = self
-            .info
-            .clone()
-            .ok_or_else(|| ArchiveError::open("inspect() must be called before test_integrity()"))?;
+        let info = self.info.clone().ok_or_else(|| {
+            ArchiveError::open("inspect() must be called before test_integrity()")
+        })?;
         let first = &info.volumes[0].path;
 
-        let mut decoder = Unrar::open(first, OpenMode::Process, password.map(|s| s.to_string()), cancel)?;
+        let mut decoder = Unrar::open(
+            first,
+            OpenMode::Process,
+            password.map(|s| s.to_string()),
+            cancel,
+        )?;
         let mut bytes_tested: u64 = 0;
         let mut index = 0u64;
         let mut progress = progress;
         let total_archive_packed = info.packed_size;
-        loop {
-            let Some(h) = decoder.read_header()? else { break };
+        while let Some(h) = decoder.read_header()? {
             let total = h.pack_size;
             let current_tested = bytes_tested;
             let mut sub_progress = progress.as_deref_mut().map(|cb| {
-                move |e: ProgressEvent| {
-                    match e {
-                        ProgressEvent::EntryProgress { current, total: entry_total, .. } => {
-                            let ratio = if entry_total > 0 {
-                                (current as f64) / (entry_total as f64)
-                            } else {
-                                1.0
-                            };
-                            let entry_done = (total as f64 * ratio.min(1.0)) as u64;
-                            let overall_done = current_tested.saturating_add(entry_done);
-                            cb(ProgressEvent::EntryProgress {
-                                entry_index: index,
-                                current: overall_done,
-                                total: total_archive_packed,
-                            })
-                        }
+                move |e: ProgressEvent| match e {
+                    ProgressEvent::EntryProgress {
+                        current,
+                        total: entry_total,
+                        ..
+                    } => {
+                        let ratio = if entry_total > 0 {
+                            (current as f64) / (entry_total as f64)
+                        } else {
+                            1.0
+                        };
+                        let entry_done = (total as f64 * ratio.min(1.0)) as u64;
+                        let overall_done = current_tested.saturating_add(entry_done);
+                        cb(ProgressEvent::EntryProgress {
+                            entry_index: index,
+                            current: overall_done,
+                            total: total_archive_packed,
+                        })
                     }
                 }
             });
@@ -230,7 +314,9 @@ impl ArchiveBackend for RarBackend {
                 Operation::Test,
                 None,
                 None,
-                sub_progress.as_mut().map(|f| f as &mut dyn FnMut(ProgressEvent) -> bool),
+                sub_progress
+                    .as_mut()
+                    .map(|f| f as &mut dyn FnMut(ProgressEvent) -> bool),
                 index,
                 total,
             );
@@ -283,14 +369,13 @@ impl ArchiveBackend for RarBackend {
             options.cancel.clone(),
         )?;
 
-let mut extracted: Vec<u64> = Vec::new();
+        let mut extracted: Vec<u64> = Vec::new();
         let mut bytes_written: u64 = 0;
         let mut index = 0u64;
         let mut progress = progress;
         let _ = info;
 
-loop {
-            let Some(h) = decoder.read_header()? else { break };
+        while let Some(h) = decoder.read_header()? {
             if index < unit.first_entry {
                 // Belongs to an already-committed unit.
                 // Split files cannot be seek-skipped in PROCESS mode (the
@@ -299,24 +384,31 @@ loop {
                 // instead: the whole split file is decoded and CRC-verified,
                 // and the decoder lands past it.
                 let is_split = h.flags & 1 != 0 || h.flags & 2 != 0;
-                let op = if is_split { Operation::Test } else { Operation::Skip };
+                let op = if is_split {
+                    Operation::Test
+                } else {
+                    Operation::Skip
+                };
                 decoder.process_file(op, None, None, None, index, h.pack_size)?;
             } else if index <= unit.last_entry {
                 let entry = self
                     .info
                     .as_ref()
-                    .ok_or_else(|| ArchiveError::open("inspect() must be called before extract_unit()"))?
+                    .ok_or_else(|| {
+                        ArchiveError::open("inspect() must be called before extract_unit()")
+                    })?
                     .entries
                     .iter()
                     .find(|e| e.index == index)
                     .ok_or_else(|| ArchiveError::NotFound(format!("entry {index}")))?;
-                if entry.is_directory {
-                    // Directories are created by the engine after commit.
+                if entry.is_directory || entry.redirection.is_some() {
+                    // Directories are created by the engine after commit; redirections/links
+                    // are skipped under SymlinkPolicy::Skip to prevent hostile link creation.
                     decoder.process_file(Operation::Skip, None, None, None, index, h.pack_size)?;
-} else {
-                    let partial = partial_output_path(options, index, &entry.name);
+                } else {
+                    let partial = partial_output_path(options, index)?;
                     let partial_str = partial.to_string_lossy().into_owned();
-                                        decoder.process_file(
+                    decoder.process_file(
                         Operation::Extract,
                         None,
                         Some(&partial_str),
@@ -324,7 +416,7 @@ loop {
                         index,
                         entry.unpacked_size,
                     )?;
-                                        extracted.push(index);
+                    extracted.push(index);
                     bytes_written = bytes_written.saturating_add(entry.unpacked_size);
                 }
             } else {
@@ -340,15 +432,18 @@ loop {
         })
     }
 
-fn cancel(&mut self) {
+    fn cancel(&mut self) {
         // Cancellation is handled via the shared AtomicBool passed at open.
     }
 
-    fn begin_extraction(&mut self, options: &ExtractOptions, stop_at: u64) -> Result<(), ArchiveError> {
-        let info = self
-            .info
-            .clone()
-            .ok_or_else(|| ArchiveError::open("inspect() must be called before begin_extraction()"))?;
+    fn begin_extraction(
+        &mut self,
+        options: &ExtractOptions,
+        stop_at: u64,
+    ) -> Result<(), ArchiveError> {
+        let info = self.info.clone().ok_or_else(|| {
+            ArchiveError::open("inspect() must be called before begin_extraction()")
+        })?;
         let first = &info.volumes[0].path;
         let decoder = Unrar::open(
             first,
@@ -391,7 +486,11 @@ fn cancel(&mut self) {
                 // Already-committed entries: seek, or verify split files in
                 // TEST mode (the DLL cannot seek past split continuations).
                 let is_split = h.flags & 1 != 0 || h.flags & 2 != 0;
-                let op = if is_split { Operation::Test } else { Operation::Skip };
+                let op = if is_split {
+                    Operation::Test
+                } else {
+                    Operation::Skip
+                };
                 decoder.process_file(op, None, None, None, index, h.pack_size)?;
                 self.next_index += 1;
                 continue;
@@ -402,12 +501,16 @@ fn cancel(&mut self) {
                 .find(|e| e.index == index)
                 .ok_or_else(|| ArchiveError::NotFound(format!("entry {index}")))?;
             self.next_index += 1;
-            if entry.is_directory {
-                // Directories are created by the engine; skip the record.
+            if entry.is_directory || entry.redirection.is_some() {
+                // Directories are created by the engine; redirections/links are skipped
+                // under SymlinkPolicy::Skip to prevent hostile link creation.
                 decoder.process_file(Operation::Skip, None, None, None, index, h.pack_size)?;
-                continue;
+                return Ok(Some(ExtractedFile {
+                    index,
+                    partial_path: None,
+                }));
             }
-            let partial = partial_output_path(options, index, &entry.name);
+            let partial = partial_output_path(options, index)?;
             let partial_str = partial.to_string_lossy().into_owned();
             decoder.process_file(
                 Operation::Extract,
@@ -419,7 +522,7 @@ fn cancel(&mut self) {
             )?;
             return Ok(Some(ExtractedFile {
                 index,
-                partial_path: partial,
+                partial_path: Some(partial),
             }));
         }
     }
@@ -463,7 +566,10 @@ fn cancel(&mut self) {
     }
 
     fn entries(&self) -> &[Entry] {
-        self.info.as_ref().map(|i| i.entries.as_slice()).unwrap_or(&[])
+        self.info
+            .as_ref()
+            .map(|i| i.entries.as_slice())
+            .unwrap_or(&[])
     }
 
     fn recovery_units(&self) -> &[RecoveryUnit] {
@@ -506,7 +612,10 @@ mod tests {
         assert_eq!(info.entries.len(), 3);
         assert_eq!(info.entries[0].name, "hello.txt");
         assert_eq!(info.entries[0].unpacked_size, 11);
-        assert_eq!(info.entries[0].crc32, Some(crate::rar::fixtures::crc32(b"hello world")));
+        assert_eq!(
+            info.entries[0].crc32,
+            Some(crate::rar::fixtures::crc32(b"hello world"))
+        );
         assert!(info.entries[1].name.ends_with("file.bin"));
         assert_eq!(info.recovery_units.len(), 3);
         assert_eq!(info.packed_size, 5011);
@@ -518,7 +627,10 @@ mod tests {
     fn inspect_rar4() {
         let dir = tempfile::tempdir().unwrap();
         let files = vec![FixtureFile::new("a.txt", b"rar4 data")];
-        let opts = FixtureOptions { rar5: false, ..Default::default() };
+        let opts = FixtureOptions {
+            rar5: false,
+            ..Default::default()
+        };
         let paths = write_rar(dir.path(), "t4", &files, &opts).unwrap();
         let mut backend = RarBackend::new(&paths[0]);
         let info = backend.inspect(&OpenOptions::default()).unwrap();
@@ -535,7 +647,10 @@ mod tests {
             FixtureFile::new("b.txt", b"bbb"),
             FixtureFile::new("c.txt", b"ccc"),
         ];
-        let opts = FixtureOptions { solid_archive: true, ..Default::default() };
+        let opts = FixtureOptions {
+            solid_archive: true,
+            ..Default::default()
+        };
         let paths = write_rar(dir.path(), "s", &files, &opts).unwrap();
         let mut backend = RarBackend::new(&paths[0]);
         let info = backend.inspect(&OpenOptions::default()).unwrap();
@@ -576,6 +691,7 @@ mod tests {
         let mut backend = RarBackend::new(&paths[0]);
         backend.inspect(&OpenOptions::default()).unwrap();
         let report = backend.test_integrity(None, None, None).unwrap();
+        eprintln!("INTEGRITY REPORT: {:?}", report);
         assert!(report.ok);
         assert_eq!(report.bytes_tested, 10003);
     }
@@ -583,7 +699,10 @@ mod tests {
     #[test]
     fn integrity_test_detects_corruption() {
         let dir = tempfile::tempdir().unwrap();
-        let files = vec![FixtureFile::new("a.txt", b"aaa"), FixtureFile::new("b.bin", &vec![9u8; 10000])];
+        let files = vec![
+            FixtureFile::new("a.txt", b"aaa"),
+            FixtureFile::new("b.bin", &vec![9u8; 10000]),
+        ];
         let opts = FixtureOptions {
             corrupt: Some((200, 0x55)),
             ..Default::default()
@@ -701,11 +820,20 @@ mod tests {
         opts.name_map.insert(2, "c.bin".to_string());
         for u in &info.recovery_units {
             let report = backend.extract_unit(u.seq, &opts, None).unwrap();
-            assert_eq!(report.verified, true);
+            assert!(report.verified);
         }
-assert_eq!(std::fs::read(out.join("a.bin.sx-partial-mv")).unwrap(), vec![0x11; 4000]);
-        assert_eq!(std::fs::read(out.join("b.bin.sx-partial-mv")).unwrap(), vec![0x22; 4000]);
-        assert_eq!(std::fs::read(out.join("c.bin.sx-partial-mv")).unwrap(), vec![0x33; 4000]);
+        assert_eq!(
+            std::fs::read(out.join("a.bin.sx-partial-mv")).unwrap(),
+            vec![0x11; 4000]
+        );
+        assert_eq!(
+            std::fs::read(out.join("b.bin.sx-partial-mv")).unwrap(),
+            vec![0x22; 4000]
+        );
+        assert_eq!(
+            std::fs::read(out.join("c.bin.sx-partial-mv")).unwrap(),
+            vec![0x33; 4000]
+        );
     }
 
     /// Real WinRAR archives contain service subheaders (NTFS streams, ACLs,
@@ -751,9 +879,18 @@ assert_eq!(std::fs::read(out.join("a.bin.sx-partial-mv")).unwrap(), vec![0x11; 4
             let report = backend.extract_unit(u.seq, &opts, None).unwrap();
             assert!(report.verified);
         }
-        assert_eq!(std::fs::read(out.join("one.bin.sx-partial-svc")).unwrap(), vec![0x11; 3000]);
-        assert_eq!(std::fs::read(out.join("two.bin.sx-partial-svc")).unwrap(), vec![0x22; 3000]);
-        assert_eq!(std::fs::read(out.join("three.bin.sx-partial-svc")).unwrap(), vec![0x33; 3000]);
+        assert_eq!(
+            std::fs::read(out.join("one.bin.sx-partial-svc")).unwrap(),
+            vec![0x11; 3000]
+        );
+        assert_eq!(
+            std::fs::read(out.join("two.bin.sx-partial-svc")).unwrap(),
+            vec![0x22; 3000]
+        );
+        assert_eq!(
+            std::fs::read(out.join("three.bin.sx-partial-svc")).unwrap(),
+            vec![0x33; 3000]
+        );
     }
 
     #[test]
@@ -789,8 +926,14 @@ assert_eq!(std::fs::read(out.join("a.bin.sx-partial-mv")).unwrap(), vec![0x11; 4
             let report = backend.extract_unit(u.seq, &opts, None).unwrap();
             assert!(report.verified);
         }
-        assert_eq!(std::fs::read(out.join("one.bin.sx-partial-svc4")).unwrap(), vec![0x44; 3000]);
-        assert_eq!(std::fs::read(out.join("two.bin.sx-partial-svc4")).unwrap(), vec![0x55; 3000]);
+        assert_eq!(
+            std::fs::read(out.join("one.bin.sx-partial-svc4")).unwrap(),
+            vec![0x44; 3000]
+        );
+        assert_eq!(
+            std::fs::read(out.join("two.bin.sx-partial-svc4")).unwrap(),
+            vec![0x55; 3000]
+        );
     }
 
     /// A file split in half across two volumes. The decoder must report ONE
@@ -816,14 +959,24 @@ assert_eq!(std::fs::read(out.join("a.bin.sx-partial-mv")).unwrap(), vec![0x11; 4
         assert_eq!(info.entries.len(), 3, "split file must be ONE entry");
         assert_eq!(info.volumes.len(), 2);
         let split = info.entries.iter().find(|e| e.name == "big.bin").unwrap();
-        assert!(split.split_before && split.split_after, "split flags must be recorded");
-        // The split entry's packed ranges must span both volumes.
+        assert!(
+            split.split_before && split.split_after,
+            "split flags must be recorded"
+        );
+        // The split entry's recovery unit is the tail unit, spanning both volumes.
         let unit = info
             .recovery_units
             .iter()
             .find(|u| u.first_entry == split.index)
             .unwrap();
-        assert_eq!(unit.packed_ranges.len(), 2, "packed range must span both volumes");
+        assert!(
+            unit.packed_ranges.iter().any(|r| r.volume_index == 0),
+            "packed ranges must include volume 0"
+        );
+        assert!(
+            unit.packed_ranges.iter().any(|r| r.volume_index == 1),
+            "packed ranges must include volume 1"
+        );
 
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).unwrap();
@@ -843,9 +996,18 @@ assert_eq!(std::fs::read(out.join("a.bin.sx-partial-mv")).unwrap(), vec![0x11; 4
             let report = backend.extract_unit(u.seq, &opts, None).unwrap();
             assert!(report.verified);
         }
-        assert_eq!(std::fs::read(out.join("a.bin.sx-partial-sp")).unwrap(), vec![0x11; 1000]);
-        assert_eq!(std::fs::read(out.join("big.bin.sx-partial-sp")).unwrap(), data);
-        assert_eq!(std::fs::read(out.join("c.bin.sx-partial-sp")).unwrap(), vec![0x33; 1000]);
+        assert_eq!(
+            std::fs::read(out.join("a.bin.sx-partial-sp")).unwrap(),
+            vec![0x11; 1000]
+        );
+        assert_eq!(
+            std::fs::read(out.join("big.bin.sx-partial-sp")).unwrap(),
+            data
+        );
+        assert_eq!(
+            std::fs::read(out.join("c.bin.sx-partial-sp")).unwrap(),
+            vec![0x33; 1000]
+        );
     }
 
     #[test]
@@ -885,7 +1047,10 @@ assert_eq!(std::fs::read(out.join("a.bin.sx-partial-mv")).unwrap(), vec![0x11; 4
             let report = backend.extract_unit(u.seq, &opts, None).unwrap();
             assert!(report.verified);
         }
-        assert_eq!(std::fs::read(out.join("big.bin.sx-partial-sp4")).unwrap(), data);
+        assert_eq!(
+            std::fs::read(out.join("big.bin.sx-partial-sp4")).unwrap(),
+            data
+        );
     }
 
     /// Large archive: thousands of entries plus service subheaders must
@@ -930,8 +1095,9 @@ assert_eq!(std::fs::read(out.join("a.bin.sx-partial-mv")).unwrap(), vec![0x11; 4
             assert!(report.verified);
         }
         let expect: Vec<u8> = (0..2048).map(|b| ((b + 2999 * 7) % 251) as u8).collect();
-        assert_eq!(std::fs::read(out.join("file-2999.bin.sx-partial-big")).unwrap(), expect);
+        assert_eq!(
+            std::fs::read(out.join("file-2999.bin.sx-partial-big")).unwrap(),
+            expect
+        );
     }
 }
-
-

@@ -1,4 +1,4 @@
-﻿//! ReclaimArc archive backends.
+//! ReclaimArc archive backends.
 //!
 //! The engine communicates with archives exclusively through the
 //! `ArchiveBackend` trait. The RAR backend (v1 target) uses the official

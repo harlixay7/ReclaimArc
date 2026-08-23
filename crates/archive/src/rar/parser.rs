@@ -1,4 +1,4 @@
-﻿//! RAR 4.x / 5.x header parser.
+//! RAR 4.x / 5.x header parser.
 //!
 //! Computes the things the engine needs that the decoder library does not
 //! expose: exact packed data ranges per volume, solid chains, and the
@@ -170,7 +170,7 @@ pub fn parse(volumes: Vec<VolumeMeta>) -> Result<ParsedRar, ArchiveError> {
         return Err(ArchiveError::open("no volumes provided"));
     }
 
-let first = &volumes[0];
+    let first = &volumes[0];
 
     // Detect format from signature.
     let mut sig = [0u8; 8];
@@ -184,7 +184,11 @@ let first = &volumes[0];
             )));
         }
     }
-    let format = if sig == RAR5_SIGNATURE { RarFormat::Rar5 } else { RarFormat::Rar4 };
+    let format = if sig == RAR5_SIGNATURE {
+        RarFormat::Rar5
+    } else {
+        RarFormat::Rar4
+    };
 
     let mut parsed = ParsedRar {
         format,
@@ -197,11 +201,11 @@ let first = &volumes[0];
         packed_size: 0,
     };
 
-// Entry index of the most recent split-after part; continuations attach
+    // Entry index of the most recent split-after part; continuations attach
     // to it (per-part conventions: each part's header sizes itself).
     let mut last_split_after_entry: Option<usize> = None;
 
-for (vol_index, vol) in volumes.iter().enumerate() {
+    for (vol_index, vol) in volumes.iter().enumerate() {
         let mut r = Reader::open(&vol.path)?;
         let sig_len = if format == RarFormat::Rar5 { 8 } else { 7 };
         let mut pos: u64 = sig_len as u64;
@@ -233,12 +237,14 @@ for (vol_index, vol) in volumes.iter().enumerate() {
                     break;
                 }
                 HeaderKind::Other => {
-                    return Err(ArchiveError::invalid("unexpected header before main header"));
+                    return Err(ArchiveError::invalid(
+                        "unexpected header before main header",
+                    ));
                 }
             }
         }
 
-// Parse file records until end-archive header or volume end.
+        // Parse file records until end-archive header or volume end.
         loop {
             if pos >= vol_len {
                 // Volume ends mid-data of a split file: the continuation
@@ -264,7 +270,7 @@ for (vol_index, vol) in volumes.iter().enumerate() {
                     split_after,
                     encrypted,
                     redirection,
-} => {
+                } => {
                     let header_end = hdr.end;
 
                     // Per-part conventions: each part's header carries the
@@ -352,7 +358,7 @@ for (vol_index, vol) in volumes.iter().enumerate() {
         }
     }
 
-if let Some(idx) = last_split_after_entry {
+    if let Some(idx) = last_split_after_entry {
         // The chain ended without its final part: the last volume ended
         // mid-file.
         return Err(ArchiveError::invalid(format!(
@@ -361,7 +367,118 @@ if let Some(idx) = last_split_after_entry {
         )));
     }
 
+    validate_structural_invariants(&parsed)?;
+
     Ok(parsed)
+}
+
+pub fn validate_structural_invariants(p: &ParsedRar) -> Result<(), ArchiveError> {
+    // 1. Part ordering, overflow checks, volume bounds, and logical packed size agreement.
+    let mut total_part_bytes = 0u64;
+    for (entry_idx, entry) in p.entries.iter().enumerate() {
+        if let Some(parts) = p.parts.get(entry_idx) {
+            let mut entry_part_bytes = 0u64;
+            let mut last_part_vol = 0u64;
+            let mut last_part_end = 0u64;
+
+            for (part_idx, part) in parts.iter().enumerate() {
+                // Bounds check volume index
+                if part.volume_index as usize >= p.volumes.len() {
+                    return Err(ArchiveError::invalid(format!(
+                        "entry {} part {} references out-of-bounds volume index {}",
+                        entry.name, part_idx, part.volume_index
+                    )));
+                }
+                let vol_len = p.volumes[part.volume_index as usize].len;
+                let part_end = part.data_start.checked_add(part.data_len).ok_or_else(|| {
+                    ArchiveError::invalid(format!(
+                        "arithmetic overflow computing part end for entry {}",
+                        entry.name
+                    ))
+                })?;
+                if part_end > vol_len {
+                    return Err(ArchiveError::invalid(format!(
+                        "entry {} part {} range [{}..{}] exceeds volume length {}",
+                        entry.name, part_idx, part.data_start, part_end, vol_len
+                    )));
+                }
+
+                // Monotonic ordering of parts for this entry
+                if part_idx > 0
+                    && (part.volume_index < last_part_vol
+                        || (part.volume_index == last_part_vol && part.data_start < last_part_end))
+                {
+                    return Err(ArchiveError::invalid(format!(
+                        "non-monotonic part ordering in entry {}",
+                        entry.name
+                    )));
+                }
+                last_part_vol = part.volume_index;
+                last_part_end = part_end;
+
+                entry_part_bytes =
+                    entry_part_bytes.checked_add(part.data_len).ok_or_else(|| {
+                        ArchiveError::invalid(format!(
+                            "arithmetic overflow accumulating packed bytes for entry {}",
+                            entry.name
+                        ))
+                    })?;
+            }
+
+            if !entry.is_directory && entry_part_bytes != entry.packed_size {
+                return Err(ArchiveError::invalid(format!(
+                    "entry '{}' sum of part lengths ({}) does not match entry packed size ({})",
+                    entry.name, entry_part_bytes, entry.packed_size
+                )));
+            }
+
+            total_part_bytes = total_part_bytes
+                .checked_add(entry_part_bytes)
+                .ok_or_else(|| {
+                    ArchiveError::invalid("arithmetic overflow accumulating archive packed size")
+                })?;
+        }
+    }
+
+    if total_part_bytes != p.packed_size {
+        return Err(ArchiveError::invalid(format!(
+            "archive packed size ({}) does not match total part bytes ({})",
+            p.packed_size, total_part_bytes
+        )));
+    }
+
+    // 2. Non-overlapping range check within each volume.
+    for (vol_idx, vol) in p.volumes.iter().enumerate() {
+        let mut vol_ranges: Vec<(u64, u64, usize)> = Vec::new();
+        for (entry_idx, parts) in p.parts.iter().enumerate() {
+            for part in parts {
+                if part.volume_index as usize == vol_idx {
+                    vol_ranges.push((part.data_start, part.data_len, entry_idx));
+                }
+            }
+        }
+        vol_ranges.sort_by_key(|&(start, _, _)| start);
+        for i in 1..vol_ranges.len() {
+            let prev = &vol_ranges[i - 1];
+            let curr = &vol_ranges[i];
+            let prev_end = prev.0.checked_add(prev.1).ok_or_else(|| {
+                ArchiveError::invalid("overflow computing range end in overlap check")
+            })?;
+            if prev_end > curr.0 {
+                return Err(ArchiveError::invalid(format!(
+                    "overlapping packed data ranges in volume {}: entry {} [{}..{}] overlaps with entry {} at offset {}",
+                    vol.path.display(),
+                    p.entries[prev.2].name,
+                    prev.0,
+                    prev_end,
+                    p.entries[curr.2].name,
+                    curr.0
+                )));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 enum HeaderKind {
@@ -415,7 +532,18 @@ fn read_header4(r: &mut Reader, pos: u64) -> Result<HeaderInfo, ArchiveError> {
         )));
     }
     let full_size = head_size + if head_size < 0x10000 { 0 } else { 4 };
-    let _ = crc;
+
+    // Verify RAR4 header checksum according to official UnRAR specification:
+    // CRC(0xFFFF, &HeaderType, HeadSize - 2) & 0xFFFF
+    let check_len = (head_size as usize).saturating_sub(2);
+    let mut raw_hdr = vec![0u8; check_len];
+    r.read_exact_at(pos + 2, &mut raw_hdr)?;
+    let computed_crc = (crc32(&raw_hdr) & 0xffff) as u16;
+    if computed_crc != crc {
+        return Err(ArchiveError::invalid(format!(
+            "RAR4 header at offset {pos} CRC mismatch: expected 0x{crc:04x}, computed 0x{computed_crc:04x}"
+        )));
+    }
 
     match htype {
         HEAD3_MAIN => {
@@ -455,7 +583,10 @@ fn read_header4(r: &mut Reader, pos: u64) -> Result<HeaderInfo, ArchiveError> {
 
             // Name (ANSI) with possible Unicode re-encoding after it.
             let name_bytes = read_bytes(r, off, name_size)?;
-            let ansi_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(name_bytes.len());
+            let ansi_end = name_bytes
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(name_bytes.len());
             let unicode = flags & LHD_UNICODE != 0;
             let name = if unicode && name_bytes.len() > ansi_end + 1 {
                 // The re-encoded Unicode name follows the ANSI name + NUL.
@@ -479,7 +610,7 @@ fn read_header4(r: &mut Reader, pos: u64) -> Result<HeaderInfo, ArchiveError> {
                 None
             };
 
-// Service subheaders (0x7A: NTFS streams, ACLs, comments) share
+            // Service subheaders (0x7A: NTFS streams, ACLs, comments) share
             // the file-record layout but are NOT archive entries. The decoder
             // skips them (SearchBlock(HEAD_FILE)); we must too, while still
             // skipping their packed data so positions stay exact.
@@ -537,9 +668,9 @@ fn read_header4(r: &mut Reader, pos: u64) -> Result<HeaderInfo, ArchiveError> {
 }
 
 fn read_header5(r: &mut Reader, pos: u64) -> Result<HeaderInfo, ArchiveError> {
-    let _crc32 = r.u32_le_at(pos)?;
+    let stored_crc32 = r.u32_le_at(pos)?;
     // Header size varint occupies 1..=3 bytes.
-let mut size_bytes = 1u64;
+    let mut size_bytes = 1u64;
     let mut b0 = r.u8_at(pos + 4)?;
     let mut header_size: u64 = (b0 & 0x7f) as u64;
     while b0 & 0x80 != 0 {
@@ -556,6 +687,19 @@ let mut size_bytes = 1u64;
     let header_total = 4 + size_bytes + header_size;
     let mut body = vec![0u8; header_size as usize];
     r.read_exact_at(pos + 4 + size_bytes, &mut body)?;
+
+    // Verify RAR5 general-header CRC32 (CRC32 over header size varint bytes + body bytes)
+    let mut size_varint_bytes = vec![0u8; size_bytes as usize];
+    r.read_exact_at(pos + 4, &mut size_varint_bytes)?;
+    let mut crc_buf = Vec::with_capacity(size_bytes as usize + header_size as usize);
+    crc_buf.extend_from_slice(&size_varint_bytes);
+    crc_buf.extend_from_slice(&body);
+    let computed_crc32 = crc32(&crc_buf);
+    if computed_crc32 != stored_crc32 {
+        return Err(ArchiveError::invalid(format!(
+            "RAR5 header at offset {pos} CRC32 mismatch: expected 0x{stored_crc32:08x}, computed 0x{computed_crc32:08x}"
+        )));
+    }
     let mut bf = SliceFields::new(&body);
 
     let htype = bf.varint()?;
@@ -630,7 +774,7 @@ let mut size_bytes = 1u64;
                 (None, false)
             };
 
-// RAR5 service subheaders (type 3: NTFS streams, ACLs, comments) share
+            // RAR5 service subheaders (type 3: NTFS streams, ACLs, comments) share
             // the record layout but are NOT archive entries — the decoder
             // skips them, so we skip them too while advancing over their
             // packed data so positions stay exact.
@@ -717,12 +861,13 @@ impl<'a> SliceFields<'a> {
         Ok(v)
     }
 
-fn u32(&mut self) -> Result<u32, ArchiveError> {
+    fn u32(&mut self) -> Result<u32, ArchiveError> {
         if self.pos + 4 > self.data.len() {
             return Err(ArchiveError::invalid("RAR5 header truncated (u32)"));
         }
         let b = &self.data[self.pos..self.pos + 4];
-        let v = (b[0] as u32) | ((b[1] as u32) << 8) | ((b[2] as u32) << 16) | ((b[3] as u32) << 24);
+        let v =
+            (b[0] as u32) | ((b[1] as u32) << 8) | ((b[2] as u32) << 16) | ((b[3] as u32) << 24);
         self.pos += 4;
         Ok(v)
     }
@@ -738,50 +883,92 @@ fn u32(&mut self) -> Result<u32, ArchiveError> {
     }
 }
 
-/// Scan RAR5 extra records: type 0x02 = redirection, 0x03 = file encryption.
-fn scan_extras(body: &[u8], start: usize, len: usize) -> Result<(Option<Redirection>, bool), ArchiveError> {
+/// RAR5 extra field IDs from the official RAR5 format specification.
+pub const EXTRA5_CRYPT: u64 = 0x01;
+pub const EXTRA5_HASH: u64 = 0x02;
+pub const EXTRA5_HTIME: u64 = 0x03;
+pub const EXTRA5_VERSION: u64 = 0x04;
+pub const EXTRA5_REDIR: u64 = 0x05;
+pub const EXTRA5_UOWNER: u64 = 0x06;
+pub const EXTRA5_SUBDATA: u64 = 0x07;
+
+/// Scan RAR5 extra records:
+/// Official structure: Size (varint) -> Type (varint) -> Data
+///
+/// 0x01: encryption
+/// 0x02: hash
+/// 0x03: time
+/// 0x04: version
+/// 0x05: redirection
+/// 0x06: owner
+/// 0x07: service data
+///
+/// Unknown or unsupported extra records are bounded and safely skipped.
+pub fn scan_extras(
+    body: &[u8],
+    start: usize,
+    len: usize,
+) -> Result<(Option<Redirection>, bool), ArchiveError> {
     let mut pos = start;
-    let end = start + len;
+    let end = (start + len).min(body.len());
     let mut redirection = None;
     let mut encrypted = false;
+
     while pos < end {
-        let mut bf = SliceFields::new(&body[pos..end.min(body.len())]);
-        let extra_type = match bf.varint() {
-            Ok(v) => v,
-            Err(_) => break,
-        };
+        let mut bf = SliceFields::new(&body[pos..end]);
         let extra_size = match bf.varint() {
-            Ok(v) => v,
+            Ok(s) => s as usize,
             Err(_) => break,
         };
-        let extra_start = pos + (bf.pos);
-        if extra_size == 0 || extra_start + extra_size as usize > end {
+        let varint_len = bf.pos;
+        let record_start = pos + varint_len;
+        let record_end = record_start.saturating_add(extra_size);
+        if extra_size == 0 || record_end > end {
             break;
         }
-        if extra_type == 0x02 {
-            // Redirect record: redir type, flags, target name.
-            let mut rf = SliceFields::new(&body[extra_start..extra_start + extra_size as usize]);
-            let redir_type = rf.varint().unwrap_or(0);
-            let _flags = rf.varint().unwrap_or(0);
-            let name_size = rf.varint().unwrap_or(0);
-            let target_bytes = rf.bytes(name_size).unwrap_or(&[]);
-            let kind = match redir_type {
-                0x01 => RedirectionKind::UnixSymlink,
-                0x02 => RedirectionKind::WindowsSymlink,
-                0x03 => RedirectionKind::Junction,
-                0x04 => RedirectionKind::Hardlink,
-                0x05 => RedirectionKind::FileCopy,
-                _ => RedirectionKind::UnixSymlink,
-            };
-            redirection = Some(Redirection {
-                kind,
-                target: String::from_utf8_lossy(target_bytes).into_owned(),
-            });
-        } else if extra_type == 0x03 {
-            encrypted = true;
+
+        let mut rf = SliceFields::new(&body[record_start..record_end]);
+        let extra_type = match rf.varint() {
+            Ok(t) => t,
+            Err(_) => {
+                pos = record_end;
+                continue;
+            }
+        };
+
+        match extra_type {
+            EXTRA5_CRYPT => {
+                encrypted = true;
+            }
+            EXTRA5_REDIR => {
+                let redir_type = rf.varint().unwrap_or(0);
+                let _flags = rf.varint().unwrap_or(0);
+                let name_size = rf.varint().unwrap_or(0);
+                let target_bytes = rf.bytes(name_size).unwrap_or(&[]);
+                let kind = match redir_type {
+                    0x01 => RedirectionKind::UnixSymlink,
+                    0x02 => RedirectionKind::WindowsSymlink,
+                    0x03 => RedirectionKind::Junction,
+                    0x04 => RedirectionKind::Hardlink,
+                    0x05 => RedirectionKind::FileCopy,
+                    _ => RedirectionKind::UnixSymlink,
+                };
+                redirection = Some(Redirection {
+                    kind,
+                    target: String::from_utf8_lossy(target_bytes).into_owned(),
+                });
+            }
+            EXTRA5_HASH | EXTRA5_HTIME | EXTRA5_VERSION | EXTRA5_UOWNER | EXTRA5_SUBDATA => {
+                // Official RAR5 extra records: safely bounded and skipped for layout parsing
+            }
+            _ => {
+                // Unknown extra record: safely skipped
+            }
         }
-        pos = extra_start + extra_size as usize;
+
+        pos = record_end;
     }
+
     Ok((redirection, encrypted))
 }
 
@@ -805,10 +992,12 @@ fn split_data_end(r: &mut Reader, format: RarFormat, vol_len: u64) -> Result<u64
             break;
         }
         match read_header(r, format, pos) {
-            Ok(h) if matches!(h.kind, HeaderKind::EndArc) && h.end == vol_len => {
-                if endarc_crc_matches(r, format, pos, h.end)? {
-                    return Ok(pos);
-                }
+            Ok(h)
+                if matches!(h.kind, HeaderKind::EndArc)
+                    && h.end == vol_len
+                    && endarc_crc_matches(r, format, pos, h.end)? =>
+            {
+                return Ok(pos);
             }
             _ => {}
         }
@@ -822,7 +1011,12 @@ fn split_data_end(r: &mut Reader, format: RarFormat, vol_len: u64) -> Result<u64
 }
 
 /// Verify the stored checksum of a header block at `pos..end`.
-fn endarc_crc_matches(r: &mut Reader, format: RarFormat, pos: u64, end: u64) -> Result<bool, ArchiveError> {
+fn endarc_crc_matches(
+    r: &mut Reader,
+    format: RarFormat,
+    pos: u64,
+    end: u64,
+) -> Result<bool, ArchiveError> {
     let len = (end - pos) as usize;
     let mut buf = vec![0u8; len];
     r.read_exact_at(pos, &mut buf)?;
@@ -853,7 +1047,9 @@ fn crc32(data: &[u8]) -> u32 {
 
 fn read_bytes(r: &mut Reader, offset: u64, len: u64) -> Result<Vec<u8>, ArchiveError> {
     if len > 1 << 24 {
-        return Err(ArchiveError::invalid(format!("implausible name size {len}")));
+        return Err(ArchiveError::invalid(format!(
+            "implausible name size {len}"
+        )));
     }
     let mut buf = vec![0u8; len as usize];
     r.read_exact_at(offset, &mut buf)?;
@@ -890,15 +1086,21 @@ fn decode_unicode_name(bytes: &[u8]) -> String {
 /// Build recovery units and packed ranges from a parsed archive.
 ///
 /// Rules:
-/// - a non-solid file (or split-file) is one unit,
-/// - a maximal run of solid files (one dictionary chain) is one unit,
-/// - if the archive-level solid flag is set, the whole archive is one unit
-///   (the decoder cannot seek past data in such archives, so no earlier data
-///   may ever be reclaimed before the archive completes).
+/// - if the archive-level solid flag is set, the whole archive is one unit;
+/// - normal independently skippable units before the first restart-dependent
+///   split entry are partitioned into solid chains or individual file units;
+/// - from the first restart-dependent split entry (split_before/split_after or
+///   multi-volume part spanning) through the end of the archive, create one
+///   recovery tail unit, ensuring restart from volume 1 preserves all required
+///   traversal data until the entire tail is committed.
 pub fn build_recovery_units(p: &ParsedRar) -> Vec<RecoveryUnit> {
     let mut units: Vec<RecoveryUnit> = Vec::new();
 
-    if p.solid_archive && !p.entries.is_empty() {
+    if p.entries.is_empty() {
+        return units;
+    }
+
+    if p.solid_archive {
         // Whole archive is one recovery unit.
         let ranges = all_packed_ranges(p);
         units.push(RecoveryUnit {
@@ -911,12 +1113,24 @@ pub fn build_recovery_units(p: &ParsedRar) -> Vec<RecoveryUnit> {
         return units;
     }
 
+    // Find the first restart-dependent split entry.
+    let first_split = p.entries.iter().enumerate().position(|(idx, e)| {
+        e.split_before
+            || e.split_after
+            || p.parts
+                .get(idx)
+                .map(|parts| parts.len() > 1)
+                .unwrap_or(false)
+    });
+
+    let normal_limit = first_split.unwrap_or(p.entries.len());
+
     let mut i = 0usize;
-    while i < p.entries.len() {
+    while i < normal_limit {
         if p.entries[i].is_solid {
             // Extend the chain while consecutive entries are solid.
             let mut j = i;
-            while j + 1 < p.entries.len() && p.entries[j + 1].is_solid {
+            while j + 1 < normal_limit && p.entries[j + 1].is_solid {
                 j += 1;
             }
             push_unit(p, &mut units, i, j);
@@ -926,6 +1140,11 @@ pub fn build_recovery_units(p: &ParsedRar) -> Vec<RecoveryUnit> {
             i += 1;
         }
     }
+
+    if normal_limit < p.entries.len() {
+        push_unit(p, &mut units, normal_limit, p.entries.len() - 1);
+    }
+
     units
 }
 
@@ -973,10 +1192,79 @@ fn all_packed_ranges(p: &ParsedRar) -> Vec<PackedRange> {
 mod tests {
     use super::*;
 
+    fn encode_varint(v: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut cur = v;
+        loop {
+            let mut b = (cur & 0x7f) as u8;
+            cur >>= 7;
+            if cur != 0 {
+                b |= 0x80;
+            }
+            out.push(b);
+            if cur == 0 {
+                break;
+            }
+        }
+        out
+    }
+
     #[test]
     fn rar4_signature_detection() {
         let mut data = Vec::new();
         data.extend_from_slice(&RAR4_SIGNATURE);
         assert_eq!(&data[..7], &RAR4_SIGNATURE);
+    }
+
+    #[test]
+    fn test_rar5_extra_records_official_format_and_skip_unknown() {
+        let mut body = Vec::new();
+
+        // 1. Extra Record 0x02 (Hash / Checksum): Size = 33, Type = 0x02, 32 bytes data
+        let mut rec_hash = encode_varint(EXTRA5_HASH);
+        rec_hash.extend_from_slice(&[0xAA; 32]); // hash payload
+        body.extend_from_slice(&encode_varint(rec_hash.len() as u64));
+        body.extend_from_slice(&rec_hash);
+
+        // 2. Extra Record 0x01 (Encryption): Size = 5, Type = 0x01, 4 bytes encryption metadata
+        let mut rec_crypt = encode_varint(EXTRA5_CRYPT);
+        rec_crypt.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]);
+        body.extend_from_slice(&encode_varint(rec_crypt.len() as u64));
+        body.extend_from_slice(&rec_crypt);
+
+        // 3. Extra Record 0x99 (Unknown / future extra field): Size = 10, Type = 0x99, 9 bytes data
+        let mut rec_unknown = encode_varint(0x99);
+        rec_unknown.extend_from_slice(&[0x55; 9]);
+        body.extend_from_slice(&encode_varint(rec_unknown.len() as u64));
+        body.extend_from_slice(&rec_unknown);
+
+        // 4. Extra Record 0x05 (Redirection): Unix symlink to "/target/path"
+        let target = b"/target/path";
+        let mut rec_redir = encode_varint(EXTRA5_REDIR);
+        rec_redir.extend_from_slice(&encode_varint(0x01)); // redir_type 0x01 (UnixSymlink)
+        rec_redir.extend_from_slice(&encode_varint(0x00)); // flags
+        rec_redir.extend_from_slice(&encode_varint(target.len() as u64)); // name size
+        rec_redir.extend_from_slice(target);
+        body.extend_from_slice(&encode_varint(rec_redir.len() as u64));
+        body.extend_from_slice(&rec_redir);
+
+        // 5. Extra Record 0x03 (Time): Size = 6, Type = 0x03, 5 bytes time metadata
+        let mut rec_time = encode_varint(EXTRA5_HTIME);
+        rec_time.extend_from_slice(&[0x10, 0x20, 0x30, 0x40, 0x50]);
+        body.extend_from_slice(&encode_varint(rec_time.len() as u64));
+        body.extend_from_slice(&rec_time);
+
+        let (redir, encrypted) = scan_extras(&body, 0, body.len()).unwrap();
+        assert!(
+            encrypted,
+            "File-level encryption must be detected from EXTRA5_CRYPT"
+        );
+        assert!(
+            redir.is_some(),
+            "Redirection must be parsed from EXTRA5_REDIR"
+        );
+        let r = redir.unwrap();
+        assert_eq!(r.kind, RedirectionKind::UnixSymlink);
+        assert_eq!(r.target, "/target/path");
     }
 }
