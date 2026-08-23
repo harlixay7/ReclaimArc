@@ -253,8 +253,7 @@ let allocated = spacextract_platform::sparse::query_allocated_ranges(
         let got = std::fs::read(dest.join(format!("file{i}.bin"))).expect("output file exists");
         assert_eq!(got, expect, "file{i}.bin must be byte-identical after crash+resume");
     }
-    assert!(!dest.join("file0.bin.sx-partial-").exists() || true);
-
+    
     // Destructive mode: source allocation must have dropped measurably.
     if mode == ExtractionMode::LowSpace {
         let journal = spacextract_journal::JobJournal::open(&journal_path).unwrap();
@@ -530,3 +529,4 @@ fn source_modification_is_detected() {
     );
     std::env::remove_var("SPACEEXTRACT_TEST_FREE_SPACE");
 }
+

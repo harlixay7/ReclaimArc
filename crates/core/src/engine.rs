@@ -36,7 +36,7 @@ use crate::safety::{validate_capacity_before_unit, SpaceCheck, SpaceMonitor};
 use crate::state;
 
 /// How the job should behave on completion regarding the archive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ExtractionMode {
     /// Keep the original archive.
     Normal,
@@ -149,8 +149,23 @@ impl Engine {
         tx: Sender<Event>,
     ) -> Result<(JobHandle, JobJob), CoreError> {
         let job_id = uuid::Uuid::new_v4().to_string();
-        let mut backend = spacextract_archive::backend_for(archive)?;
+let mut backend = spacextract_archive::backend_for(archive)?;
         let info = backend.inspect(&OpenOptions { password: password.clone() })?;
+
+        // Destination must exist before any probe runs against it.
+        if !destination.exists() {
+            std::fs::create_dir_all(destination).map_err(|e| {
+                CoreError::failed(
+                    "create destination",
+                    Some(destination.to_path_buf()),
+                    e.raw_os_error().map(|v| v as u32),
+                    "pending",
+                    format!("cannot create destination '{}': {e}", destination.display()),
+                    "Choose a writable destination folder.",
+                )
+            })?;
+        }
+
         let free = observed_free_space(destination)?;
         let total = total_space(destination).map_err(CoreError::Platform)?;
         let plan = crate::planner::plan(&info, free, total, &self.config)?;
@@ -189,26 +204,20 @@ impl Engine {
             }
         }
 
-        // Validate every entry name before anything is written.
+// Validate every entry name before anything is written.
         let (safe_entries, name_map) = self.validate_entries(&info)?;
-
-        // Destination existence / conflict preflight.
-        if !destination.exists() {
-            std::fs::create_dir_all(destination).map_err(|e| {
-                CoreError::failed(
-                    "create destination",
-                    Some(destination.to_path_buf()),
-                    e.raw_os_error().map(|v| v as u32),
-                    "pending",
-                    format!("cannot create destination '{}': {e}", destination.display()),
-                    "Choose a writable destination folder.",
-                )
-            })?;
-        }
 
         let journal_dir = Self::journal_dir(archive, &job_id);
         let journal_path = journal_dir.join("job.db");
         let now = spacextract_journal::now_iso();
+let settings_json = {
+            let mut v = serde_json::to_value(&self.config).unwrap_or_else(|_| serde_json::json!({}));
+            v["mode"] = serde_json::json!(match mode {
+                ExtractionMode::Normal => "normal",
+                ExtractionMode::LowSpace => "lowspace",
+            });
+            v.to_string()
+        };
         let meta = JobMeta {
             job_id: job_id.clone(),
             created_at: now.clone(),
@@ -217,7 +226,7 @@ impl Engine {
             destination: destination.to_path_buf(),
             archive_fingerprint: None,
             safety_mode: self.config.safety_mode.as_str().to_string(),
-            settings_json: serde_json::to_string(&self.config).unwrap_or_else(|_| "{}".into()),
+            settings_json,
             current_unit: 0,
             job_state: JobState::Active,
         };
@@ -382,9 +391,66 @@ impl Engine {
         Ok((safe_entries, name_map))
     }
 
-    /// Run a job to completion (or pause/cancel/failure).
+/// Run a job to completion (or pause/cancel/failure).
     pub fn run_job(&mut self, job: &mut JobJob, handle: &JobHandle) -> Result<JobOutcome, CoreError> {
         job.run(self.config.clone(), &handle.pause, &handle.cancel)
+    }
+
+    /// Resume an interrupted job from its journal.
+    ///
+    /// Runs the full recovery preparation (identity validation, partial
+    /// reconciliation, reclaim reconciliation) and returns a runnable job.
+    pub fn resume_job(&self, journal_path: &Path, tx: Sender<Event>) -> Result<(JobHandle, JobJob), CoreError> {
+        let journal = crate::recovery::prepare_resume(journal_path, None)?;
+        let meta = journal.job_meta().map_err(CoreError::Journal)?;
+        let mut backend = spacextract_archive::backend_for(&meta.archive_path)?;
+        let info = backend
+            .inspect(&OpenOptions {
+                password: None,
+            })
+            .map_err(|e| {
+                CoreError::failed(
+                    "re-inspect archive for resume",
+                    Some(meta.archive_path.clone()),
+                    None,
+                    "recovery",
+                    format!("cannot re-inspect the archive: {e}"),
+                    "If the archive was moved or renamed, the job cannot resume.",
+                )
+            })?;
+        let (_, name_map) = self.validate_entries(&info)?;
+        let mode = serde_json::from_str::<serde_json::Value>(&meta.settings_json)
+            .ok()
+            .and_then(|v| v.get("mode").and_then(|m| m.as_str()).and_then(|m| match m {
+                "normal" => Some(ExtractionMode::Normal),
+                "lowspace" => Some(ExtractionMode::LowSpace),
+                _ => None,
+            }))
+            .unwrap_or(ExtractionMode::Normal);
+
+        let job_id = meta.job_id.clone();
+        let _ = tx.send(Event::JobStarted {
+            job_id: job_id.clone(),
+        });
+        Ok((
+            JobHandle {
+                job_id: job_id.clone(),
+                pause: Arc::new(AtomicBool::new(false)),
+                cancel: Arc::new(AtomicBool::new(false)),
+            },
+            JobJob {
+                job_id,
+                archive: meta.archive_path.clone(),
+                destination: meta.destination.clone(),
+                journal,
+                info,
+                backend,
+                name_map,
+                mode,
+                password: None,
+                tx,
+            },
+        ))
     }
 }
 
@@ -720,7 +786,7 @@ impl JobJob {
                             .or_default()
                             .push(ByteRange { start: r.start, len: r.len });
                     }
-                    for (v_idx, ranges) in by_volume {
+for (v_idx, ranges) in by_volume {
                         let vol = volumes
                             .get(v_idx as usize)
                             .ok_or_else(|| {

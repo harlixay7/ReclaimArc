@@ -113,22 +113,28 @@ pub fn set_sparse(file: &std::fs::File, path: &Path) -> Result<(), PlatformError
     Ok(())
 }
 
-/// Align a range inward to cluster boundaries.
+/// Align a range inward to the filesystem deallocation granularity.
 ///
 /// `start` is rounded *up* and `end` is rounded *down*, so the resulting range
 /// never extends beyond the retired range. Returns `None` when the aligned
 /// range is empty.
+///
+/// On NTFS, `FSCTL_SET_ZERO_DATA` deallocates only the interior that is
+/// aligned to 64 KiB units (verified empirically: clusters in the first and
+/// last partial 64 KiB window remain allocated). The granularity is therefore
+/// `max(cluster, 64 KiB)`.
 pub fn align_inward(range: ByteRange, cluster: u32) -> Option<ByteRange> {
-    let cluster = cluster as u64;
-    if cluster == 0 {
+    const NTFS_DEALLOC_UNIT: u64 = 64 * 1024;
+    let unit = (cluster as u64).max(NTFS_DEALLOC_UNIT);
+    if unit == 0 {
         return Some(range);
     }
-    let start = if range.start % cluster == 0 {
+    let start = if range.start % unit == 0 {
         range.start
     } else {
-        (range.start / cluster + 1) * cluster
+        (range.start / unit + 1) * unit
     };
-    let end = (range.end() / cluster) * cluster;
+    let end = (range.end() / unit) * unit;
     if start >= end {
         return None;
     }

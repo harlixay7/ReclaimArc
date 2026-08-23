@@ -13,3 +13,4 @@ unrar_sys = "0.5.8"
 
 [dev-dependencies]
 tempfile.workspace = true
+spacextract-platform = { workspace = true }
