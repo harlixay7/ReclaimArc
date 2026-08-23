@@ -678,11 +678,12 @@ impl<'a> SliceFields<'a> {
         Ok(v)
     }
 
-    fn u32(&mut self) -> Result<u32, ArchiveError> {
+fn u32(&mut self) -> Result<u32, ArchiveError> {
         if self.pos + 4 > self.data.len() {
             return Err(ArchiveError::invalid("RAR5 header truncated (u32)"));
         }
-        let v = u32::from_le_bytes(self.data[self.pos..self.pos + 4].try_into().unwrap());
+        let b = &self.data[self.pos..self.pos + 4];
+        let v = (b[0] as u32) | ((b[1] as u32) << 8) | ((b[2] as u32) << 16) | ((b[3] as u32) << 24);
         self.pos += 4;
         Ok(v)
     }
@@ -704,7 +705,7 @@ fn scan_extras(body: &[u8], start: usize, len: usize) -> Result<(Option<Redirect
     let end = start + len;
     let mut redirection = None;
     let mut encrypted = false;
-    while pos + 1 <= end {
+    while pos < end {
         let mut bf = SliceFields::new(&body[pos..end.min(body.len())]);
         let extra_type = match bf.varint() {
             Ok(v) => v,

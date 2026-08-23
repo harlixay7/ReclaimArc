@@ -132,7 +132,7 @@ extern "C" fn unrar_callback(msg: UINT, user_data: LPARAM, p1: LPARAM, p2: LPARA
                 let name = unsafe { std::slice::from_raw_parts(p1 as *const u16, 4096) };
                 let end = name.iter().position(|&c| c == 0).unwrap_or(name.len());
                 let vol = String::from_utf16_lossy(&name[..end]);
-                if !vol.is_empty() && !ctx.opened_volumes.iter().any(|v| *v == vol) {
+                if !vol.is_empty() && !ctx.opened_volumes.contains(&vol) {
                     ctx.opened_volumes.push(vol);
                 }
             }
@@ -203,7 +203,7 @@ impl Unrar {
 /// Read the next file header. Returns `Ok(None)` at end of archive.
     pub fn read_header(&mut self) -> Result<Option<RawHeader>, ArchiveError> {
         let mut h = HeaderDataEx::default();
-        let code = unsafe { RARReadHeaderEx(self.handle, &mut h) };
+        let code = unsafe { RARReadHeaderEx(self.handle, &h) };
                 if code == ERAR_END_ARCHIVE {
             return Ok(None);
         }
@@ -257,8 +257,8 @@ impl Unrar {
             Operation::Test => RAR_TEST,
             Operation::Extract => RAR_EXTRACT,
         };
-        let path_w = dest_path.map(|s| to_wide(s));
-        let name_w = dest_name.map(|s| to_wide(s));
+        let path_w = dest_path.map(to_wide);
+        let name_w = dest_name.map(to_wide);
         let code = unsafe {
             RARProcessFileW(
                 self.handle,

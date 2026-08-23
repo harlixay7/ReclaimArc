@@ -985,10 +985,12 @@ fn rename_into_place(
                 )
             })
         }
-        ConflictPolicy::Skip | ConflictPolicy::Ask => {
+ConflictPolicy::Skip | ConflictPolicy::Ask => {
             if final_path.exists() {
                 // Skip: remove the partial, keep the existing file.
-                let _ = std::fs::remove_file(partial);
+                if let Err(e) = std::fs::remove_file(partial) {
+                    tracing::warn!(path = %partial.display(), "could not remove skipped partial: {e}");
+                }
                 Ok(())
             } else {
                 rename_into_place(partial, final_path, ConflictPolicy::Overwrite)
@@ -1050,7 +1052,16 @@ fn delete_archive_shells(journal: &JobJournal) -> Result<(), CoreError> {
     let volumes = journal.volumes().map_err(CoreError::Journal)?;
     for v in volumes {
         if v.path.exists() {
-            let _ = std::fs::remove_file(&v.path);
+            std::fs::remove_file(&v.path).map_err(|e| {
+                CoreError::failed(
+                    "delete source shell",
+                    Some(v.path.clone()),
+                    e.raw_os_error().map(|v| v as u32),
+                    "COMPLETED",
+                    format!("cannot delete source '{}': {e}", v.path.display()),
+                    "The extraction completed; delete the archive manually.",
+                )
+            })?;
         }
     }
     Ok(())

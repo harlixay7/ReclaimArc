@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "spacextract-desktop"
 version.workspace = true
 edition.workspace = true

@@ -267,7 +267,7 @@ let mut extracted: Vec<u64> = Vec::new();
                 let entry = self
                     .info
                     .as_ref()
-                    .unwrap()
+                    .ok_or_else(|| ArchiveError::open("inspect() must be called before extract_unit()"))?
                     .entries
                     .iter()
                     .find(|e| e.index == index)

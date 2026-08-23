@@ -32,7 +32,7 @@ impl SafeEntry {
 
     /// The path under `dest` (never escapes it).
     pub fn output_path(&self, dest: &Path) -> PathBuf {
-        dest.join(&self.relative())
+        dest.join(self.relative())
     }
 }
 
@@ -48,9 +48,7 @@ impl SafeEntry {
 pub fn validate_entry(name: &str, is_directory: bool) -> Result<SafeEntry, CoreError> {
     let trimmed = name.trim_end_matches('/').trim_end_matches('\\');
     if trimmed.is_empty() {
-        return Err(CoreError::Precondition(format!(
-            "archive contains an empty path name"
-        )));
+        return Err(CoreError::Precondition("archive contains an empty path name".to_string()));
     }
 
     // Absolute path detection (both separator styles and drive prefixes).
@@ -70,7 +68,7 @@ pub fn validate_entry(name: &str, is_directory: bool) -> Result<SafeEntry, CoreE
     }
 
 let mut components: Vec<String> = Vec::new();
-    for raw in trimmed.split(|c| c == '/' || c == '\\') {
+    for raw in trimmed.split(['/', '\\']) {
         if raw.is_empty() {
             return Err(CoreError::Precondition(format!(
                 "archive contains an empty path component in '{name}'"

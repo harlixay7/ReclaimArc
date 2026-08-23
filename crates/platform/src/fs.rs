@@ -37,7 +37,7 @@ pub fn open_for_identity(path: &Path) -> Result<std::fs::File, PlatformError> {
     let result = unsafe {
         CreateFileW(
             PCWSTR(name.as_ptr()),
-            FILE_READ_ATTRIBUTES.0 as u32,
+            FILE_READ_ATTRIBUTES.0,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             None,
             OPEN_EXISTING,

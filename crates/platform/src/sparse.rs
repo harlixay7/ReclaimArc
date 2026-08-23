@@ -129,7 +129,7 @@ pub fn align_inward(range: ByteRange, cluster: u32) -> Option<ByteRange> {
     if unit == 0 {
         return Some(range);
     }
-    let start = if range.start % unit == 0 {
+    let start = if range.start.is_multiple_of(unit) {
         range.start
     } else {
         (range.start / unit + 1) * unit
@@ -296,7 +296,7 @@ pub fn open_for_query(path: &Path) -> Result<std::fs::File, PlatformError> {
     let result = unsafe {
         CreateFileW(
             windows::core::PCWSTR(name.as_ptr()),
-            GENERIC_READ.0 | FILE_READ_DATA.0 as u32,
+            GENERIC_READ.0 | FILE_READ_DATA.0,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             None,
             OPEN_EXISTING,
