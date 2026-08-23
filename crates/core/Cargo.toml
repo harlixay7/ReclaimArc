@@ -16,6 +16,14 @@ blake3.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 
+[features]
+# Test-only observation hook: replaces the free-space probe with
+# SPACEEXTRACT_TEST_FREE_SPACE. Enabled only in test builds. Never in
+# production. See TESTING.md.
+test-hooks = []
+
 [dev-dependencies]
 tempfile.workspace = true
 proptest.workspace = true
+spacextract-core = { path = ".", features = ["test-hooks"] }
+spacextract-archive = { workspace = true }

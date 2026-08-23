@@ -200,11 +200,11 @@ impl Unrar {
         })
     }
 
-    /// Read the next file header. Returns `Ok(None)` at end of archive.
+/// Read the next file header. Returns `Ok(None)` at end of archive.
     pub fn read_header(&mut self) -> Result<Option<RawHeader>, ArchiveError> {
         let mut h = HeaderDataEx::default();
         let code = unsafe { RARReadHeaderEx(self.handle, &mut h) };
-        if code == ERAR_END_ARCHIVE {
+                if code == ERAR_END_ARCHIVE {
             return Ok(None);
         }
         if code != 0 {
@@ -274,11 +274,10 @@ impl Unrar {
         if code == 0 {
             return Ok(());
         }
-        // A user abort from the callback surfaces as ERAR_UNKNOWN; treat it as
-        // cancellation when the flag is set.
-        if ctx.cancel.as_ref().map(|c| c.load(Ordering::Relaxed)).unwrap_or(false)
-            && code == ERAR_UNKNOWN
-        {
+        // The DLL reports a callback abort (our progress/pause callback
+        // returning false) as ERAR_UNKNOWN (RARX_USERBREAK has no dedicated
+        // DLL code). Treat it as cancellation.
+        if code == ERAR_UNKNOWN {
             return Err(ArchiveError::Cancelled);
         }
         Err(map_process_error(code, "process file"))
@@ -354,3 +353,4 @@ mod tests {
         assert_eq!(back, s);
     }
 }
+

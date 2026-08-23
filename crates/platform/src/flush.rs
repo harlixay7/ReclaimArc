@@ -31,15 +31,20 @@ pub fn flush_file(file: &std::fs::File, path: &Path) -> Result<(), PlatformError
 /// Flush a directory so that renames/creates inside it are durable.
 ///
 /// On NTFS/ReFS this works by opening the directory with
-/// `FILE_FLAG_BACKUP_SEMANTICS` and flushing it. On filesystems that cannot
-/// flush directories this returns an explicit `UnsupportedFilesystem` error â€”
-/// the engine records it in the journal and treats the job accordingly.
+/// `FILE_FLAG_BACKUP_SEMANTICS` and flushing it. `FlushFileBuffers` on a
+/// directory requires `FILE_WRITE_DATA` access on the handle (verified
+/// empirically; read-only handles fail with ERROR_ACCESS_DENIED). On
+/// filesystems that cannot flush directories this returns an explicit
+/// `UnsupportedFilesystem` error — the engine records it in the journal and
+/// treats the job accordingly.
 pub fn flush_directory(path: &Path) -> Result<(), PlatformError> {
+    use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+
     let name: Vec<u16> = extend_path(path)?.encode_utf16().chain(std::iter::once(0)).collect();
     let result = unsafe {
         CreateFileW(
             PCWSTR(name.as_ptr()),
-            FILE_READ_ATTRIBUTES.0 as u32,
+            GENERIC_READ.0 | GENERIC_WRITE.0,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             None,
             OPEN_EXISTING,

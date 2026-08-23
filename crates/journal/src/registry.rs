@@ -52,7 +52,11 @@ impl Registry {
     }
 
     /// The default application data directory for SpaceExtract.
+    /// Overridable via `SPACEEXTRACT_APP_DATA` (used by tests).
     pub fn default_app_data_dir() -> PathBuf {
+        if let Some(dir) = std::env::var_os("SPACEEXTRACT_APP_DATA") {
+            return PathBuf::from(dir);
+        }
         let local = std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));

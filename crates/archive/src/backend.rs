@@ -3,6 +3,7 @@
 //! `RetirementProof` objects describing when a source range can never again
 //! be needed for a successful restart.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -17,10 +18,18 @@ pub struct ExtractOptions {
     pub dest_dir: PathBuf,
     /// Job id used in partial-file suffixes.
     pub job_id: String,
+    /// Partial-name suffix appended to each validated entry path. The engine
+    /// makes this unique per attempt so that a file left locked by an aborted
+    /// decoder never blocks a retry.
+    pub partial_suffix: String,
     /// Optional password (never persisted anywhere).
     pub password: Option<String>,
     /// Cancellation flag (checked between files and mid-file via callback).
     pub cancel: Option<Arc<AtomicBool>>,
+    /// Validated relative output paths for each entry (index → relative
+    /// path). The backend MUST write through these names; raw archive names
+    /// are hostile and never used for filesystem paths.
+    pub name_map: HashMap<u64, String>,
 }
 
 /// Options for opening/listing an archive.

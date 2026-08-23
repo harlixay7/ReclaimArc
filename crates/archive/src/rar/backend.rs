@@ -1,4 +1,4 @@
-//! RAR backend: implements `ArchiveBackend` for RAR 4.x / 5.x using the
+﻿//! RAR backend: implements `ArchiveBackend` for RAR 4.x / 5.x using the
 //! official UnRAR library for decoding and our own header parser for exact
 //! packed ranges, solid chains and recovery units.
 
@@ -30,16 +30,22 @@ impl RarBackend {
             info: None,
         }
     }
+}
 
-    fn partial_name(&self, entry_name: &str, job_id: &str) -> String {
-        // <dest>/<dir>/<name>.sx-partial-<job>
-        let suffix = format!(".sx-partial-{job_id}");
-        if entry_name.ends_with('/') || entry_name.ends_with('\\') {
-            format!("{entry_name}{}", suffix.trim_start_matches('.'))
-        } else {
-            format!("{entry_name}{suffix}")
-        }
-    }
+/// The partial output path for an entry, derived ONLY from the engine's
+/// validated name map and the engine-chosen per-attempt suffix.
+fn partial_output_path(options: &ExtractOptions, entry_index: u64, entry_name: &str) -> PathBuf {
+    let validated = options
+        .name_map
+        .get(&entry_index)
+        .cloned()
+        .unwrap_or_else(|| entry_name.to_string());
+    let suffix = if options.partial_suffix.is_empty() {
+        format!(".sx-partial-{}", options.job_id)
+    } else {
+        options.partial_suffix.clone()
+    };
+    options.dest_dir.join(format!("{validated}{suffix}"))
 }
 
 impl ArchiveBackend for RarBackend {
@@ -246,18 +252,22 @@ impl ArchiveBackend for RarBackend {
             options.cancel.clone(),
         )?;
 
-        let mut extracted: Vec<u64> = Vec::new();
+let mut extracted: Vec<u64> = Vec::new();
         let mut bytes_written: u64 = 0;
         let mut index = 0u64;
         let mut progress = progress;
+        let _ = info;
 
         loop {
             let Some(h) = decoder.read_header()? else { break };
-            if index < unit.first_entry {
+                        if index < unit.first_entry {
                 // Belongs to an already-committed unit: skip (seek) only.
                 decoder.process_file(Operation::Skip, None, None, None, index, h.pack_size)?;
-            } else if index <= unit.last_entry {
-                let entry = info
+                            } else if index <= unit.last_entry {
+                let entry = self
+                    .info
+                    .as_ref()
+                    .unwrap()
                     .entries
                     .iter()
                     .find(|e| e.index == index)
@@ -265,10 +275,10 @@ impl ArchiveBackend for RarBackend {
                 if entry.is_directory {
                     // Directories are created by the engine after commit.
                     decoder.process_file(Operation::Skip, None, None, None, index, h.pack_size)?;
-                } else {
-                    let partial = options.dest_dir.join(&self.partial_name(&entry.name, &options.job_id));
+} else {
+                    let partial = partial_output_path(options, index, &entry.name);
                     let partial_str = partial.to_string_lossy().into_owned();
-                    decoder.process_file(
+                                        decoder.process_file(
                         Operation::Extract,
                         None,
                         Some(&partial_str),
@@ -276,7 +286,7 @@ impl ArchiveBackend for RarBackend {
                         index,
                         entry.unpacked_size,
                     )?;
-                    extracted.push(index);
+                                        extracted.push(index);
                     bytes_written = bytes_written.saturating_add(entry.unpacked_size);
                 }
             } else {
@@ -479,12 +489,16 @@ mod tests {
 
         // Extract unit 0.
         let cancel = Arc::new(AtomicBool::new(false));
-        let opts = crate::backend::ExtractOptions {
+        let mut opts = crate::backend::ExtractOptions {
             dest_dir: out.clone(),
             job_id: "job1".into(),
             password: None,
             cancel: Some(cancel),
+            partial_suffix: String::new(),
+            name_map: std::collections::HashMap::new(),
         };
+        opts.name_map.insert(0, "one.txt".to_string());
+        opts.name_map.insert(1, "sub\\two.txt".to_string());
         let report = backend.extract_unit(0, &opts, None).unwrap();
         assert_eq!(report.extracted, vec![0]);
         let partial = out.join("one.txt.sx-partial-job1");
@@ -512,12 +526,15 @@ mod tests {
         let mut backend = RarBackend::new(&paths[0]);
         backend.inspect(&OpenOptions::default()).unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
-        let opts = ExtractOptions {
+        let mut opts = ExtractOptions {
             dest_dir: out,
             job_id: "j".into(),
             password: None,
             cancel: Some(cancel),
+            partial_suffix: String::new(),
+            name_map: std::collections::HashMap::new(),
         };
+        opts.name_map.insert(0, "a.txt".to_string());
         let result = backend.extract_unit(0, &opts, None);
         assert!(result.is_err(), "corrupt file must fail extraction");
         match result.unwrap_err() {
@@ -549,12 +566,17 @@ mod tests {
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
-        let opts = ExtractOptions {
+        let mut opts = ExtractOptions {
             dest_dir: out.clone(),
             job_id: "mv".into(),
             password: None,
             cancel: Some(cancel),
+            partial_suffix: String::new(),
+            name_map: std::collections::HashMap::new(),
         };
+        opts.name_map.insert(0, "a.bin".to_string());
+        opts.name_map.insert(1, "b.bin".to_string());
+        opts.name_map.insert(2, "c.bin".to_string());
         for u in &info.recovery_units {
             let report = backend.extract_unit(u.seq, &opts, None).unwrap();
             assert_eq!(report.verified, true);
@@ -564,3 +586,5 @@ mod tests {
         assert_eq!(std::fs::read(out.join("c.bin.sx-partial-mv")).unwrap(), vec![0x33; 4000]);
     }
 }
+
+

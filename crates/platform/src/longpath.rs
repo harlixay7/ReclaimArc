@@ -42,3 +42,30 @@ pub fn extend_path(path: &Path) -> Result<String, PlatformError> {
 pub fn extended(path: &Path) -> Result<PathBuf, PlatformError> {
     Ok(PathBuf::from(extend_path(path)?))
 }
+
+/// Atomically replace `dst` with `src` on the same volume, with
+/// `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH` so the rename is
+/// durable.
+pub fn rename_existing(src: &Path, dst: &Path) -> Result<(), PlatformError> {
+    use windows::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let src_w: Vec<u16> = extend_path(src)?.encode_utf16().chain(std::iter::once(0)).collect();
+    let dst_w: Vec<u16> = extend_path(dst)?.encode_utf16().chain(std::iter::once(0)).collect();
+    let result = unsafe {
+        MoveFileExW(
+            windows::core::PCWSTR(src_w.as_ptr()),
+            windows::core::PCWSTR(dst_w.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    result.map_err(|e| {
+        PlatformError::from_os(
+            crate::error::PlatformErrorKind::Win32,
+            "atomic rename",
+            Some(dst),
+            e.code().0 as u32,
+        )
+    })
+}

@@ -435,16 +435,23 @@ impl JobJournal {
         Ok(())
     }
 
-    /// Record partial/final paths for an entry (set before extraction).
+/// Record partial/final paths for an entry (set before extraction).
+    /// Only the provided (non-None) columns are updated.
     pub fn set_entry_paths(&mut self, index: u64, partial: Option<&Path>, final_path: Option<&Path>) -> Result<()> {
-        self.conn.execute(
-            "UPDATE entries SET partial_path = ?1, final_path = ?2 WHERE index_in_archive = ?3",
-            params![
-                partial.map(|p| p.to_string_lossy().into_owned()),
-                final_path.map(|p| p.to_string_lossy().into_owned()),
-                index as i64
-            ],
-        )?;
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(p) = partial {
+            tx.execute(
+                "UPDATE entries SET partial_path = ?1 WHERE index_in_archive = ?2",
+                params![p.to_string_lossy().into_owned(), index as i64],
+            )?;
+        }
+        if let Some(f) = final_path {
+            tx.execute(
+                "UPDATE entries SET final_path = ?1 WHERE index_in_archive = ?2",
+                params![f.to_string_lossy().into_owned(), index as i64],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
