@@ -182,50 +182,87 @@ pub fn query_allocated_ranges(
     if len == 0 {
         return Ok(vec![]);
     }
-    let query = FILE_ALLOCATED_RANGE_BUFFER {
-        FileOffset: start as i64,
-        Length: len as i64,
-    };
-    let mut output: Vec<FILE_ALLOCATED_RANGE_BUFFER> = Vec::with_capacity(16);
-    let mut out_bytes = (16 * std::mem::size_of::<FILE_ALLOCATED_RANGE_BUFFER>()) as u32;
-    loop {
+    let end_offset = start.saturating_add(len);
+    let mut current_offset = start;
+    let mut all_ranges = Vec::new();
+
+    const CHUNK_ENTRIES: usize = 1024;
+    let mut buffer: Vec<FILE_ALLOCATED_RANGE_BUFFER> =
+        vec![FILE_ALLOCATED_RANGE_BUFFER::default(); CHUNK_ENTRIES];
+    let out_bytes = (CHUNK_ENTRIES * std::mem::size_of::<FILE_ALLOCATED_RANGE_BUFFER>()) as u32;
+
+    while current_offset < end_offset {
+        let remaining_len = end_offset.saturating_sub(current_offset);
+        if remaining_len == 0 {
+            break;
+        }
+        let query = FILE_ALLOCATED_RANGE_BUFFER {
+            FileOffset: current_offset as i64,
+            Length: remaining_len as i64,
+        };
         let mut returned: u32 = 0;
-        let ok = unsafe {
+        let res = unsafe {
             DeviceIoControl(
                 HANDLE(file.as_raw_handle() as *mut _),
                 FSCTL_QUERY_ALLOCATED_RANGES,
                 Some(&query as *const _ as *const _),
                 std::mem::size_of::<FILE_ALLOCATED_RANGE_BUFFER>() as u32,
-                Some(output.as_mut_ptr() as *mut _),
+                Some(buffer.as_mut_ptr() as *mut _),
                 out_bytes,
                 Some(&mut returned),
                 None,
             )
         };
-        if let Err(e) = ok {
-            return Err(PlatformError::from_os(
-                PlatformErrorKind::Win32,
-                "FSCTL_QUERY_ALLOCATED_RANGES",
-                Some(path),
-                e.code().0 as u32,
-            ));
-        }
+
+        let more_data = match res {
+            Ok(()) => false,
+            Err(e) => {
+                let code = e.code().0 as u32;
+                if code == windows::Win32::Foundation::ERROR_MORE_DATA.0
+                    || (code & 0xFFFF) == windows::Win32::Foundation::ERROR_MORE_DATA.0
+                    || e.code() == windows::Win32::Foundation::ERROR_MORE_DATA.to_hresult()
+                {
+                    true
+                } else {
+                    return Err(PlatformError::from_os(
+                        PlatformErrorKind::Win32,
+                        "FSCTL_QUERY_ALLOCATED_RANGES",
+                        Some(path),
+                        code,
+                    ));
+                }
+            }
+        };
+
         let count = (returned as usize) / std::mem::size_of::<FILE_ALLOCATED_RANGE_BUFFER>();
-        unsafe { output.set_len(count) };
-        if returned < out_bytes {
+        if count == 0 {
             break;
         }
-        out_bytes = out_bytes.saturating_mul(2);
-        output.resize(out_bytes as usize / std::mem::size_of::<FILE_ALLOCATED_RANGE_BUFFER>(), FILE_ALLOCATED_RANGE_BUFFER::default());
+
+        for r in &buffer[..count] {
+            let r_start = r.FileOffset.max(0) as u64;
+            let r_len = r.Length.max(0) as u64;
+            if r_len > 0 {
+                all_ranges.push(ByteRange {
+                    start: r_start,
+                    len: r_len,
+                });
+            }
+        }
+
+        let last = &buffer[count - 1];
+        let next_offset = (last.FileOffset.max(0) as u64).saturating_add(last.Length.max(0) as u64);
+        if next_offset <= current_offset {
+            break;
+        }
+        current_offset = next_offset;
+
+        if !more_data {
+            break;
+        }
     }
-    Ok(output
-        .iter()
-        .map(|r| ByteRange {
-            start: r.FileOffset.max(0) as u64,
-            len: r.Length.max(0) as u64,
-        })
-        .filter(|r| r.len > 0)
-        .collect())
+
+    Ok(all_ranges)
 }
 
 /// Reclaim a byte range of a file: mark sparse if needed, zero the aligned
@@ -242,17 +279,15 @@ pub fn reclaim_range(
 ) -> Result<ReclaimReport, PlatformError> {
     let cluster = crate::fs::cluster_size(path)?;
     let Some(aligned) = align_inward(range, cluster) else {
-        let alloc = crate::fs::allocated_size_from_handle(file, path)?;
         return Ok(ReclaimReport {
             requested: range,
             reclaimed: vec![],
             remaining: vec![range],
-            allocated_before: alloc,
-            allocated_after: alloc,
+            allocated_before: 0,
+            allocated_after: 0,
         });
     };
 
-    let allocated_before = crate::fs::allocated_size_from_handle(file, path)?;
     let before = query_allocated_ranges(file, path, aligned.start, aligned.len)?;
 
     if !before.is_empty() {
@@ -260,7 +295,6 @@ pub fn reclaim_range(
     }
 
     let after = query_allocated_ranges(file, path, aligned.start, aligned.len)?;
-    let allocated_after = crate::fs::allocated_size_from_handle(file, path)?;
 
     let reclaimed: Vec<ByteRange> = before
         .iter()
@@ -273,8 +307,8 @@ pub fn reclaim_range(
         requested: aligned,
         reclaimed,
         remaining,
-        allocated_before,
-        allocated_after,
+        allocated_before: 0,
+        allocated_after: 0,
     })
 }
 
@@ -340,5 +374,45 @@ pub fn open_for_reclaim(path: &Path) -> Result<std::fs::File, PlatformError> {
             Some(path),
             e.code().0 as u32,
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn test_many_sparse_ranges_query_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("many_holes.bin");
+        let mut f = std::fs::File::create(&file_path).unwrap();
+
+        // Write a 4MB file with non-zero data
+        let chunk = vec![0xAAu8; 64 * 1024];
+        for _ in 0..64 {
+            f.write_all(&chunk).unwrap();
+        }
+        f.flush().unwrap();
+        drop(f);
+
+        let file = open_for_reclaim(&file_path).unwrap();
+        set_sparse(&file, &file_path).unwrap();
+
+        // Punch 40 separate holes (every odd 64KB block)
+        for i in 0..40 {
+            let offset = (i * 2 + 1) * 64 * 1024;
+            let range = ByteRange {
+                start: offset,
+                len: 64 * 1024,
+            };
+            let _ = reclaim_range(&file, &file_path, range);
+        }
+
+        let ranges = query_allocated_ranges(&file, &file_path, 0, 4 * 1024 * 1024).unwrap();
+        assert!(!ranges.is_empty(), "allocated ranges should not be empty");
+
+        let alloc_size = crate::fs::allocated_size_from_handle(&file, &file_path).unwrap();
+        assert!(alloc_size > 0, "allocated size should be non-zero");
     }
 }

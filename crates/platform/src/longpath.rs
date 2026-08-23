@@ -1,9 +1,9 @@
-//! Long-path-safe helpers.
+﻿//! Long-path-safe helpers.
 //!
 //! Windows paths longer than 260 characters require the extended-length
 //! prefix `\\?\`. Note that `\\?\` disables dot-segment normalization, so this
 //! layer is only ever fed already-validated clean paths (see
-//! `spacextract-core` path security).
+//! `reclaimarc-core` path security).
 
 use std::path::{Path, PathBuf};
 

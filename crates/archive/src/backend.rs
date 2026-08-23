@@ -110,4 +110,7 @@ pub trait ArchiveBackend: Send {
 
     /// The recovery units of the currently inspected archive.
     fn recovery_units(&self) -> &[RecoveryUnit];
+
+    /// Close any open decoder handles to release locks on archive files.
+    fn close(&mut self) {}
 }

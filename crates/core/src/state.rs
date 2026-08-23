@@ -1,4 +1,4 @@
-//! Recovery-unit state machine.
+﻿//! Recovery-unit state machine.
 //!
 //! The master-plan lifecycle:
 //! PENDING → EXTRACTING → OUTPUT_WRITTEN → OUTPUT_VERIFIED → OUTPUT_DURABLE
@@ -8,7 +8,7 @@
 //! filesystem action). Transitions are strictly linear — no skipping, no
 //! going backwards.
 
-use spacextract_journal::UnitState;
+use reclaimarc_journal::UnitState;
 
 use crate::error::CoreError;
 

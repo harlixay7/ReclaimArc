@@ -1,11 +1,29 @@
+﻿# Build outputs
 /target
-**/*.rs.bk
-apps/desktop/node_modules
-apps/desktop/dist
 apps/desktop/src-tauri/target
+apps/desktop/dist
+apps/desktop/node_modules
+
+# Temporary & Rust backup files
+**/*.rs.bk
 *.log
+*.tmp
+*.sx-partial*
+.reclaimarc/
+
+# Databases
+*.db
+*.db-wal
+*.db-shm
+
+# IDE & OS artifacts
 .idea
 .vscode
 .DS_Store
+Thumbs.db
+desktop.ini
+
+# Test datasets
 testdata/downloaded/
 testdata/work/
+

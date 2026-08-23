@@ -1,4 +1,4 @@
-# SpaceExtract — Testing
+﻿# ReclaimArc — Testing
 
 ## Running the suite
 
@@ -16,7 +16,7 @@ Expect:
 
 `crates/core/tests/fault_injection.rs` simulates process death at **every
 durable transition** by running the engine in a child process with
-`SPACEEXTRACT_FAULT_AT=<point>`; the child dies with exit code 86 at the
+`RECLAIMARC_FAULT_AT=<point>`; the child dies with exit code 86 at the
 requested point. The parent then:
 
 1. asserts the child died at the exact point,
@@ -37,7 +37,7 @@ rejection, pause→resume completion, and source-modification detection.
 
 ## Test-only free-space hook
 
-`SPACEEXTRACT_TEST_FREE_SPACE` replaces the free-space observation when the
+`RECLAIMARC_TEST_FREE_SPACE` replaces the free-space observation when the
 `test-hooks` feature is enabled (dev builds only). This lets integration
 tests exercise low-space scenarios deterministically; it is not a faked
 result — the planner, engine and reclamation all run their real logic

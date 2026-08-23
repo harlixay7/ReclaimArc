@@ -1,7 +1,7 @@
-#![deny(unsafe_op_in_unsafe_fn)]
+﻿#![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
-//! SpaceExtract platform layer.
+//! ReclaimArc platform layer.
 //!
 //! Windows-first implementation of the filesystem operations required by the
 //! transactional storage engine: file identity, allocated sizes, free space,

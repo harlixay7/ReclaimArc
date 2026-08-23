@@ -1,10 +1,10 @@
-//! Core engine errors. Every failure carries enough structure to be recorded
+﻿//! Core engine errors. Every failure carries enough structure to be recorded
 //! in the journal and surfaced with a recommended action — the engine never
 //! silently swallows a filesystem error.
 
-use spacextract_archive::ArchiveError;
-use spacextract_journal::JournalError;
-use spacextract_platform::PlatformError;
+use reclaimarc_archive::ArchiveError;
+use reclaimarc_journal::JournalError;
+use reclaimarc_platform::PlatformError;
 
 /// Core error type.
 #[derive(Debug, thiserror::Error)]

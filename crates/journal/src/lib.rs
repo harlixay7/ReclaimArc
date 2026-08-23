@@ -1,4 +1,4 @@
-//! Durable recovery journal for SpaceExtract.
+﻿//! Durable recovery journal for ReclaimArc.
 //!
 //! A per-job SQLite database (WAL, `synchronous=FULL`) recording every durable
 //! transition of the transactional extraction engine, plus a mirrored job

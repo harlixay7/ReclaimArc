@@ -2674,6 +2674,100 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20675572f6f24e9e76ef639bc5552774ed45f1c30e2951e1e99c59888861c539"
 
 [[package]]
+name = "reclaimarc-archive"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "reclaimarc-platform",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tracing",
+ "unrar_sys",
+]
+
+[[package]]
+name = "reclaimarc-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ctrlc",
+ "reclaimarc-archive",
+ "reclaimarc-core",
+ "reclaimarc-journal",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+ "windows",
+]
+
+[[package]]
+name = "reclaimarc-core"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "chrono",
+ "proptest",
+ "reclaimarc-archive",
+ "reclaimarc-core",
+ "reclaimarc-journal",
+ "reclaimarc-platform",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "reclaimarc-desktop"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "reclaimarc-archive",
+ "reclaimarc-core",
+ "reclaimarc-journal",
+ "reclaimarc-platform",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-shell",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "reclaimarc-journal"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "reclaimarc-platform"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "thiserror 2.0.20",
+ "tracing",
+ "windows",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3262,98 +3356,6 @@ dependencies = [
  "gobject-sys",
  "libc",
  "system-deps",
-]
-
-[[package]]
-name = "spacextract-archive"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "serde",
- "spacextract-platform",
- "tempfile",
- "thiserror 2.0.20",
- "tracing",
- "unrar_sys",
-]
-
-[[package]]
-name = "spacextract-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "ctrlc",
- "serde",
- "serde_json",
- "spacextract-archive",
- "spacextract-core",
- "spacextract-journal",
- "tracing",
- "tracing-subscriber",
- "windows",
-]
-
-[[package]]
-name = "spacextract-core"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "chrono",
- "proptest",
- "serde",
- "serde_json",
- "spacextract-archive",
- "spacextract-core",
- "spacextract-journal",
- "spacextract-platform",
- "tempfile",
- "thiserror 2.0.20",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "spacextract-desktop"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "serde",
- "serde_json",
- "spacextract-archive",
- "spacextract-core",
- "spacextract-journal",
- "spacextract-platform",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-shell",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "spacextract-journal"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.20",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "spacextract-platform"
-version = "0.1.0"
-dependencies = [
- "tempfile",
- "thiserror 2.0.20",
- "tracing",
- "windows",
 ]
 
 [[package]]

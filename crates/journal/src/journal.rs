@@ -16,7 +16,7 @@ use crate::error::{JournalError, Result};
 use crate::models::*;
 use crate::schema;
 
-/// A per-job journal opened on `<archive_dir>/.spacextract/<job_id>/job.db`.
+/// A per-job journal opened on `<archive_dir>/.reclaimarc/<job_id>/job.db`.
 pub struct JobJournal {
     conn: Connection,
 }
@@ -41,7 +41,7 @@ impl JobJournal {
         Ok(j)
     }
 
-    /// Open an existing journal and validate it is a SpaceExtract journal.
+    /// Open an existing journal and validate it is a ReclaimArc journal.
     pub fn open(path: &Path) -> Result<JobJournal> {
         let conn = Self::open_conn(path)?;
         let has_meta_table: bool = conn
@@ -671,7 +671,7 @@ mod tests {
     }
 
     fn db_path(dir: &std::path::Path) -> std::path::PathBuf {
-        dir.join(".spacextract").join("test-job").join("job.db")
+        dir.join(".reclaimarc").join("test-job").join("job.db")
     }
 
     #[test]

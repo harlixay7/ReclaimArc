@@ -1,6 +1,6 @@
-# SpaceExtract — Safety Model
+﻿# ReclaimArc — Safety Model
 
-SpaceExtract converts disk allocation occupied by an archive into allocation
+ReclaimArc converts disk allocation occupied by an archive into allocation
 occupied by verified extracted files. This document states exactly when the
 engine is allowed to destroy source bytes — and when it is not.
 

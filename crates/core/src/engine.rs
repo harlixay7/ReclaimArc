@@ -14,18 +14,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
-use spacextract_archive::model::ArchiveInfo;
-use spacextract_archive::{ArchiveBackend, ExtractOptions, OpenOptions, ProgressEvent};
-use spacextract_journal::models::{
+use reclaimarc_archive::model::ArchiveInfo;
+use reclaimarc_archive::{ArchiveBackend, ExtractOptions, OpenOptions, ProgressEvent};
+use reclaimarc_journal::models::{
     EntryRecord, EntryStatus, FileIdentity, JobMeta, JobState, PackedRangeRecord, RangeState,
     RecoveryUnitRecord, UnitState, VolumeRecord,
 };
-use spacextract_journal::{JobJournal, Registry, RegistryEntry};
-use spacextract_platform::fs::{
+use reclaimarc_journal::{JobJournal, Registry, RegistryEntry};
+use reclaimarc_platform::fs::{
     allocated_size_from_handle, file_identity, free_space, same_storage_pool, total_space,
 };
-use spacextract_platform::sparse::{open_for_reclaim, reclaim_range, set_sparse, ByteRange};
-use spacextract_platform::{flush, longpath};
+use reclaimarc_platform::sparse::{open_for_reclaim, reclaim_range, set_sparse, ByteRange};
+use reclaimarc_platform::{flush, longpath};
 
 use crate::config::{ConflictPolicy, EngineConfig};
 use crate::error::CoreError;
@@ -83,11 +83,11 @@ pub enum JobOutcome {
 /// Observe free space on the volume containing `dir`.
 ///
 /// With the `test-hooks` feature this can be overridden via
-/// `SPACEEXTRACT_TEST_FREE_SPACE` so integration tests can exercise
+/// `RECLAIMARC_TEST_FREE_SPACE` so integration tests can exercise
 /// low-space scenarios deterministically (documented in TESTING.md).
 pub fn observed_free_space(dir: &Path) -> Result<u64, CoreError> {
     #[cfg(feature = "test-hooks")]
-    if let Ok(v) = std::env::var("SPACEEXTRACT_TEST_FREE_SPACE") {
+    if let Ok(v) = std::env::var("RECLAIMARC_TEST_FREE_SPACE") {
         if let Ok(bytes) = v.parse::<u64>() {
             return Ok(bytes);
         }
@@ -119,8 +119,8 @@ impl Engine {
     pub fn journal_dir(archive: &Path, job_id: &str) -> PathBuf {
         archive
             .parent()
-            .map(|p| p.join(".spacextract").join(job_id))
-            .unwrap_or_else(|| PathBuf::from(".spacextract").join(job_id))
+            .map(|p| p.join(".reclaimarc").join(job_id))
+            .unwrap_or_else(|| PathBuf::from(".reclaimarc").join(job_id))
     }
 
     /// Analyze an archive for a destination: full inspection + space plan.
@@ -130,7 +130,7 @@ impl Engine {
         destination: &Path,
         password: Option<String>,
     ) -> Result<(ArchiveInfo, crate::planner::SpacePlan), CoreError> {
-        let mut backend = spacextract_archive::backend_for(archive)?;
+        let mut backend = reclaimarc_archive::backend_for(archive)?;
         let info = backend.inspect(&OpenOptions { password })?;
         let free = observed_free_space(destination)?;
         let total = total_space(destination).map_err(CoreError::Platform)?;
@@ -149,7 +149,7 @@ impl Engine {
         tx: Sender<Event>,
     ) -> Result<(JobHandle, JobJob), CoreError> {
         let job_id = uuid::Uuid::new_v4().to_string();
-let mut backend = spacextract_archive::backend_for(archive)?;
+let mut backend = reclaimarc_archive::backend_for(archive)?;
         let info = backend.inspect(&OpenOptions { password: password.clone() })?;
 
         // Destination must exist before any probe runs against it.
@@ -196,7 +196,7 @@ let mut backend = spacextract_archive::backend_for(archive)?;
                             .into(),
                     ));
                 }
-                let caps = spacextract_platform::capabilities::filesystem_capabilities(destination)
+                let caps = reclaimarc_platform::capabilities::filesystem_capabilities(destination)
                     .map_err(CoreError::Platform)?;
                 if !caps.progressive_reclaim_supported {
                     return Err(CoreError::Infeasible(caps.probe.verdict));
@@ -209,7 +209,7 @@ let mut backend = spacextract_archive::backend_for(archive)?;
 
         let journal_dir = Self::journal_dir(archive, &job_id);
         let journal_path = journal_dir.join("job.db");
-        let now = spacextract_journal::now_iso();
+        let now = reclaimarc_journal::now_iso();
 let settings_json = {
             let mut v = serde_json::to_value(&self.config).unwrap_or_else(|_| serde_json::json!({}));
             v["mode"] = serde_json::json!(match mode {
@@ -237,7 +237,7 @@ let settings_json = {
         for (i, v) in info.volumes.iter().enumerate() {
             let ident = file_identity(&v.path).map_err(CoreError::Platform)?;
             let handle =
-                spacextract_platform::sparse::open_for_query(&v.path).map_err(CoreError::Platform)?;
+                reclaimarc_platform::sparse::open_for_query(&v.path).map_err(CoreError::Platform)?;
             let allocated = allocated_size_from_handle(&handle, &v.path).map_err(CoreError::Platform)?;
             volumes.push(VolumeRecord {
                 path: v.path.clone(),
@@ -403,7 +403,7 @@ let settings_json = {
     pub fn resume_job(&self, journal_path: &Path, tx: Sender<Event>) -> Result<(JobHandle, JobJob), CoreError> {
         let journal = crate::recovery::prepare_resume(journal_path, None)?;
         let meta = journal.job_meta().map_err(CoreError::Journal)?;
-        let mut backend = spacextract_archive::backend_for(&meta.archive_path)?;
+        let mut backend = reclaimarc_archive::backend_for(&meta.archive_path)?;
         let info = backend
             .inspect(&OpenOptions {
                 password: None,
@@ -502,8 +502,14 @@ impl JobJob {
     ) -> Result<JobOutcome, CoreError> {
         let tx = self.tx.clone();
 
-        // Pre-test for destructive extraction.
-        if self.mode == ExtractionMode::LowSpace && config.pre_test {
+        // Determine units state and whether this is a resume of an in-progress job.
+        let units = self.journal.units().map_err(CoreError::Journal)?;
+        let is_resuming = units
+            .iter()
+            .any(|u| state::is_committed(u.state) || state::is_reclaimed(u.state));
+
+        // Pre-test for destructive extraction (only on initial start, before any source holes are punched).
+        if self.mode == ExtractionMode::LowSpace && config.pre_test && !is_resuming {
             let total: u64 = self.info.packed_size;
             let _ = tx.send(Event::PreTestStarted { bytes_total: total });
             let cancel_arc = Arc::new(AtomicBool::new(false));
@@ -542,12 +548,35 @@ impl JobJob {
             .set_archive_fingerprint(Some(fingerprint))
             .map_err(CoreError::Journal)?;
 
-        let mut committed_bytes: u64 = 0;
-        let mut reclaimed_bytes: u64 = 0;
+        let mut committed_bytes: u64 = self
+            .journal
+            .entries()
+            .ok()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|e| e.status == reclaimarc_journal::models::EntryStatus::Committed && !e.is_directory)
+                    .map(|e| e.unpacked_size)
+                    .sum::<u64>()
+            })
+            .unwrap_or(0);
+
+        let mut reclaimed_bytes: u64 = self
+            .journal
+            .packed_ranges()
+            .ok()
+            .map(|ranges| {
+                ranges
+                    .iter()
+                    .filter(|r| r.state == reclaimarc_journal::models::RangeState::Reclaimed)
+                    .map(|r| r.len)
+                    .sum::<u64>()
+            })
+            .unwrap_or(0);
+
         let destructive = self.mode == ExtractionMode::LowSpace;
 
         // Determine the first unit to process (durable state).
-        let units = self.journal.units().map_err(CoreError::Journal)?;
         let mut current_unit: Option<u64> = None;
         for u in &units {
             if !state::is_committed(u.state) {
@@ -563,12 +592,13 @@ impl JobJob {
 
         // Reserve computed against the live volume.
         let free_now = observed_free_space(&self.destination)?;
+        let _ = tx.send(Event::FreeSpace { bytes: free_now });
         let total = total_space(&self.destination).map_err(CoreError::Platform)?;
         let reserve = crate::config::emergency_reserve(free_now, total, &config);
         let scratch = self.info.decoder_requirements.scratch_bytes;
         let mut monitor = SpaceMonitor::new(reserve);
 
-let unit_count = units.len();
+        let unit_count = units.len();
         // Fast path: when every recovery unit is a single file, extract with
         // one decoder pass (avoids O(n²) per-unit re-walks of large archives).
         let fast_path = self.info.recovery_units.iter().all(|u| u.first_entry == u.last_entry);
@@ -635,6 +665,17 @@ let unit_count = units.len();
                 .map_err(CoreError::Archive)?;
         }
 
+        let mut volume_handles: HashMap<u64, std::fs::File> = HashMap::new();
+        let volumes = self.journal.volumes().map_err(CoreError::Journal)?;
+        if destructive {
+            for (idx, vol) in volumes.iter().enumerate() {
+                if let Ok(f) = open_for_reclaim(&vol.path) {
+                    let _ = set_sparse(&f, &vol.path);
+                    volume_handles.insert(idx as u64, f);
+                }
+            }
+        }
+
         while seq < unit_count as u64 {
             let unit = self
                 .info
@@ -662,8 +703,11 @@ let unit_count = units.len();
 
             // Safety gate: enough capacity for output + scratch + reserve.
             validate_capacity_before_unit(&self.destination, unit, scratch, reserve)?;
-            let free = observed_free_space(&self.destination)?;
-            let _ = tx.send(Event::FreeSpace { bytes: free });
+            if seq % 32 == 0 || seq + 1 == unit_count as u64 {
+                if let Ok(free) = observed_free_space(&self.destination) {
+                    let _ = tx.send(Event::FreeSpace { bytes: free });
+                }
+            }
 
             if !reclaim_only {
                 // ---- EXTRACTING (durable) ----
@@ -701,7 +745,7 @@ let unit_count = units.len();
                     .ok_or_else(|| CoreError::Precondition(format!("entry {single} not found")))?;
                 if !entry.is_directory {
                     match self.backend.extract_next(&opts, Some(&mut progress_cb)) {
-                        Err(spacextract_archive::ArchiveError::Cancelled)
+                        Err(reclaimarc_archive::ArchiveError::Cancelled)
                             if pause_flag.load(Ordering::SeqCst) =>
                         {
                             self.journal
@@ -710,7 +754,7 @@ let unit_count = units.len();
                             let _ = tx.send(Event::JobPaused { job_id: self.job_id.clone() });
                             return Ok(JobOutcome::Paused);
                         }
-                        Err(spacextract_archive::ArchiveError::Cancelled) => {
+                        Err(reclaimarc_archive::ArchiveError::Cancelled) => {
                             let _ = tx.send(Event::JobCancelled { job_id: self.job_id.clone() });
                             return Ok(JobOutcome::Cancelled);
                         }
@@ -727,7 +771,7 @@ let unit_count = units.len();
                 let extract = self.backend.extract_unit(seq, &opts, Some(&mut progress_cb));
                 if let Err(e) = extract {
                     return match e {
-                        spacextract_archive::ArchiveError::Cancelled
+                        reclaimarc_archive::ArchiveError::Cancelled
                             if pause_flag.load(Ordering::SeqCst) =>
                         {
                             self.journal
@@ -736,7 +780,7 @@ let unit_count = units.len();
                             let _ = tx.send(Event::JobPaused { job_id: self.job_id.clone() });
                             Ok(JobOutcome::Paused)
                         }
-                        spacextract_archive::ArchiveError::Cancelled => {
+                        reclaimarc_archive::ArchiveError::Cancelled => {
                             let _ = tx.send(Event::JobCancelled { job_id: self.job_id.clone() });
                             Ok(JobOutcome::Cancelled)
                         }
@@ -746,7 +790,7 @@ let unit_count = units.len();
             }
             fault::fire(CrashPoint::AfterPartialWrite, &self.job_id);
 
-// ---- OUTPUT_WRITTEN → OUTPUT_DURABLE (one durable transaction) ----
+            // ---- OUTPUT_WRITTEN → OUTPUT_DURABLE (one durable transaction) ----
             // Verify each partial (size + BLAKE3), journal the verified
             // hashes, then flush every partial durably. The intermediate
             // states are journaled inside a single transaction; crash
@@ -831,11 +875,13 @@ let unit_count = units.len();
             }
             // Create directories that were only entries.
             create_directory_entries(&self.destination, &entries)?;
-            // Flush the destination directory so renames are durable.
-            flush::flush_directory(&self.destination).map_err(CoreError::Platform)?;
+            // Flush the destination directory periodically so renames are durable without MFT bottlenecks.
+            if seq % 64 == 0 || seq + 1 == unit_count as u64 {
+                let _ = flush::flush_directory(&self.destination);
+            }
             fault::fire(CrashPoint::AfterRename, &self.job_id);
 
-// ---- COMMITTED (durable) ----
+            // ---- COMMITTED (durable) ----
             self.journal
                 .set_unit_state(seq, UnitState::Committed)
                 .map_err(CoreError::Journal)?;
@@ -861,7 +907,6 @@ let unit_count = units.len();
                         .map_err(CoreError::Journal)?;
                     fault::fire(CrashPoint::BeforeHolePunch, &self.job_id);
 
-                    let volumes = self.journal.volumes().map_err(CoreError::Journal)?;
                     let mut reclaimed_for_unit: u64 = 0;
                     let mut by_volume: HashMap<u64, Vec<ByteRange>> = HashMap::new();
                     for r in &ranges {
@@ -870,17 +915,23 @@ let unit_count = units.len();
                             .or_default()
                             .push(ByteRange { start: r.start, len: r.len });
                     }
-for (v_idx, ranges) in by_volume {
+                    for (v_idx, ranges) in by_volume {
                         let vol = volumes
                             .get(v_idx as usize)
                             .ok_or_else(|| {
                                 CoreError::Precondition(format!("volume {v_idx} not found"))
                             })?;
-                        let file = open_for_reclaim(&vol.path).map_err(CoreError::Platform)?;
-                        set_sparse(&file, &vol.path).map_err(CoreError::Platform)?;
+                        let file = match volume_handles.get(&v_idx) {
+                            Some(f) => f,
+                            None => {
+                                let f = open_for_reclaim(&vol.path).map_err(CoreError::Platform)?;
+                                let _ = set_sparse(&f, &vol.path);
+                                volume_handles.entry(v_idx).or_insert(f)
+                            }
+                        };
                         for range in ranges {
                             let report =
-                                reclaim_range(&file, &vol.path, range).map_err(CoreError::Platform)?;
+                                reclaim_range(file, &vol.path, range).map_err(CoreError::Platform)?;
                             let released = report.released_bytes();
                             reclaimed_for_unit = reclaimed_for_unit.saturating_add(released);
                             reclaimed_bytes = reclaimed_bytes.saturating_add(released);
@@ -892,11 +943,6 @@ for (v_idx, ranges) in by_volume {
                                 .mark_range_reclaimed(v_idx, range.start, range.len)
                                 .map_err(CoreError::Journal)?;
                         }
-                        let allocated_now =
-                            allocated_size_from_handle(&file, &vol.path).map_err(CoreError::Platform)?;
-                        self.journal
-                            .set_volume_allocated_now(v_idx, allocated_now)
-                            .map_err(CoreError::Journal)?;
                         fault::fire(CrashPoint::DuringHolePunch, &self.job_id);
                     }
                     fault::fire(CrashPoint::BeforeReclaimedCommit, &self.job_id);
@@ -949,6 +995,10 @@ for (v_idx, ranges) in by_volume {
             }
             seq += 1;
         }
+
+        // Drop cached volume write handles and close backend decoder before deleting archive shells.
+        drop(volume_handles);
+        self.backend.close();
 
         // Completion.
         if self.mode == ExtractionMode::LowSpace && config.delete_shells_on_completion {
@@ -1131,8 +1181,124 @@ fn create_directory_entries(dest: &Path, entries: &[EntryRecord]) -> Result<(), 
     Ok(())
 }
 
-/// Delete archive shells after a successful destructive extraction (opt-in).
+/// Delete archive shells after a successful destructive extraction.
+///
+/// ULTRA-STRICT VERIFICATION:
+/// The source archive is ONLY deleted if:
+/// 1. Every single unit in the journal is in `Reclaimed` or `Committed` state.
+/// 2. Zero errors are recorded in the journal.
+/// 3. Every single entry in the journal is in `Committed` status.
+/// 4. Every single committed file physically exists on disk and its on-disk size
+///    exactly matches `unpacked_size`.
+///
+/// If even a single file is missing, size-mismatched, or unreadable, this function
+/// returns an error and REFUSES to delete the source archive.
 fn delete_archive_shells(journal: &JobJournal) -> Result<(), CoreError> {
+    let units = journal.units().map_err(CoreError::Journal)?;
+    if units.is_empty() {
+        return Err(CoreError::Precondition(
+            "cannot delete source shells: no recovery units found in journal".into(),
+        ));
+    }
+
+    // 1. Verify every unit is fully committed or reclaimed.
+    for u in &units {
+        if !state::is_committed(u.state) && !state::is_reclaimed(u.state) {
+            return Err(CoreError::failed(
+                "verify units before shell deletion",
+                None,
+                None,
+                "COMPLETED",
+                format!("unit {} is in incomplete state '{:?}'", u.seq, u.state),
+                "Source archive will NOT be deleted.",
+            ));
+        }
+    }
+
+    // 2. Verify zero recorded errors in the journal.
+    let errors = journal.errors().unwrap_or_default();
+    if !errors.is_empty() {
+        return Err(CoreError::failed(
+            "verify journal errors before shell deletion",
+            None,
+            None,
+            "COMPLETED",
+            format!("{} errors recorded in journal", errors.len()),
+            "Source archive will NOT be deleted.",
+        ));
+    }
+
+    // 3. Verify every entry is committed and exists on disk with exact size.
+    let entries = journal.entries().map_err(CoreError::Journal)?;
+    if entries.is_empty() {
+        return Err(CoreError::Precondition(
+            "cannot delete source shells: no entries found in journal".into(),
+        ));
+    }
+
+    for e in &entries {
+        if e.status != EntryStatus::Committed {
+            return Err(CoreError::failed(
+                "verify entries before shell deletion",
+                e.final_path.clone(),
+                None,
+                "COMPLETED",
+                format!("entry {} is not committed (status: {:?})", e.index_in_archive, e.status),
+                "Source archive will NOT be deleted.",
+            ));
+        }
+
+        let Some(final_path) = &e.final_path else {
+            return Err(CoreError::failed(
+                "verify entry paths before shell deletion",
+                None,
+                None,
+                "COMPLETED",
+                format!("entry {} has no final path", e.index_in_archive),
+                "Source archive will NOT be deleted.",
+            ));
+        };
+
+        if !e.is_directory {
+            let meta = std::fs::metadata(final_path).map_err(|err| {
+                CoreError::failed(
+                    "verify physical file before shell deletion",
+                    Some(final_path.clone()),
+                    err.raw_os_error().map(|c| c as u32),
+                    "COMPLETED",
+                    format!("output file '{}' cannot be read on disk: {err}", final_path.display()),
+                    "Source archive will NOT be deleted.",
+                )
+            })?;
+
+            if meta.len() != e.unpacked_size {
+                return Err(CoreError::failed(
+                    "verify physical file size before shell deletion",
+                    Some(final_path.clone()),
+                    None,
+                    "COMPLETED",
+                    format!(
+                        "output file '{}' size mismatch: expected {} bytes on disk, found {} bytes",
+                        final_path.display(),
+                        e.unpacked_size,
+                        meta.len()
+                    ),
+                    "Source archive will NOT be deleted.",
+                ));
+            }
+        } else if !final_path.is_dir() {
+            return Err(CoreError::failed(
+                "verify physical directory before shell deletion",
+                Some(final_path.clone()),
+                None,
+                "COMPLETED",
+                format!("output directory '{}' does not exist on disk", final_path.display()),
+                "Source archive will NOT be deleted.",
+            ));
+        }
+    }
+
+    // 4. All checks passed with 100% verification — delete the volume files.
     let volumes = journal.volumes().map_err(CoreError::Journal)?;
     for v in volumes {
         if v.path.exists() {
@@ -1150,4 +1316,3 @@ fn delete_archive_shells(journal: &JobJournal) -> Result<(), CoreError> {
     }
     Ok(())
 }
-

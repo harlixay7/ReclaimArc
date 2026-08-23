@@ -171,6 +171,10 @@ export async function setSettings(s: SettingsDto): Promise<void> {
   return invoke("set_settings", { settings: s });
 }
 
+export async function openFolder(path: string): Promise<void> {
+  return invoke("open_folder", { path });
+}
+
 export async function openLogsDir(): Promise<void> {
   return invoke("open_logs_dir");
 }

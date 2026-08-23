@@ -1,4 +1,4 @@
-//! Safety machinery: emergency reserve, pre-flight capacity validation and
+﻿//! Safety machinery: emergency reserve, pre-flight capacity validation and
 //! free-space monitoring during extraction.
 //!
 //! The engine never intentionally drives a volume below the reserve. If
@@ -6,7 +6,7 @@
 //! the reserve — the current unit's source remains intact, so its partial
 //! output can be discarded and retried.
 
-use spacextract_archive::model::RecoveryUnit;
+use reclaimarc_archive::model::RecoveryUnit;
 
 use crate::config::EngineConfig;
 use crate::error::CoreError;

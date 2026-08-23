@@ -1,6 +1,6 @@
-# SpaceExtract — User Guide
+# ReclaimArc — User Guide
 
-SpaceExtract extracts archives when there is enough disk space for the final
+ReclaimArc extracts archives when there is enough disk space for the final
 files but not enough to hold the archive **and** the output at the same time.
 It does this by converting verified archive bytes back into free space as it
 goes.
@@ -60,19 +60,32 @@ On startup the app lists interrupted jobs. Select the archive, then:
 ## Command line
 
 ```
-spacextract inspect <archive>
-spacextract plan <archive> <destination>
-spacextract extract <archive> <destination>            # normal
-spacextract extract --low-space <archive> <destination> # destructive
-spacextract jobs
-spacextract resume <archive>
-spacextract abandon <archive>
-spacextract diagnostics <archive>
+reclaimarc inspect <archive>
+reclaimarc plan <archive> <destination>
+reclaimarc extract <archive> <destination>            # normal
+reclaimarc extract --low-space <archive> <destination> # destructive
+reclaimarc jobs
+reclaimarc resume <archive>
+reclaimarc abandon <archive>
+reclaimarc diagnostics <archive>
 ```
 
 Options: `--password <pwd>`, `--mode safe|balanced|maximum-space`, `--yes`.
 
-## What SpaceExtract is honest about
+## Windows Batch Scripts
+
+ReclaimArc provides two root batch scripts for quick setup and execution:
+
+- **`setup.bat`**: Audits and installs all system dependencies (Rust, MSVC Build Tools, Node.js, npm, WebView2 runtime) idempotently.
+- **`run.bat`**: Interactive launcher. Supports:
+  * `run.bat` (launches Desktop GUI)
+  * `run.bat --cli` (interactive CLI)
+  * `run.bat --test` (runs 76-test suite)
+  * `run.bat --build` (builds release binaries and installers)
+  * `run.bat --setup` (runs dependency setup)
+
+
+## What ReclaimArc is honest about
 
 - If the app says an extraction is safe, the engine can prove why (see
   SAFETY_MODEL.md).

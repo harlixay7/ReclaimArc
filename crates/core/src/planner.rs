@@ -1,4 +1,4 @@
-//! Space planner: simulates extraction over recovery units and decides,
+﻿//! Space planner: simulates extraction over recovery units and decides,
 //! before anything is touched, whether an extraction is safe — and if not,
 //! exactly why.
 //!
@@ -8,7 +8,7 @@
 //!   if requirement > available → NOT SAFE at this unit
 //!   available -= unit output; reclaimable pool += unit packed bytes
 
-use spacextract_archive::model::ArchiveInfo;
+use reclaimarc_archive::model::ArchiveInfo;
 
 use crate::config::{emergency_reserve, EngineConfig};
 use crate::error::CoreError;
@@ -150,7 +150,7 @@ pub fn feasible_mode(plan: &SpacePlan) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spacextract_archive::model::{CapabilityMatrix, DecoderRequirements, Entry, PackedRange, RecoveryUnit, VolumeInfo};
+    use reclaimarc_archive::model::{CapabilityMatrix, DecoderRequirements, Entry, PackedRange, RecoveryUnit, VolumeInfo};
     use proptest::prelude::*;
 
     fn fake_info(units: &[(u64, u64)], free: u64) -> ArchiveInfo {

@@ -1,5 +1,5 @@
-[package]
-name = "spacextract-archive"
+﻿[package]
+name = "reclaimarc-archive"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,4 +13,4 @@ unrar_sys = "0.5.8"
 
 [dev-dependencies]
 tempfile.workspace = true
-spacextract-platform = { workspace = true }
+reclaimarc-platform = { workspace = true }

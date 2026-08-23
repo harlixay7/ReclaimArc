@@ -1,17 +1,17 @@
-[package]
-name = "spacextract-cli"
+﻿[package]
+name = "reclaimarc-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "spacextract"
+name = "reclaimarc"
 path = "src/main.rs"
 
 [dependencies]
-spacextract-core.workspace = true
-spacextract-archive.workspace = true
-spacextract-journal.workspace = true
+reclaimarc-core.workspace = true
+reclaimarc-archive.workspace = true
+reclaimarc-journal.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
@@ -19,3 +19,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 ctrlc = "3"
 windows.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+

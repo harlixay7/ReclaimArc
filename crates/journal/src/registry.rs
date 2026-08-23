@@ -1,4 +1,4 @@
-//! Mirrored job registry in application data.
+﻿//! Mirrored job registry in application data.
 //!
 //! A small database that remembers every job, so the app can discover
 //! interrupted jobs even when the archive's directory is opened fresh.
@@ -51,16 +51,16 @@ impl Registry {
         Ok(Registry { conn })
     }
 
-    /// The default application data directory for SpaceExtract.
-    /// Overridable via `SPACEEXTRACT_APP_DATA` (used by tests).
+    /// The default application data directory for ReclaimArc.
+    /// Overridable via `RECLAIMARC_APP_DATA` (used by tests).
     pub fn default_app_data_dir() -> PathBuf {
-        if let Some(dir) = std::env::var_os("SPACEEXTRACT_APP_DATA") {
+        if let Some(dir) = std::env::var_os("RECLAIMARC_APP_DATA") {
             return PathBuf::from(dir);
         }
         let local = std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
-        local.join("SpaceExtract")
+        local.join("ReclaimArc")
     }
 
     /// Register or update a job (durable).
@@ -155,7 +155,7 @@ mod tests {
         let e = RegistryEntry {
             job_id: "job-1".into(),
             archive_dir: dir.path().join("a"),
-            job_db_path: dir.path().join("a").join(".spacextract").join("job-1").join("job.db"),
+            job_db_path: dir.path().join("a").join(".reclaimarc").join("job-1").join("job.db"),
             archive: dir.path().join("a").join("x.rar"),
             destination: dir.path().join("out"),
             created_at: crate::now_iso(),
@@ -178,7 +178,7 @@ mod tests {
         let e = RegistryEntry {
             job_id: "j".into(),
             archive_dir: dir.path().join("a"),
-            job_db_path: dir.path().join("a").join(".spacextract").join("j").join("job.db"),
+            job_db_path: dir.path().join("a").join(".reclaimarc").join("j").join("job.db"),
             archive: dir.path().join("x.rar"),
             destination: dir.path().join("out"),
             created_at: crate::now_iso(),

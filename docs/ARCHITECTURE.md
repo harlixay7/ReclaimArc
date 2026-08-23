@@ -1,8 +1,8 @@
-# SpaceExtract — Architecture
+﻿# ReclaimArc — Architecture
 
 ```
 ┌─────────────────────────────── apps ───────────────────────────────┐
-│  apps/cli         spacextract  (inspect / plan / extract / resume) │
+│  apps/cli         reclaimarc  (inspect / plan / extract / resume) │
 │  apps/desktop     Tauri 2 + React + strict TypeScript              │
 └───────────────────────────────▲───────────────────────────────────┘
                                  │ events / commands
@@ -59,9 +59,9 @@ reclamation supports.
 
 ## Journal
 
-Per-job SQLite database beside the archive (`.spacextract/<job>/job.db`),
+Per-job SQLite database beside the archive (`.reclaimarc/<job>/job.db`),
 WAL mode, `synchronous=FULL` for trust-critical commits, plus a mirrored
-registry in `%LOCALAPPDATA%\SpaceExtract`. Every durable transition is
+registry in `%LOCALAPPDATA%\ReclaimArc`. Every durable transition is
 committed before the corresponding filesystem action.
 
 ## Platform

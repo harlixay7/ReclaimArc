@@ -1,4 +1,4 @@
-﻿//! RAR backend: implements `ArchiveBackend` for RAR 4.x / 5.x using the
+//! RAR backend: implements `ArchiveBackend` for RAR 4.x / 5.x using the
 //! official UnRAR library for decoding and our own header parser for exact
 //! packed ranges, solid chains and recovery units.
 
@@ -201,14 +201,36 @@ impl ArchiveBackend for RarBackend {
         let mut bytes_tested: u64 = 0;
         let mut index = 0u64;
         let mut progress = progress;
+        let total_archive_packed = info.packed_size;
         loop {
             let Some(h) = decoder.read_header()? else { break };
             let total = h.pack_size;
+            let current_tested = bytes_tested;
+            let mut sub_progress = progress.as_deref_mut().map(|cb| {
+                move |e: ProgressEvent| {
+                    match e {
+                        ProgressEvent::EntryProgress { current, total: entry_total, .. } => {
+                            let ratio = if entry_total > 0 {
+                                (current as f64) / (entry_total as f64)
+                            } else {
+                                1.0
+                            };
+                            let entry_done = (total as f64 * ratio.min(1.0)) as u64;
+                            let overall_done = current_tested.saturating_add(entry_done);
+                            cb(ProgressEvent::EntryProgress {
+                                entry_index: index,
+                                current: overall_done,
+                                total: total_archive_packed,
+                            })
+                        }
+                    }
+                }
+            });
             let result = decoder.process_file(
                 Operation::Test,
                 None,
                 None,
-                progress.as_deref_mut(),
+                sub_progress.as_mut().map(|f| f as &mut dyn FnMut(ProgressEvent) -> bool),
                 index,
                 total,
             );
@@ -449,6 +471,10 @@ fn cancel(&mut self) {
             .as_ref()
             .map(|i| i.recovery_units.as_slice())
             .unwrap_or(&[])
+    }
+
+    fn close(&mut self) {
+        self.decoder = None;
     }
 }
 

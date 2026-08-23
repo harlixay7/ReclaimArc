@@ -1,4 +1,4 @@
-//! SpaceExtract core engine.
+﻿//! ReclaimArc core engine.
 //!
 //! The transactional storage engine: space planning, the recovery-unit state
 //! machine, safety (reserve + pre-test + monitoring), path security, the

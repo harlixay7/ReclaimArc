@@ -1,6 +1,6 @@
-//! Generate a test RAR archive.
-//! Usage: cargo run -p spacextract-cli --example make_fixture <dir> <name>
-use spacextract_archive::rar::fixtures::{write_rar, FixtureFile, FixtureOptions};
+﻿//! Generate a test RAR archive.
+//! Usage: cargo run -p reclaimarc-cli --example make_fixture <dir> <name>
+use reclaimarc_archive::rar::fixtures::{write_rar, FixtureFile, FixtureOptions};
 
 fn main() {
     let dir = std::path::PathBuf::from(std::env::args().nth(1).expect("dir"));

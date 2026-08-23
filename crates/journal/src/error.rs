@@ -1,4 +1,4 @@
-/// Error type for journal operations.
+﻿/// Error type for journal operations.
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
     /// Underlying SQLite failure.
@@ -17,8 +17,8 @@ pub enum JournalError {
     #[error("journal corrupted: {0}")]
     Corrupt(String),
 
-    /// The journal file is not a SpaceExtract journal (schema mismatch).
-    #[error("not a SpaceExtract journal (unexpected schema): {0}")]
+    /// The journal file is not a ReclaimArc journal (schema mismatch).
+    #[error("not a ReclaimArc journal (unexpected schema): {0}")]
     Schema(String),
 
     /// I/O failure.

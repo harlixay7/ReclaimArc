@@ -1,12 +1,18 @@
 [package]
-name = "spacextract-desktop"
+name = "reclaimarc-desktop"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [lib]
-name = "spacextract_desktop_lib"
+name = "reclaimarc_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+# Enabled by the Tauri CLI for production builds (`tauri build`): embeds the
+# frontend dist instead of loading devUrl. Building without it produces an
+# exe that expects the vite dev server on localhost:1420.
+custom-protocol = ["tauri/custom-protocol"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -17,11 +23,15 @@ tauri-plugin-dialog = "2"
 tauri-plugin-shell = "2"
 serde.workspace = true
 serde_json.workspace = true
-spacextract-core.workspace = true
-spacextract-archive.workspace = true
-spacextract-journal.workspace = true
-spacextract-platform.workspace = true
+reclaimarc-core.workspace = true
+reclaimarc-archive.workspace = true
+reclaimarc-journal.workspace = true
+reclaimarc-platform.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+

@@ -1,7 +1,7 @@
 ﻿//! Recovery: discovery and reconciliation of interrupted jobs.
 //!
 //! On startup the app finds interrupted jobs (from the app-data registry and
-//! by scanning for `.spacextract` directories beside archives). For each job
+//! by scanning for `.reclaimarc` directories beside archives). For each job
 //! the engine:
 //! - validates the journal,
 //! - validates source identity (volume serial, file id, size, mtime),
@@ -15,10 +15,10 @@
 
 use std::path::{Path, PathBuf};
 
-use spacextract_journal::models::{EntryStatus, JobState, RangeState, UnitState};
-use spacextract_journal::{JobJournal, Registry, RegistryEntry};
-use spacextract_platform::fs::{file_identity, open_for_identity};
-use spacextract_platform::sparse::{open_for_reclaim, query_allocated_ranges, set_sparse};
+use reclaimarc_journal::models::{EntryStatus, JobState, RangeState, UnitState};
+use reclaimarc_journal::{JobJournal, Registry, RegistryEntry};
+use reclaimarc_platform::fs::{file_identity, open_for_identity};
+use reclaimarc_platform::sparse::{open_for_reclaim, query_allocated_ranges, set_sparse};
 
 use crate::error::CoreError;
 use crate::state;
@@ -166,7 +166,8 @@ pub fn prepare_resume(
     //    matches; delete everything else that is incomplete.
     let units = journal.units().map_err(CoreError::Journal)?;
     for unit in &units {
-        if state::is_committed(unit.state) {
+        // Pending units were never started; committed/reclaimed units are already done.
+        if unit.state == UnitState::Pending || state::is_committed(unit.state) {
             continue;
         }
         let entries = journal.entries_for_unit(unit.seq).map_err(CoreError::Journal)?;
@@ -234,7 +235,7 @@ pub fn prepare_resume(
                 // Punch the remainder now (the unit is committed; its source
                 // is provably safe to reclaim).
                 for chunk in &allocated {
-                    let report = spacextract_platform::sparse::reclaim_range(&file, &vol.path, *chunk)
+                    let report = reclaimarc_platform::sparse::reclaim_range(&file, &vol.path, *chunk)
                         .map_err(CoreError::Platform)?;
                     let _ = report;
                 }
@@ -244,28 +245,6 @@ pub fn prepare_resume(
             }
         }
         journal.set_unit_state(unit.seq, UnitState::Reclaimed).map_err(CoreError::Journal)?;
-    }
-
-    // 4. RECLAIMED units: verify the filesystem matches the journal.
-    for unit in &units {
-        if unit.state != UnitState::Reclaimed {
-            continue;
-        }
-        let ranges = journal.packed_ranges_for_unit(unit.seq).map_err(CoreError::Journal)?;
-        let volumes = journal.volumes().map_err(CoreError::Journal)?;
-        for r in &ranges {
-            if let Some(vol) = volumes.get(r.volume_index as usize) {
-                if let Ok(file) = open_for_reclaim(&vol.path) {
-                    if let Ok(allocated) = query_allocated_ranges(&file, &vol.path, r.start, r.len) {
-                        if allocated.is_empty() {
-                            journal
-                                .mark_range_reclaimed(r.volume_index, r.start, r.len)
-                                .map_err(CoreError::Journal)?;
-                        }
-                    }
-                }
-            }
-        }
     }
 
     // 5. Fingerprint sanity (only advisory — identity already validated).

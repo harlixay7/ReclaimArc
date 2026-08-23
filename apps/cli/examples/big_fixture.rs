@@ -1,7 +1,7 @@
-//! Generate a large test RAR with service headers (stress the parser↔decoder
+﻿//! Generate a large test RAR with service headers (stress the parser↔decoder
 //! cross-validation at scale).
-//! Usage: cargo run -p spacextract-cli --example big_fixture <dir> <name> <count>
-use spacextract_archive::rar::fixtures::{write_rar, FixtureFile, FixtureOptions};
+//! Usage: cargo run -p reclaimarc-cli --example big_fixture <dir> <name> <count>
+use reclaimarc_archive::rar::fixtures::{write_rar, FixtureFile, FixtureOptions};
 
 fn main() {
     let dir = std::path::PathBuf::from(std::env::args().nth(1).expect("dir"));

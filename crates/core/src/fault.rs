@@ -1,7 +1,7 @@
-//! Fault injection: crash points used by the test harness to simulate
+﻿//! Fault injection: crash points used by the test harness to simulate
 //! process death after every durable transition.
 //!
-//! Activated via `SPACEEXTRACT_FAULT_AT=<name>`; when the engine reaches the
+//! Activated via `RECLAIMARC_FAULT_AT=<name>`; when the engine reaches the
 //! named point it calls `std::process::exit(86)`. The journal has already
 //! been durably updated up to that point, so reopening the job must prove the
 //! invariants hold.
@@ -56,14 +56,14 @@ impl CrashPoint {
 
 /// The crash point armed via the environment, if any.
 pub fn armed_crash_point() -> Option<CrashPoint> {
-    std::env::var("SPACEEXTRACT_FAULT_AT")
+    std::env::var("RECLAIMARC_FAULT_AT")
         .ok()
         .and_then(|s| CrashPoint::from_str(s.trim()))
 }
 
 /// The job id that must match for the crash to fire (optional).
 pub fn armed_job_id() -> Option<String> {
-    std::env::var("SPACEEXTRACT_FAULT_JOB").ok()
+    std::env::var("RECLAIMARC_FAULT_JOB").ok()
 }
 
 static CRASH_FIRED: AtomicBool = AtomicBool::new(false);

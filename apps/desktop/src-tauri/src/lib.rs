@@ -1,4 +1,4 @@
-﻿//! SpaceExtract desktop backend: Tauri commands over the shared engine.
+﻿//! ReclaimArc desktop backend: Tauri commands over the shared engine.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -6,7 +6,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
-use spacextract_core::{
+use reclaimarc_core::{
     Engine, EngineConfig, Event, ExtractionMode, JobOutcome, SafetyMode,
 };
 use tauri::Emitter;
@@ -26,13 +26,15 @@ impl ActiveJob {
     fn event_json(e: &Event) -> serde_json::Value {
         use Event::*;
         match e {
-            JobStarted { job_id } => json_event("job-started", serde_json::json!(job_id)),
+            JobStarted { job_id } => serde_json::json!({
+                "type": "job-started", "job_id": job_id,
+            }),
             Analyzed { archive, plan_bytes } => serde_json::json!({
                 "type": "analyzed", "archive": archive, "plan": plan_bytes,
             }),
-            PreTestStarted { bytes_total } => {
-                json_event("pre-test-started", serde_json::json!({ "total": bytes_total }))
-            }
+            PreTestStarted { bytes_total } => serde_json::json!({
+                "type": "pre-test-started", "total": bytes_total,
+            }),
             PreTestProgress { current, total } => serde_json::json!({
                 "type": "pre-test-progress", "current": current, "total": total,
             }),
@@ -84,10 +86,6 @@ impl ActiveJob {
             }),
         }
     }
-}
-
-fn json_event(event: &str, payload: serde_json::Value) -> serde_json::Value {
-    serde_json::json!({ "type": event, "payload": payload })
 }
 
 /// Shared application state.
@@ -155,16 +153,29 @@ fn err_msg(e: impl std::fmt::Display) -> String {
 }
 
 /// Command: analyze an archive for a destination.
-#[tauri::command]
+///
+/// Runs off the main thread: inspect() walks every header twice and would
+/// otherwise block the UI event loop (sync Tauri commands run on the main
+/// thread), freezing the webview until it finishes.
+#[tauri::command(async)]
 fn analyze(
     state: tauri::State<'_, AppState>,
     archive: String,
     destination: String,
     password: Option<String>,
 ) -> Result<AnalyzeResult, String> {
+    let archive_path = PathBuf::from(&archive);
+    let dest_path = if destination.trim().is_empty() {
+        archive_path
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+    } else {
+        PathBuf::from(&destination)
+    };
     let engine = state.engine.lock().unwrap();
     let (info, plan) = engine
-        .analyze(&PathBuf::from(&archive), &PathBuf::from(&destination), password)
+        .analyze(&archive_path, &dest_path, password)
         .map_err(err_msg)?;
     let info_json = serde_json::to_value(&info).map_err(err_msg)?;
     let plan_json = serde_json::to_value(&plan).map_err(err_msg)?;
@@ -172,7 +183,10 @@ fn analyze(
 }
 
 /// Command: start a fresh extraction job.
-#[tauri::command]
+///
+/// `start_job` re-inspects the archive (full header walk) and sets up the
+/// journal, so this must not run on the main thread either.
+#[tauri::command(async)]
 fn start_extraction(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
@@ -184,6 +198,15 @@ fn start_extraction(
     if state.active.lock().unwrap().is_some() {
         return Err("an extraction is already running".into());
     }
+    let archive_path = PathBuf::from(&archive);
+    let dest_path = if destination.trim().is_empty() {
+        archive_path
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+    } else {
+        PathBuf::from(&destination)
+    };
     let config = state.config.lock().unwrap().clone();
     let engine = Engine::new(config);
     let (tx, rx) = mpsc::channel::<Event>();
@@ -197,11 +220,21 @@ fn start_extraction(
     });
     let _ = forwarder;
 
+    let mut active_lock = state.active.lock().unwrap();
+    if let Some(j) = active_lock.as_ref() {
+        if j.outcome.lock().unwrap().is_some() {
+            *active_lock = None;
+        } else {
+            return Err("an extraction is already running".into());
+        }
+    }
+    drop(active_lock);
+
     let mode = if low_space { ExtractionMode::LowSpace } else { ExtractionMode::Normal };
     let (handle, mut job) = engine
         .start_job(
-            &PathBuf::from(&archive),
-            &PathBuf::from(&destination),
+            &archive_path,
+            &dest_path,
             mode,
             password,
             tx.clone(),
@@ -223,7 +256,7 @@ fn start_extraction(
         let o = match result {
             Ok(o) => o,
             Err(e) => JobOutcome::Failed {
-                failure: spacextract_core::FailureInfo::from(&e),
+                failure: reclaimarc_core::FailureInfo::from(&e),
             },
         };
         *outcome2.lock().unwrap() = Some(o);
@@ -231,7 +264,7 @@ fn start_extraction(
         drop(tx2);
     });
 
-*state.active.lock().unwrap() = Some(ActiveJob {
+    *state.active.lock().unwrap() = Some(ActiveJob {
         job_id: job_id.clone(),
         pause,
         cancel,
@@ -242,7 +275,7 @@ fn start_extraction(
 }
 
 /// Command: resume the interrupted job belonging to an archive.
-#[tauri::command]
+#[tauri::command(async)]
 fn resume_extraction(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
@@ -277,7 +310,7 @@ let (handle, mut job) = engine.resume_job(&journal_path, tx.clone()).map_err(err
         let o = match result {
             Ok(o) => o,
             Err(e) => JobOutcome::Failed {
-                failure: spacextract_core::FailureInfo::from(&e),
+                failure: reclaimarc_core::FailureInfo::from(&e),
             },
         };
         *outcome2.lock().unwrap() = Some(o);
@@ -327,14 +360,20 @@ fn cancel_job(state: tauri::State<'_, AppState>) -> Result<(), String> {
 /// Command: the current job's id (empty when idle).
 #[tauri::command]
 fn current_job(state: tauri::State<'_, AppState>) -> Result<Option<String>, String> {
-    let active = state.active.lock().unwrap();
+    let mut active = state.active.lock().unwrap();
+    if let Some(j) = active.as_ref() {
+        if j.outcome.lock().unwrap().is_some() {
+            *active = None;
+            return Ok(None);
+        }
+    }
     Ok(active.as_ref().map(|j| j.job_id.clone()))
 }
 
 /// Command: list interrupted jobs from the registry.
-#[tauri::command]
+#[tauri::command(async)]
 fn list_jobs() -> Result<Vec<JobListEntry>, String> {
-    let jobs = spacextract_core::discover_interrupted_jobs().map_err(err_msg)?;
+    let jobs = reclaimarc_core::discover_interrupted_jobs().map_err(err_msg)?;
     Ok(jobs
         .into_iter()
         .map(|j| JobListEntry {
@@ -348,11 +387,11 @@ fn list_jobs() -> Result<Vec<JobListEntry>, String> {
 }
 
 /// Command: recovery view for an archive.
-#[tauri::command]
+#[tauri::command(async)]
 fn recovery_view(archive: String) -> Result<RecoveryView, String> {
     let journal_path = find_journal(&PathBuf::from(&archive))?;
-    let journal = spacextract_journal::JobJournal::open(&journal_path).map_err(err_msg)?;
-    let s = spacextract_core::summarize(&journal).map_err(err_msg)?;
+    let journal = reclaimarc_journal::JobJournal::open(&journal_path).map_err(err_msg)?;
+    let s = reclaimarc_core::summarize(&journal).map_err(err_msg)?;
     Ok(RecoveryView {
         job_id: s.job_id,
         archive: s.archive.to_string_lossy().into_owned(),
@@ -371,12 +410,12 @@ fn recovery_view(archive: String) -> Result<RecoveryView, String> {
 }
 
 /// Command: abandon a job.
-#[tauri::command]
+#[tauri::command(async)]
 fn abandon_job(archive: String) -> Result<(), String> {
     let journal_path = find_journal(&PathBuf::from(&archive))?;
-    let journal = spacextract_journal::JobJournal::open(&journal_path).map_err(err_msg)?;
+    let journal = reclaimarc_journal::JobJournal::open(&journal_path).map_err(err_msg)?;
     let job_id = journal.job_meta().map_err(err_msg)?.job_id;
-    spacextract_core::abandon_job(&journal_path, &job_id).map_err(err_msg)
+    reclaimarc_core::abandon_job(&journal_path, &job_id).map_err(err_msg)
 }
 
 /// Command: get settings.
@@ -392,10 +431,10 @@ fn set_settings(state: tauri::State<'_, AppState>, settings: SettingsDto) -> Res
     let mut config = state.config.lock().unwrap();
     config.safety_mode = SafetyMode::from_str(&settings.safety_mode).unwrap_or(SafetyMode::Balanced);
     config.conflict_policy = match settings.conflict_policy.as_str() {
-        "skip" => spacextract_core::ConflictPolicy::Skip,
-        "rename-new" => spacextract_core::ConflictPolicy::RenameNew,
-        "overwrite" => spacextract_core::ConflictPolicy::Overwrite,
-        _ => spacextract_core::ConflictPolicy::Ask,
+        "skip" => reclaimarc_core::ConflictPolicy::Skip,
+        "rename-new" => reclaimarc_core::ConflictPolicy::RenameNew,
+        "overwrite" => reclaimarc_core::ConflictPolicy::Overwrite,
+        _ => reclaimarc_core::ConflictPolicy::Ask,
     };
     config.pre_test = settings.pre_test;
     config.write_manifest = settings.write_manifest;
@@ -403,6 +442,17 @@ fn set_settings(state: tauri::State<'_, AppState>, settings: SettingsDto) -> Res
     config.delete_shells_on_completion = settings.delete_shells_on_completion;
     config.log_level = settings.log_level;
     Ok(())
+}
+
+/// Command: open any folder in Explorer.
+#[tauri::command(async)]
+fn open_folder(path: String) -> Result<(), String> {
+    let p = PathBuf::from(&path);
+    if p.exists() {
+        open_in_explorer(&p)
+    } else {
+        Err(format!("Folder does not exist: {}", path))
+    }
 }
 
 /// Command: open the logs directory.
@@ -417,7 +467,7 @@ fn open_logs_dir() -> Result<(), String> {
 #[tauri::command]
 fn read_logs(last: usize) -> Result<String, String> {
     let dir = log_dir();
-    let path = dir.join("spacextract.log");
+    let path = dir.join("reclaimarc.log");
     if !path.exists() {
         return Ok("(no log file yet)".into());
     }
@@ -438,7 +488,7 @@ fn log_dir() -> PathBuf {
     std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("SpaceExtract")
+        .join("ReclaimArc")
         .join("logs")
 }
 
@@ -454,10 +504,10 @@ fn open_in_explorer(dir: &PathBuf) -> Result<(), String> {
 fn find_journal(archive: &std::path::Path) -> Result<PathBuf, String> {
     let state = archive
         .parent()
-        .map(|p| p.join(".spacextract"))
+        .map(|p| p.join(".reclaimarc"))
         .ok_or_else(|| "archive has no parent directory".to_string())?;
     if !state.exists() {
-        return Err(format!("no SpaceExtract state found beside '{}'", archive.display()));
+        return Err(format!("no ReclaimArc state found beside '{}'", archive.display()));
     }
     let mut candidates: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(&state)
         .map_err(err_msg)?
@@ -486,7 +536,7 @@ pub fn init_logging() {
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(dir.join("spacextract.log"));
+        .open(dir.join("reclaimarc.log"));
     if let Ok(file) = file {
         let _ = tracing_subscriber::fmt()
             .with_env_filter(
@@ -522,11 +572,42 @@ pub fn run() {
             abandon_job,
             get_settings,
             set_settings,
+            open_folder,
             open_logs_dir,
             read_logs,
         ])
         .run(tauri::generate_context!())
-        .expect("error while running SpaceExtract");
+        .expect("error while running ReclaimArc");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reclaimarc_archive::rar::fixtures::{write_rar, FixtureFile, FixtureOptions};
+
+    #[test]
+    fn test_analyze_with_empty_destination_defaults_to_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = vec![FixtureFile::new("sample.txt", b"hello analyze world")];
+        let paths = write_rar(dir.path(), "test_analyze", &files, &FixtureOptions::default()).unwrap();
+        let archive_path = paths[0].to_str().unwrap().to_string();
+
+        let state = AppState {
+            engine: Mutex::new(Engine::new(EngineConfig::default())),
+            config: Mutex::new(EngineConfig::default()),
+            active: Mutex::new(None),
+        };
+
+        // Test fallback resolution logic
+        let archive = PathBuf::from(&archive_path);
+        let dest = archive.parent().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+        let engine = state.engine.lock().unwrap();
+        let (info, plan) = engine.analyze(&archive, &dest, None).unwrap();
+
+        assert_eq!(info.entries.len(), 1);
+        assert_eq!(info.entries[0].name, "sample.txt");
+        assert!(plan.free_now > 0);
+    }
 }
 
 

@@ -1,11 +1,11 @@
-# SpaceExtract — Recovery
+﻿# ReclaimArc — Recovery
 
 ## Where the journal lives
 
-- Beside the archive: `<archive folder>\.spacextract\<job-id>\job.db`
+- Beside the archive: `<archive folder>\.reclaimarc\<job-id>\job.db`
   (SQLite, WAL, `synchronous=FULL`).
-- Mirrored registry: `%LOCALAPPDATA%\SpaceExtract\registry.db`
-  (overridable via `SPACEEXTRACT_APP_DATA`, used by tests).
+- Mirrored registry: `%LOCALAPPDATA%\ReclaimArc\registry.db`
+  (overridable via `RECLAIMARC_APP_DATA`, used by tests).
 
 ## What is recorded
 
@@ -20,7 +20,7 @@ Passwords are never stored.
 ## On startup
 
 1. Interrupted jobs are discovered from the registry and by scanning
-   `.spacextract` folders beside archives.
+   `.reclaimarc` folders beside archives.
 2. The recovery screen shows: committed output, source reclaimed, remaining
    source, last safe checkpoint, unit states, and recorded errors. It never
    says "rollback" unless the source actually exists.
@@ -54,6 +54,6 @@ failed integrity or reclamation operation.
 
 ## Diagnostics
 
-`spacextract diagnostics <archive>` prints the full recovery report.
-Structured logs live in `%LOCALAPPDATA%\SpaceExtract\logs\spacextract.log`
+`reclaimarc diagnostics <archive>` prints the full recovery report.
+Structured logs live in `%LOCALAPPDATA%\ReclaimArc\logs\reclaimarc.log`
 (redacted — passwords never appear).

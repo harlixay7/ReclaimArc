@@ -1,4 +1,4 @@
-﻿//! SpaceExtract command-line interface.
+﻿//! ReclaimArc command-line interface.
 //!
 //! The CLI drives the same engine as the desktop app.
 //!
@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 
-use spacextract_core::{
+use reclaimarc_core::{
     abandon_job, discover_interrupted_jobs, Engine, EngineConfig, Event, ExtractionMode, JobHandle,
     JobOutcome, SafetyMode,
 };
@@ -52,10 +52,10 @@ fn main() {
 
 fn print_help() {
     println!(
-        "SpaceExtract — low-space archive extraction\n\
+        "ReclaimArc — low-space archive extraction\n\
          \n\
          USAGE:\n\
-         \x20 spacextract <command> [options]\n\
+         \x20 reclaimarc <command> [options]\n\
          \n\
          COMMANDS:\n\
          \x20 inspect <archive>                 Show archive structure, recovery units, capabilities\n\
@@ -109,9 +109,9 @@ fn format_bytes(n: u64) -> String {
 fn cmd_inspect(args: &[String]) -> Result<(), String> {
     let archive = PathBuf::from(args.first().ok_or("usage: inspect <archive>")?);
     let password = parse_password(args);
-    let mut backend = spacextract_archive::backend_for(&archive).map_err(|e| e.to_string())?;
+    let mut backend = reclaimarc_archive::backend_for(&archive).map_err(|e| e.to_string())?;
     let info = backend
-        .inspect(&spacextract_archive::OpenOptions { password })
+        .inspect(&reclaimarc_archive::OpenOptions { password })
         .map_err(|e| e.to_string())?;
 
     println!("Archive: {}", archive.display());
@@ -290,7 +290,7 @@ Event::RangeReclaimed { volume_index, bytes } => {
                     println!("[unit {seq}] source reclaimed ({})", format_bytes(bytes));
                 }
                 Event::FreeSpace { bytes } => println!("  free space: {}", format_bytes(bytes)),
-                Event::JobPaused { .. } => println!("job paused (resume with: spacextract resume <archive>)"),
+                Event::JobPaused { .. } => println!("job paused (resume with: reclaimarc resume <archive>)"),
                 Event::JobCancelled { .. } => println!("job cancelled (resumable)"),
                 Event::JobFinished { committed_bytes, reclaimed_bytes, .. } => {
                     println!(
@@ -325,8 +325,8 @@ Event::RangeReclaimed { volume_index, bytes } => {
     ui_thread.join().map_err(|_| "ui thread panicked")?;
     match outcome {
         JobOutcome::Completed { .. } => Ok(()),
-        JobOutcome::Paused => Err("paused — run `spacextract resume <archive>` to continue".into()),
-        JobOutcome::Cancelled => Err("cancelled — run `spacextract resume <archive>` to continue".into()),
+        JobOutcome::Paused => Err("paused — run `reclaimarc resume <archive>` to continue".into()),
+        JobOutcome::Cancelled => Err("cancelled — run `reclaimarc resume <archive>` to continue".into()),
         JobOutcome::Failed { failure } => Err(format!("{} — {}", failure.message, failure.recommended_action)),
     }
 }
@@ -386,8 +386,8 @@ fn cmd_resume(args: &[String]) -> Result<(), String> {
     ui_thread.join().map_err(|_| "ui thread panicked")?;
     match outcome {
         JobOutcome::Completed { .. } => Ok(()),
-        JobOutcome::Paused => Err("paused again — run `spacextract resume <archive>` to continue".into()),
-        JobOutcome::Cancelled => Err("cancelled — run `spacextract resume <archive>` to continue".into()),
+        JobOutcome::Paused => Err("paused again — run `reclaimarc resume <archive>` to continue".into()),
+        JobOutcome::Cancelled => Err("cancelled — run `reclaimarc resume <archive>` to continue".into()),
         JobOutcome::Failed { failure } => Err(format!("{} — {}", failure.message, failure.recommended_action)),
     }
 }
@@ -396,7 +396,7 @@ fn cmd_abandon(args: &[String]) -> Result<(), String> {
     let archive = PathBuf::from(args.first().ok_or("usage: abandon <archive>")?);
     let journal_path = find_journal_for(&archive)?;
     let job_id = {
-        let journal = spacextract_journal::JobJournal::open(&journal_path).map_err(|e| e.to_string())?;
+        let journal = reclaimarc_journal::JobJournal::open(&journal_path).map_err(|e| e.to_string())?;
         journal.job_meta().map_err(|e| e.to_string())?.job_id
     };
     println!(
@@ -417,8 +417,8 @@ fn cmd_abandon(args: &[String]) -> Result<(), String> {
 fn cmd_diagnostics(args: &[String]) -> Result<(), String> {
     let archive = PathBuf::from(args.first().ok_or("usage: diagnostics <archive>")?);
     let journal_path = find_journal_for(&archive)?;
-    let journal = spacextract_journal::JobJournal::open(&journal_path).map_err(|e| e.to_string())?;
-    let summary = spacextract_core::summarize(&journal).map_err(|e| e.to_string())?;
+    let journal = reclaimarc_journal::JobJournal::open(&journal_path).map_err(|e| e.to_string())?;
+    let summary = reclaimarc_core::summarize(&journal).map_err(|e| e.to_string())?;
     println!("Recovery report for job {}", summary.job_id);
     println!("  archive:      {}", summary.archive.display());
     println!("  destination:  {}", summary.destination.display());
@@ -440,15 +440,15 @@ fn cmd_diagnostics(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Find the newest journal for an archive (beside it, in .spacextract/).
+/// Find the newest journal for an archive (beside it, in .reclaimarc/).
 fn find_journal_for(archive: &std::path::Path) -> Result<PathBuf, String> {
     let state = archive
         .parent()
-        .map(|p| p.join(".spacextract"))
+        .map(|p| p.join(".reclaimarc"))
         .ok_or_else(|| "archive has no parent directory".to_string())?;
     if !state.exists() {
         return Err(format!(
-            "no SpaceExtract state found beside '{}' (nothing interrupted?)",
+            "no ReclaimArc state found beside '{}' (nothing interrupted?)",
             archive.display()
         ));
     }

@@ -25,7 +25,7 @@ pub struct FilesystemCapabilities {
     pub directory_flush_supported: bool,
 }
 
-/// Whether a path names a filesystem SpaceExtract trusts for destructive work.
+/// Whether a path names a filesystem ReclaimArc trusts for destructive work.
 fn trusted_filesystem(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     matches!(n.as_str(), "ntfs" | "refs")
@@ -38,7 +38,7 @@ pub fn filesystem_capabilities(dir: &Path) -> Result<FilesystemCapabilities, Pla
     let name = filesystem_name(dir).unwrap_or_else(|_| "unknown".into());
     let trusted = trusted_filesystem(&name);
 
-    let probe_path = dir.join(format!(".spacextract-probe-{}.bin", std::process::id()));
+    let probe_path = dir.join(format!(".reclaimarc-probe-{}.bin", std::process::id()));
     let mut probe = SparseProbe {
         sparse_mark_ok: false,
         deallocation_ok: false,
