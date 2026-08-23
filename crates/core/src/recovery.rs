@@ -24,7 +24,7 @@ use crate::error::CoreError;
 use crate::state;
 
 /// Summary presented on the recovery screen.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct RecoverySummary {
     pub job_id: String,
     pub archive: PathBuf,

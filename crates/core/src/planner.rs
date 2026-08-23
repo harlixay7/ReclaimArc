@@ -14,7 +14,7 @@ use crate::config::{emergency_reserve, EngineConfig};
 use crate::error::CoreError;
 
 /// The verdict of the space simulation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SpacePlan {
     /// Whether progressive extraction can complete safely.
     pub progressive_feasible: bool,

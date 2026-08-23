@@ -170,7 +170,7 @@ pub enum ProgressEvent {
 }
 
 /// Full archive inspection result.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArchiveInfo {
     pub format: String,
     /// Total logical packed bytes across all volumes.
