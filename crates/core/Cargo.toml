@@ -1,0 +1,21 @@
+[package]
+name = "spacextract-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+spacextract-archive.workspace = true
+spacextract-platform.workspace = true
+spacextract-journal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+blake3.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+proptest.workspace = true

@@ -1,0 +1,694 @@
+# SPACEXTRACT — MASTER IMPLEMENTATION DIRECTIVE
+
+Build a production-quality Windows-first open-source utility that can extract archives when there is enough disk capacity for the FINAL files, but not enough free space to simultaneously keep both the full archive and full extracted output.
+
+Working name: SpaceExtract.
+
+This is NOT “extract chunks and delete chunks”.
+It is a transactional storage engine.
+
+Do not stop at planning. Inspect required format/OS documentation, implement the application, test failure recovery, and finish the product.
+
+==================================================
+CORE GUARANTEE
+==================================================
+
+SpaceExtract progressively converts disk allocation occupied by an archive into allocation occupied by verified extracted files.
+
+The fundamental invariant is:
+
+SOURCE BYTES MAY ONLY BE RECLAIMED AFTER THE OUTPUT DEPENDING ON THEM IS:
+1. completely decoded,
+2. integrity-verified,
+3. flushed durably to disk,
+4. atomically committed,
+5. recorded in the durable recovery journal.
+
+If safety cannot be proven, DO NOT reclaim the source.
+
+Never infer reclaimability merely because the decoder file pointer moved forward.
+
+==================================================
+IMPORTANT ARCHITECTURAL RULE
+==================================================
+
+Separate:
+
+I/O CHUNK
+and
+RECOVERY UNIT.
+
+I/O chunks may be small (64–256 MB) for buffering/progress.
+
+A RECOVERY UNIT is determined by the archive format and decoder restart semantics.
+
+Examples:
+
+RAR non-solid file
+→ one safely restartable unit.
+
+RAR file split across volumes
+→ all parts belong to one unit.
+
+RAR solid chain
+→ the entire solid dependency chain is one recovery unit unless a real dictionary reset occurs.
+
+Stored/uncompressed data or independently framed codecs
+→ may support smaller units when mathematically safe.
+
+Never pretend a fixed “1 GB checkpoint” is crash-recoverable if the compression stream cannot restart there.
+
+If one 50 GB compressed file forms one restart unit, the UI must truthfully report that safe extraction requires enough temporary space for that unit.
+
+==================================================
+TECH STACK
+==================================================
+
+Use:
+
+- Rust for the complete extraction/recovery/storage engine.
+- Tauri 2 desktop shell.
+- React + strict TypeScript frontend.
+- SQLite for durable extraction journals.
+- tracing for structured logs.
+- BLAKE3 for internal output/journal integrity.
+- minimal, well-maintained dependencies.
+
+Structure the repository so the core does not depend on the UI:
+
+/crates/core
+/crates/archive
+/crates/platform
+/crates/journal
+/apps/cli
+/apps/desktop
+
+The CLI and desktop UI must use the same engine.
+
+Windows is the first production target.
+
+Design platform traits so Linux hole-punching can be added cleanly afterward.
+
+==================================================
+ARCHIVE BACKEND
+==================================================
+
+Create an ArchiveBackend interface instead of coupling the engine to one decoder.
+
+It must expose:
+
+inspect()
+test_integrity()
+entries()
+recovery_units()
+extract_unit()
+cancel()
+decoder_requirements()
+
+The backend must provide exact packed-data ranges and explicit RetirementProof objects describing when a source range can never again be needed for successful restart.
+
+RAR 4/5 is the first-class v1 target.
+
+Support:
+- single-volume RAR;
+- multipart RAR;
+- encrypted archives;
+- non-solid archives;
+- solid archives with correct dependency-chain handling;
+- split files;
+- Unicode paths;
+- archive CRC/hash validation.
+
+Do NOT implement or reverse-engineer RAR compression.
+
+Evaluate libarchive and RARLab UnRAR.
+
+Keep any UnRAR integration behind its own adapter and license boundary; do not incorrectly relicense it.
+
+Never claim an archive mode is supported until it passes real corpus tests.
+
+Design the adapter layer for later:
+ZIP
+7z
+tar
+zstd/tar.zst
+etc.
+
+Progressive reclamation may have different capabilities per format.
+
+Expose a capability matrix rather than faking universal support.
+
+==================================================
+SOURCE RECLAMATION
+==================================================
+
+For Windows NTFS/ReFS-compatible filesystems:
+
+- verify sparse-file capability;
+- mark the working archive sparse;
+- reclaim only proven-safe packed DATA ranges;
+- preserve archive headers/metadata ranges where useful;
+- use FSCTL_SET_ZERO_DATA to deallocate safe ranges;
+- query allocated ranges afterward to verify actual reclamation.
+
+Align reclamation inward to safe filesystem allocation boundaries. Never zero bytes outside the retired range merely to gain another cluster.
+
+Do not truncate the beginning of files or shift archive offsets.
+
+For multipart archives, prefer keeping tiny sparse volume shells containing required metadata rather than blindly deleting previous volumes if restart/navigation may still reference them.
+
+On successful completion, delete remaining archive shells if the user selected destructive low-space extraction.
+
+The platform layer must also expose:
+
+filesystem_capabilities()
+allocated_size()
+free_space()
+same_storage_pool()
+reclaim_range()
+query_allocated_ranges()
+flush_file()
+flush_directory()
+
+Low-space extraction is useful only when reclaiming the source actually increases capacity available to the destination.
+
+Detect source/destination on different filesystems and explain when reclamation will not help.
+
+Disable destructive mode on unverified filesystems/network/cloud-placeholder scenarios.
+
+==================================================
+TRANSACTION ENGINE
+==================================================
+
+Each recovery unit follows this exact lifecycle:
+
+PENDING
+→ EXTRACTING
+→ OUTPUT_WRITTEN
+→ OUTPUT_VERIFIED
+→ OUTPUT_DURABLE
+→ COMMITTED
+→ RECLAIM_INTENT
+→ RECLAIMED
+
+For each output file:
+
+write:
+filename.sx-partial-<job>
+
+Then:
+
+decode
+→ validate archive CRC/hash
+→ FlushFileBuffers/fsync
+→ compute/store BLAKE3
+→ atomically rename to final name
+→ flush parent directory
+→ commit journal record
+
+Only afterward may corresponding packed source ranges enter RECLAIM_INTENT.
+
+Persist RECLAIM_INTENT BEFORE punching holes.
+
+Then reclaim source ranges.
+
+Then query allocation and persist RECLAIMED.
+
+This ordering must survive a crash between ANY two operations.
+
+A crash after output commit but before source reclamation is harmless.
+
+A crash after source reclamation but before the RECLAIMED journal write must be reconciled by inspecting actual filesystem allocation state.
+
+==================================================
+RECOVERY JOURNAL
+==================================================
+
+Create a small SQLite job database stored beside the archive in a hidden SpaceExtract state directory, with a mirrored job registry in application data.
+
+Use durable transactions:
+WAL where appropriate
+synchronous=FULL for trust-critical commits.
+
+Record:
+
+job ID
+archive identity
+source file IDs/inodes
+all volumes
+source logical/allocated sizes
+archive metadata
+destination
+archive fingerprint
+recovery units
+entries
+partial/final output paths
+checksums
+packed ranges
+reclaimed ranges
+current unit
+state transitions
+errors
+timestamps
+configuration
+
+Never store archive passwords.
+
+On startup, automatically discover interrupted jobs.
+
+Recovery must:
+
+validate source identity
+validate remaining source ranges
+validate committed output sizes/checksums
+reconcile partial reclaim operations
+delete/restart incomplete .sx-partial files when needed
+resume from the last REAL restart boundary
+
+Do not advertise rollback after source data has been reclaimed.
+
+==================================================
+SPACE PLANNER
+==================================================
+
+Before changing the archive, perform a complete simulation.
+
+Determine:
+
+archive logical size
+archive currently allocated size
+total unpacked size
+current free space
+filesystem capability
+restart/recovery units
+largest unit
+expected output allocation
+scratch requirements
+safety reserve
+source ranges recoverable after each unit
+
+Simulate extraction sequentially:
+
+free space
+- new output written
++ source space safely reclaimable
+= next available space.
+
+Peak space must be based on RECOVERY UNITS, not arbitrary chunks.
+
+If extraction cannot be completed safely, explain exactly why.
+
+Example:
+
+Archive                 100.4 GB
+Extracted size           102.1 GB
+Free space                34.8 GB
+Normal extraction        IMPOSSIBLE
+Progressive extraction   POSSIBLE
+Peak extra requirement    11.2 GB
+Emergency reserve          3.0 GB
+Largest restart unit       8.1 GB
+
+Or:
+
+Progressive extraction   NOT SAFE
+Reason:
+A 42.6 GB solid recovery chain must complete before its source can be reclaimed.
+Additional space required: 46.0 GB
+
+Truth is more important than claiming compatibility.
+
+==================================================
+SAFETY
+==================================================
+
+Safe mode must perform a full archive integrity test BEFORE destructive extraction.
+
+While testing, opportunistically compute archive fingerprints so this does not require unnecessary extra passes.
+
+Default emergency reserve:
+
+max(
+  reasonable fixed minimum,
+  percentage of filesystem,
+  transaction/journal requirement
+)
+
+Never intentionally reduce the drive to zero free space.
+
+Before every recovery unit:
+reserve/validate enough capacity for:
+unit output
++ scratch
++ emergency reserve.
+
+Continuously monitor free space.
+
+If actual expansion exceeds estimate:
+STOP before consuming the reserve.
+
+The current recovery unit source remains intact, so its partial output can be discarded and retried.
+
+Protect archive sources from external modification with exclusive/appropriate file locking and identity checks.
+
+Passwords:
+- memory only;
+- never logs;
+- never journal;
+- zero memory when finished.
+
+==================================================
+ARCHIVE EXTRACTION SECURITY
+==================================================
+
+Treat archive paths as hostile.
+
+Block:
+- absolute paths;
+- ../ traversal;
+- drive-letter escapes;
+- UNC escapes;
+- Windows device names;
+- unsafe ADS paths;
+- symlink/hardlink targets escaping destination;
+- case-insensitive filename collisions.
+
+Use long-path-safe Windows APIs.
+
+Symlinks/hardlinks should default to a conservative policy and require explicit opt-in when ambiguous.
+
+Existing-file behavior must be configurable:
+
+Ask
+Skip
+Rename new
+Overwrite
+
+Preflight must account for the space implications of overwrite/backup behavior.
+
+==================================================
+SAFETY MODES
+==================================================
+
+Expose three understandable presets.
+
+SAFE
+- full pre-test required;
+- restartable boundaries only;
+- retain one previous completed recovery unit when practical;
+- full durability flushes;
+- conservative reserve.
+
+BALANCED — DEFAULT
+- full pre-test;
+- reclaim immediately after each durable recovery unit;
+- restartable boundaries only;
+- normal reserve.
+
+MAXIMUM SPACE
+- smallest safe reserve;
+- immediate reclamation at every proven restart boundary.
+
+Do NOT introduce unsafe arbitrary mid-stream destruction merely to make Maximum Space look better.
+
+Decoder-state serialization may be researched later, but it is not a v1 requirement.
+
+==================================================
+PAUSE / CANCEL / FAILURE
+==================================================
+
+Pause should be safe.
+
+Normal Pause:
+finish or safely abort the current recovery unit, journal state, then pause.
+
+Immediate Stop:
+stop decoder, keep source for current unit intact, delete/reconcile partial output on resume.
+
+Cancel must clearly explain:
+previously reclaimed source data cannot be restored.
+
+Failures such as:
+CRC error
+disk full risk
+locked destination
+decoder error
+power loss
+application crash
+filesystem operation failure
+
+must leave the job either:
+RESUMABLE
+or
+explicitly FAILED with a precise reason.
+
+Never silently continue after a failed integrity/reclaim operation.
+
+==================================================
+UI / UX
+==================================================
+
+The application must look like a normal high-quality Windows utility.
+
+NOT:
+SaaS dashboard
+glassmorphism
+gradients
+glows
+purple themes
+giant rounded cards
+marketing hero screens
+excessive animation
+AI-generated component spam.
+
+Use:
+Segoe UI/system fonts
+Windows system theme
+neutral white/gray/dark surfaces
+1px borders
+4–6px radii
+system accent color only where useful
+normal Windows spacing
+compact native-looking controls.
+
+Main window:
+
+Menu/command bar
+[Open Archive] [Destination] [Analyze]
+
+Archive summary:
+RAR5 · 100.4 GB packed · 102.1 GB unpacked · Non-solid
+
+Large normal file table:
+Name | Packed | Size | Ratio | Recovery Unit | Status
+
+Bottom Space Plan panel:
+
+Free now
+Normal extraction requirement
+Progressive peak requirement
+Safety reserve
+Largest recovery unit
+Estimated source reclaim
+
+Primary action:
+Extract
+
+Offer two clear extraction choices:
+
+Normal Extraction
+Keeps original archive.
+
+Low-Space Extraction
+Progressively destroys verified portions of the source archive to reclaim space.
+
+Before destructive mode starts, show ONE concise confirmation explaining exactly what happens.
+
+During extraction use the same window:
+
+Overall progress
+Current file
+Current recovery unit
+Written
+Verified
+Source reclaimed
+Current free space
+Speed
+ETA
+
+Buttons:
+Pause
+Stop Safely
+
+No fake “100% safe” labels.
+
+==================================================
+SETTINGS
+==================================================
+
+Keep the main UI simple.
+
+Settings dialog may expose:
+
+General
+- default destination;
+- conflict policy;
+- preserve timestamps/attributes;
+- theme.
+
+Space & Safety
+- Safe/Balanced/Maximum Space;
+- automatic/custom reserve;
+- pre-test archive;
+- output checksum manifest;
+- retain previous recovery unit.
+
+Extraction
+- password behavior;
+- symlink policy;
+- metadata policy;
+- delete source shells on completion.
+
+Advanced
+- I/O buffer size;
+- decoder threads;
+- logging level;
+- reclamation strategy.
+
+Do not expose internal knobs ordinary users should not understand.
+
+==================================================
+RECOVERY UX
+==================================================
+
+If an interrupted job is found on startup:
+
+Extraction was interrupted.
+
+Archive:
+...
+Committed output: 71.2 GB
+Source reclaimed: 69.8 GB
+Remaining source: 30.4 GB
+Last safe checkpoint: File 842
+
+[Resume]
+[Inspect]
+[Abandon Job]
+
+Never say “rollback” unless the source actually exists to perform one.
+
+==================================================
+OBSERVABILITY
+==================================================
+
+Use structured rolling logs with automatic redaction.
+
+Provide:
+Open Logs
+Copy Diagnostics
+Export Recovery Report
+
+Never log passwords or confidential file contents.
+
+Errors must include:
+operation
+path
+OS error
+archive/backend error
+recovery state
+recommended action.
+
+==================================================
+TESTING — THIS IS CRITICAL
+==================================================
+
+Build a fault-injection harness.
+
+Simulate process death after EVERY durable transition:
+
+after partial write
+after output flush
+after rename
+after journal commit
+before hole punch
+during/after hole punch
+before RECLAIMED commit
+
+Reopen the job and prove invariants hold.
+
+Add tests for:
+
+non-solid RAR
+solid RAR
+multiple solid chains
+split files
+multipart archives
+encrypted archives
+corrupt archives
+very large files
+zero-byte files
+Unicode
+path traversal
+symlink escape
+case collisions
+existing destination files
+source modification
+low-space boundary
+unsupported filesystem
+source/destination different volumes
+pause/cancel
+journal corruption
+partial range reclamation.
+
+Include real Windows integration tests that:
+create a sparse-capable temporary file,
+reclaim ranges,
+verify allocated size drops,
+verify unrelated bytes remain unchanged.
+
+Use small fixtures plus synthetic large sparse files so CI does not require hundreds of GB.
+
+Add property tests for the space planner and recovery state machine.
+
+Fuzz archive metadata/path handling where practical.
+
+==================================================
+DEFINITION OF DONE
+==================================================
+
+The project is done only when:
+
+1. Safe mode never destroys data belonging to an uncommitted recovery unit.
+2. Every crash point automatically resumes or reports an exact unrecoverable condition.
+3. Space predictions match measured peak usage within a defined conservative margin.
+4. A real low-space RAR extraction succeeds where normal extraction would fail.
+5. Solid archives are handled according to actual dependency boundaries.
+6. Unsupported situations are rejected instead of guessed.
+7. Source range reclamation measurably returns free disk space.
+8. Path traversal and destination escapes are impossible.
+9. UI can be understood without documentation.
+10. CLI and GUI use the same tested engine.
+11. Build/tests pass cleanly with no fake success paths.
+12. Documentation clearly explains destructive extraction and recovery limitations.
+
+Before finishing, audit the entire codebase for:
+ignored filesystem errors,
+unchecked fsync/flush failures,
+source deletion before durable commit,
+hardcoded paths,
+fake test results,
+unwraps/panics on archive input,
+password leakage,
+path traversal,
+unsafe arithmetic,
+incorrect space accounting,
+unsupported archive assumptions.
+
+Do not weaken the safety model to make a demo work.
+
+The product's strongest feature is not that it always extracts.
+
+Its strongest feature is:
+
+IF SPACEXTRACT SAYS AN EXTRACTION IS SAFE, THE ENGINE CAN PROVE WHY.
