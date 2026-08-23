@@ -170,14 +170,12 @@ pub fn prepare_resume(
             continue;
         }
         let entries = journal.entries_for_unit(unit.seq).map_err(CoreError::Journal)?;
-        eprintln!("[recovery] unit {} state {:?} entries {}", unit.seq, unit.state, entries.len());
         for entry in &entries {
             if entry.is_directory {
                 continue;
             }
             let final_path = entry.final_path.clone().unwrap_or_default();
             let partial = entry.partial_path.clone().unwrap_or_default();
-            eprintln!("[recovery]   entry {} status {:?} partial {:?}", entry.index_in_archive, entry.status, partial);
             if entry.status == EntryStatus::Verified || entry.status == EntryStatus::Durable {
                 // Possibly already renamed into place. Verify the final file.
                 if final_path.exists() && entry.blake3.is_some() {
@@ -333,3 +331,4 @@ pub fn fail_job(journal: &mut JobJournal, reason: &str) -> Result<(), CoreError>
 pub fn open_source_handle(path: &Path) -> Result<std::fs::File, CoreError> {
     open_for_identity(path).map_err(CoreError::Platform)
 }
+

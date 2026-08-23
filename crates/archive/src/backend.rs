@@ -42,6 +42,15 @@ pub struct OpenOptions {
 /// Progress callback signature used by the engine to surface events.
 pub type ProgressFn<'a> = &'a mut dyn FnMut(ProgressEvent) -> bool;
 
+/// One file extracted by a streaming pass.
+#[derive(Debug, Clone)]
+pub struct ExtractedFile {
+    /// Entry index in the archive.
+    pub index: u64,
+    /// Absolute path of the written partial file.
+    pub partial_path: PathBuf,
+}
+
 /// The archive backend interface.
 pub trait ArchiveBackend: Send {
     /// Inspect the archive: entries, volumes, recovery units, capabilities.
@@ -72,6 +81,23 @@ pub trait ArchiveBackend: Send {
 
     /// Request cancellation of the current operation.
     fn cancel(&mut self);
+
+    /// Begin a single-pass streaming extraction: the decoder is opened once
+    /// and walks the archive forward, extracting every file at or after
+    /// `stop_at` as the caller calls `extract_next`.
+    ///
+    /// This avoids the O(n²) re-walks of per-unit passes and is the fast path
+    /// for archives whose recovery units are single files.
+    fn begin_extraction(&mut self, options: &ExtractOptions, stop_at: u64) -> Result<(), ArchiveError>;
+
+    /// Extract the next file of the streaming pass. Returns `None` when the
+    /// archive is exhausted. Entries before `stop_at` are skipped (seek, or
+    /// verified in TEST mode for split files).
+    fn extract_next<'p, 'c>(
+        &mut self,
+        options: &ExtractOptions,
+        progress: Option<&'p mut (dyn FnMut(ProgressEvent) -> bool + 'c)>,
+    ) -> Result<Option<ExtractedFile>, ArchiveError>;
 
     /// Decoder requirements for the planner.
     fn decoder_requirements(&self) -> DecoderRequirements;

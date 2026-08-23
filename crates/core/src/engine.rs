@@ -568,7 +568,73 @@ impl JobJob {
         let scratch = self.info.decoder_requirements.scratch_bytes;
         let mut monitor = SpaceMonitor::new(reserve);
 
-        let unit_count = units.len();
+let unit_count = units.len();
+        // Fast path: when every recovery unit is a single file, extract with
+        // one decoder pass (avoids O(n²) per-unit re-walks of large archives).
+        let fast_path = self.info.recovery_units.iter().all(|u| u.first_entry == u.last_entry);
+
+        // Per-attempt partial suffix: unique per run. The journal's entry
+        // partial paths must match exactly what the decoder writes.
+        let suffix = attempt_suffix(&self.job_id);
+        if fast_path {
+            // Update partial paths for every entry whose unit is not yet
+            // committed, in one durable batch. (Entry status alone is not
+            // enough: a unit can crash after its entries were renamed, and
+            // recovery re-extracts them under a fresh partial name.)
+            let committed_units: std::collections::HashSet<u64> = units
+                .iter()
+                .filter(|u| state::is_committed(u.state))
+                .map(|u| u.seq)
+                .collect();
+            let entries = self.journal.entries().map_err(CoreError::Journal)?;
+            let updates: Vec<(u64, String)> = entries
+                .iter()
+                .filter(|e| !e.is_directory)
+                .filter(|e| !committed_units.contains(&e.recovery_unit))
+                .filter_map(|e| {
+                    e.final_path.clone().map(|f| {
+                        let mut p = f.as_os_str().to_os_string();
+                        p.push(&suffix);
+                        (e.index_in_archive, p.to_string_lossy().into_owned())
+                    })
+                })
+                .collect();
+            self.journal
+                .set_partial_paths_batch(&updates)
+                .map_err(CoreError::Journal)?;
+        }
+
+        // The streaming pass skips everything before the first entry that will be
+        // (re-)extracted. In destructive mode, committed-but-unreclaimed units
+        // are reclaim-only and must NOT be re-extracted — their source may
+        // already have been punched.
+        let stop_at = self
+            .info
+            .recovery_units
+            .iter()
+            .find(|u| {
+                units
+                    .iter()
+                    .find(|j| j.seq == u.seq)
+                    .map(|j| !state::is_committed(j.state))
+                    .unwrap_or(true)
+            })
+            .map(|u| u.first_entry)
+            .unwrap_or(0);
+        if fast_path {
+            let opts = ExtractOptions {
+                dest_dir: self.destination.clone(),
+                job_id: self.job_id.clone(),
+                partial_suffix: suffix.clone(),
+                password: self.password.clone(),
+                cancel: None,
+                name_map: self.name_map.clone(),
+            };
+            self.backend
+                .begin_extraction(&opts, stop_at)
+                .map_err(CoreError::Archive)?;
+        }
+
         while seq < unit_count as u64 {
             let unit = self
                 .info
@@ -576,6 +642,17 @@ impl JobJob {
                 .iter()
                 .find(|u| u.seq == seq)
                 .ok_or_else(|| CoreError::Precondition(format!("unit {seq} not found")))?;
+
+            // In destructive mode a committed unit may still need its source
+            // reclaimed (crash between COMMITTED and RECLAIMED). Reclaim-only:
+            // no re-extraction, no re-verification — the output is committed.
+            let unit_state = units
+                .iter()
+                .find(|u| u.seq == seq)
+                .map(|u| u.state)
+                .unwrap_or(UnitState::Pending);
+            let reclaim_only =
+                destructive && state::is_committed(unit_state) && !state::is_reclaimed(unit_state);
 
             let _ = tx.send(Event::UnitStarted {
                 seq,
@@ -588,35 +665,11 @@ impl JobJob {
             let free = observed_free_space(&self.destination)?;
             let _ = tx.send(Event::FreeSpace { bytes: free });
 
-// ---- EXTRACTING (durable) ----
-            self.journal
-                .set_unit_state(seq, UnitState::Extracting)
-                .map_err(CoreError::Journal)?;
-
-            // Unique per-attempt partial names (an aborted decoder leaves its
-            // output locked until process exit). The journal records the
-            // exact names so verification and recovery stay exact.
-            let suffix = attempt_suffix(&self.job_id);
-            let unit_entries = self
-                .journal
-                .entries_for_unit(seq)
-                .map_err(CoreError::Journal)?;
-            for entry in &unit_entries {
-                if entry.is_directory {
-                    continue;
-                }
-                let final_path = entry.final_path.clone().unwrap();
-                let mut partial = final_path.as_os_str().to_os_string();
-                partial.push(&suffix);
-                let partial_path = PathBuf::from(partial);
+            if !reclaim_only {
+                // ---- EXTRACTING (durable) ----
                 self.journal
-                    .set_entry_paths(
-                        entry.index_in_archive,
-                        Some(&partial_path),
-                        Some(&final_path),
-                    )
+                    .set_unit_state(seq, UnitState::Extracting)
                     .map_err(CoreError::Journal)?;
-            }
 
             let opts = ExtractOptions {
                 dest_dir: self.destination.clone(),
@@ -635,95 +688,125 @@ impl JobJob {
                 // Pause = safe abort at the next file boundary.
                 !cancel_flag.load(Ordering::SeqCst) && !pause_flag.load(Ordering::SeqCst)
             };
-            let extract = self.backend.extract_unit(seq, &opts, Some(&mut progress_cb));
 
-            if let Err(e) = extract {
-                return match e {
-                    spacextract_archive::ArchiveError::Cancelled
-                        if pause_flag.load(Ordering::SeqCst) =>
-                    {
-                        self.journal
-                            .set_job_progress(seq, JobState::Paused)
-                            .map_err(CoreError::Journal)?;
-                        let _ = tx.send(Event::JobPaused { job_id: self.job_id.clone() });
-                        Ok(JobOutcome::Paused)
+            if fast_path {
+                // The unit holds a single entry. Directories are created by
+                // the commit step; the streaming pass skips them for us.
+                let single = unit.first_entry;
+                let entry = self
+                    .info
+                    .entries
+                    .iter()
+                    .find(|e| e.index == single)
+                    .ok_or_else(|| CoreError::Precondition(format!("entry {single} not found")))?;
+                if !entry.is_directory {
+                    match self.backend.extract_next(&opts, Some(&mut progress_cb)) {
+                        Err(spacextract_archive::ArchiveError::Cancelled)
+                            if pause_flag.load(Ordering::SeqCst) =>
+                        {
+                            self.journal
+                                .set_job_progress(seq, JobState::Paused)
+                                .map_err(CoreError::Journal)?;
+                            let _ = tx.send(Event::JobPaused { job_id: self.job_id.clone() });
+                            return Ok(JobOutcome::Paused);
+                        }
+                        Err(spacextract_archive::ArchiveError::Cancelled) => {
+                            let _ = tx.send(Event::JobCancelled { job_id: self.job_id.clone() });
+                            return Ok(JobOutcome::Cancelled);
+                        }
+                        Err(other) => return Err(CoreError::Archive(other)),
+                        Ok(None) => {
+                            return Err(CoreError::Precondition(format!(
+                                "streaming pass exhausted before unit {seq}"
+                            )));
+                        }
+                        Ok(Some(_)) => {}
                     }
-                    spacextract_archive::ArchiveError::Cancelled => {
-                        let _ = tx.send(Event::JobCancelled { job_id: self.job_id.clone() });
-                        Ok(JobOutcome::Cancelled)
-                    }
-                    other => Err(CoreError::Archive(other)),
-                };
+                }
+            } else {
+                let extract = self.backend.extract_unit(seq, &opts, Some(&mut progress_cb));
+                if let Err(e) = extract {
+                    return match e {
+                        spacextract_archive::ArchiveError::Cancelled
+                            if pause_flag.load(Ordering::SeqCst) =>
+                        {
+                            self.journal
+                                .set_job_progress(seq, JobState::Paused)
+                                .map_err(CoreError::Journal)?;
+                            let _ = tx.send(Event::JobPaused { job_id: self.job_id.clone() });
+                            Ok(JobOutcome::Paused)
+                        }
+                        spacextract_archive::ArchiveError::Cancelled => {
+                            let _ = tx.send(Event::JobCancelled { job_id: self.job_id.clone() });
+                            Ok(JobOutcome::Cancelled)
+                        }
+                        other => Err(CoreError::Archive(other)),
+                    };
+                }
             }
             fault::fire(CrashPoint::AfterPartialWrite, &self.job_id);
 
-            // ---- OUTPUT_WRITTEN (durable) ----
-            self.journal
-                .set_unit_state(seq, UnitState::OutputWritten)
-                .map_err(CoreError::Journal)?;
-
-            // ---- verify each partial (size + BLAKE3) ----
+// ---- OUTPUT_WRITTEN → OUTPUT_DURABLE (one durable transaction) ----
+            // Verify each partial (size + BLAKE3), journal the verified
+            // hashes, then flush every partial durably. The intermediate
+            // states are journaled inside a single transaction; crash
+            // recovery treats any non-committed unit identically.
             let entries = self.journal.entries_for_unit(seq).map_err(CoreError::Journal)?;
             let mut written_bytes: u64 = 0;
-            for entry in &entries {
-                if entry.is_directory {
-                    continue;
-                }
-                let partial = entry.partial_path.clone().ok_or_else(|| {
-                    CoreError::Precondition(format!(
-                        "entry {} has no partial path",
-                        entry.index_in_archive
-                    ))
-                })?;
-                let blake3 =
-                    verify_file(&partial, entry.unpacked_size, config.io_buffer_size).map_err(|e| {
-                        CoreError::failed(
-                            "verify partial output",
-                            Some(partial.clone()),
-                            None,
-                            "EXTRACTING",
-                            format!("verification of '{}' failed: {e}", partial.display()),
-                            "The unit's partial output is discarded on resume and the unit is re-extracted.",
-                        )
+            if !reclaim_only {
+                let mut verified: Vec<(u64, String)> = Vec::new();
+                for entry in &entries {
+                    if entry.is_directory {
+                        continue;
+                    }
+                    let partial = entry.partial_path.clone().ok_or_else(|| {
+                        CoreError::Precondition(format!(
+                            "entry {} has no partial path",
+                            entry.index_in_archive
+                        ))
                     })?;
-                self.journal
-                    .set_entry_verified(entry.index_in_archive, &blake3)
-                    .map_err(CoreError::Journal)?;
-                let _ = tx.send(Event::EntryVerified {
-                    index: entry.index_in_archive,
-                    blake3,
-                });
-                written_bytes = written_bytes.saturating_add(entry.unpacked_size);
-            }
-
-            // ---- OUTPUT_VERIFIED (durable) ----
-            self.journal
-                .set_unit_state(seq, UnitState::OutputVerified)
-                .map_err(CoreError::Journal)?;
-
-// ---- flush every partial durably ----
-            for entry in &entries {
-                if entry.is_directory {
-                    continue;
+                    let blake3 =
+                        verify_file(&partial, entry.unpacked_size, config.io_buffer_size).map_err(
+                            |e| {
+                                CoreError::failed(
+                                    "verify partial output",
+                                    Some(partial.clone()),
+                                    None,
+                                    "EXTRACTING",
+                                    format!("verification of '{}' failed: {e}", partial.display()),
+                                    "The unit's partial output is discarded on resume and the unit is re-extracted.",
+                                )
+                            },
+                        )?;
+                    let _ = tx.send(Event::EntryVerified {
+                        index: entry.index_in_archive,
+                        blake3: blake3.clone(),
+                    });
+                    written_bytes = written_bytes.saturating_add(entry.unpacked_size);
+                    verified.push((entry.index_in_archive, blake3));
                 }
-                let partial = entry.partial_path.clone().unwrap();
-                // FlushFileBuffers requires a write-capable handle.
-                let file = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&partial)
-                    .map_err(|e| CoreError::from_io_source("open partial for flush", &partial, e))?;
-                flush::flush_file(&file, &partial).map_err(CoreError::Platform)?;
+                // Flush before journaling DURABLE so the bytes are on disk
+                // when the journal says so.
+                for entry in &entries {
+                    if entry.is_directory {
+                        continue;
+                    }
+                    let partial = entry.partial_path.clone().unwrap();
+                    // FlushFileBuffers requires a write-capable handle.
+                    let file = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&partial)
+                        .map_err(|e| {
+                            CoreError::from_io_source("open partial for flush", &partial, e)
+                        })?;
+                    flush::flush_file(&file, &partial).map_err(CoreError::Platform)?;
+                }
                 self.journal
-                    .set_entry_status(entry.index_in_archive, EntryStatus::Durable)
+                    .mark_unit_verified_durable(seq, &verified)
                     .map_err(CoreError::Journal)?;
+                fault::fire(CrashPoint::AfterOutputFlush, &self.job_id);
             }
-
-            // ---- OUTPUT_DURABLE (durable) ----
-            self.journal
-                .set_unit_state(seq, UnitState::OutputDurable)
-                .map_err(CoreError::Journal)?;
-            fault::fire(CrashPoint::AfterOutputFlush, &self.job_id);
 
             // ---- atomic rename to final name ----
             for entry in &entries {
@@ -752,12 +835,13 @@ impl JobJob {
             flush::flush_directory(&self.destination).map_err(CoreError::Platform)?;
             fault::fire(CrashPoint::AfterRename, &self.job_id);
 
-            // ---- COMMITTED (durable) ----
+// ---- COMMITTED (durable) ----
             self.journal
                 .set_unit_state(seq, UnitState::Committed)
                 .map_err(CoreError::Journal)?;
             let _ = tx.send(Event::UnitCommitted { seq, bytes: written_bytes });
             fault::fire(CrashPoint::AfterJournalCommit, &self.job_id);
+            } // end !reclaim_only
 
             // ---- reclaim source ranges (destructive mode) ----
             if destructive {
@@ -1066,3 +1150,4 @@ fn delete_archive_shells(journal: &JobJournal) -> Result<(), CoreError> {
     }
     Ok(())
 }
+

@@ -26,7 +26,7 @@ use unrar_sys::{
     RARProcessFileW, RARReadHeaderEx, UINT, UCM_CHANGEVOLUMEW, UCM_NEEDPASSWORDW, UCM_PROCESSDATA,
     ERAR_BAD_ARCHIVE, ERAR_BAD_DATA, ERAR_BAD_PASSWORD, ERAR_ECREATE, ERAR_END_ARCHIVE, ERAR_EOPEN,
     ERAR_EREAD, ERAR_EREFERENCE, ERAR_EWRITE, ERAR_MISSING_PASSWORD, ERAR_UNKNOWN, ERAR_UNKNOWN_FORMAT,
-    RAR_EXTRACT, RAR_OM_EXTRACT, RAR_OM_LIST_INCSPLIT, RAR_SKIP, RAR_TEST,
+    RAR_EXTRACT, RAR_OM_EXTRACT, RAR_OM_LIST, RAR_SKIP, RAR_TEST,
 };
 
 /// One header as reported by the C library (ground truth for validation).
@@ -87,7 +87,7 @@ extern "C" fn unrar_callback(msg: UINT, user_data: LPARAM, p1: LPARAM, p2: LPARA
     // and the callback is invoked synchronously on the driving thread.
     let ctx: &mut CallbackCtx = unsafe { &mut *(user_data as *mut CallbackCtx) };
     match msg {
-        UCM_PROCESSDATA => {
+UCM_PROCESSDATA => {
             // p1 = unpacked data buffer, p2 = byte count.
             if let Some(cancel) = &ctx.cancel {
                 if cancel.load(Ordering::Relaxed) {
@@ -126,14 +126,24 @@ extern "C" fn unrar_callback(msg: UINT, user_data: LPARAM, p1: LPARAM, p2: LPARA
                 -1
             }
         }
-        UCM_CHANGEVOLUMEW => {
-            // p1 = next volume name (wide, NUL-terminated). Accept the name.
+UCM_CHANGEVOLUMEW => {
+            // p1 = next volume name (wide, NUL-terminated).
+            // Reject the name when the file does not exist: the DLL would
+            // otherwise retry the same open forever (its merge loop accepts
+            // the callback's answer and loops). Returning -1 turns the
+            // missing volume into a precise ERAR_EOPEN error.
             if p1 != 0 {
                 let name = unsafe { std::slice::from_raw_parts(p1 as *const u16, 4096) };
                 let end = name.iter().position(|&c| c == 0).unwrap_or(name.len());
                 let vol = String::from_utf16_lossy(&name[..end]);
-                if !vol.is_empty() && !ctx.opened_volumes.contains(&vol) {
-                    ctx.opened_volumes.push(vol);
+                if vol.is_empty() {
+                    return -1;
+                }
+                if !ctx.opened_volumes.contains(&vol) {
+                    ctx.opened_volumes.push(vol.clone());
+                }
+                if !std::path::Path::new(&vol).exists() {
+                    return -1;
                 }
             }
             0
@@ -173,9 +183,14 @@ impl Unrar {
         });
         let ctx_ptr = Box::into_raw(ctx);
 
-        let wide_name = to_wide(&first_volume.to_string_lossy());
+let wide_name = to_wide(&first_volume.to_string_lossy());
+        // Plain RAR_OM_LIST (not _INCSPLIT): the DLL then auto-skips
+        // split-before continuation headers, yielding exactly one header per
+        // logical file — matching our parser, which merges parts. (INCSPLIT
+        // would report every part as a separate header and break the
+        // parser↔decoder cross-validation for multipart archives.)
         let mut data = OpenArchiveDataEx::new(wide_name.as_ptr(), if mode == OpenMode::List {
-            RAR_OM_LIST_INCSPLIT
+            RAR_OM_LIST
         } else {
             RAR_OM_EXTRACT
         });
@@ -193,7 +208,7 @@ impl Unrar {
             handle,
             ctx: ctx_ptr,
             open_mode: if mode == OpenMode::List {
-                RAR_OM_LIST_INCSPLIT
+                RAR_OM_LIST
             } else {
                 RAR_OM_EXTRACT
             }
@@ -268,7 +283,7 @@ impl Unrar {
             )
         };
 
-        let ctx = unsafe { &mut *self.ctx };
+let ctx = unsafe { &mut *self.ctx };
         ctx.progress = None;
 
         if code == 0 {
@@ -353,4 +368,6 @@ mod tests {
         assert_eq!(back, s);
     }
 }
+
+
 

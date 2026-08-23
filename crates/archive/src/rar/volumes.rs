@@ -90,8 +90,16 @@ let entries = std::fs::read_dir(&dir).map_err(|e| {
         ArchiveError::open(format!("cannot list directory '{}': {e}", dir.display()))
     })?;
 
+    // When multiple files map to the same part number (e.g. "part1.rar"
+    // beside "part01.rar" from a different naming scheme), prefer the one
+    // matching the digit width of the given file's part number.
+    let given_digits = parse_new_numbering(&name)
+        .map(|(_, n)| n.to_string().len())
+        .unwrap_or(0);
+
     let mut parts: Vec<(u64, PathBuf)> = Vec::new();
     let is_new_numbering = parse_new_numbering(&name).is_some();
+    let mut seen: std::collections::HashMap<u64, Vec<PathBuf>> = std::collections::HashMap::new();
 
     for entry in entries.flatten() {
         let p = entry.path();
@@ -101,13 +109,28 @@ let entries = std::fs::read_dir(&dir).map_err(|e| {
             .unwrap_or_default();
         if let Some((s, num)) = parse_new_numbering(&n) {
             if s == stem {
-                parts.push((num, p));
+                seen.entry(num).or_default().push(p);
             }
         } else if let Some((s, num)) = parse_old_numbering(&n) {
             if s == stem {
-                parts.push((num, p));
+                seen.entry(num).or_default().push(p);
             }
         }
+    }
+    for (num, mut candidates) in seen {
+        if candidates.len() > 1 {
+            // Prefer the candidate whose part digits match the given file's
+            // digit width (e.g. "part01" vs "part1"); fall back to the first.
+            candidates.sort_by_key(|p| {
+                let digits = p
+                    .file_name()
+                    .map(|x| x.to_string_lossy().into_owned())
+                    .and_then(|n| parse_new_numbering(&n).map(|(_, v)| v.to_string().len()))
+                    .unwrap_or(0);
+                (digits != given_digits, digits)
+            });
+        }
+        parts.push((num, candidates.remove(0)));
     }
 
     if parts.is_empty() {

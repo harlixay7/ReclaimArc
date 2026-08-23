@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use crate::backend::{ArchiveBackend, ExtractOptions, OpenOptions};
+use crate::backend::{ArchiveBackend, ExtractOptions, ExtractedFile, OpenOptions};
 use crate::error::ArchiveError;
 use crate::model::{
     ArchiveInfo, CapabilityMatrix, DecoderRequirements, Entry, IntegrityReport, ProgressEvent,
@@ -20,6 +20,11 @@ use crate::rar::volumes::{describe, discover_volumes};
 pub struct RarBackend {
     first_volume: PathBuf,
     info: Option<ArchiveInfo>,
+    /// Streaming pass state.
+    decoder: Option<Unrar>,
+    next_index: u64,
+    stop_at: u64,
+    pass_done: bool,
 }
 
 impl RarBackend {
@@ -28,6 +33,10 @@ impl RarBackend {
         RarBackend {
             first_volume: path.to_path_buf(),
             info: None,
+            decoder: None,
+            next_index: 0,
+            stop_at: 0,
+            pass_done: false,
         }
     }
 }
@@ -258,12 +267,19 @@ let mut extracted: Vec<u64> = Vec::new();
         let mut progress = progress;
         let _ = info;
 
-        loop {
+loop {
             let Some(h) = decoder.read_header()? else { break };
-                        if index < unit.first_entry {
-                // Belongs to an already-committed unit: skip (seek) only.
-                decoder.process_file(Operation::Skip, None, None, None, index, h.pack_size)?;
-                            } else if index <= unit.last_entry {
+            if index < unit.first_entry {
+                // Belongs to an already-committed unit.
+                // Split files cannot be seek-skipped in PROCESS mode (the
+                // DLL fails on the continuation with a checksum error —
+                // verified empirically), so process them in TEST mode
+                // instead: the whole split file is decoded and CRC-verified,
+                // and the decoder lands past it.
+                let is_split = h.flags & 1 != 0 || h.flags & 2 != 0;
+                let op = if is_split { Operation::Test } else { Operation::Skip };
+                decoder.process_file(op, None, None, None, index, h.pack_size)?;
+            } else if index <= unit.last_entry {
                 let entry = self
                     .info
                     .as_ref()
@@ -302,8 +318,88 @@ let mut extracted: Vec<u64> = Vec::new();
         })
     }
 
-    fn cancel(&mut self) {
+fn cancel(&mut self) {
         // Cancellation is handled via the shared AtomicBool passed at open.
+    }
+
+    fn begin_extraction(&mut self, options: &ExtractOptions, stop_at: u64) -> Result<(), ArchiveError> {
+        let info = self
+            .info
+            .clone()
+            .ok_or_else(|| ArchiveError::open("inspect() must be called before begin_extraction()"))?;
+        let first = &info.volumes[0].path;
+        let decoder = Unrar::open(
+            first,
+            OpenMode::Process,
+            options.password.clone(),
+            options.cancel.clone(),
+        )?;
+        self.decoder = Some(decoder);
+        self.next_index = 0;
+        self.stop_at = stop_at;
+        self.pass_done = false;
+        Ok(())
+    }
+
+    fn extract_next<'p, 'c>(
+        &mut self,
+        options: &ExtractOptions,
+        progress: Option<&'p mut (dyn FnMut(ProgressEvent) -> bool + 'c)>,
+    ) -> Result<Option<ExtractedFile>, ArchiveError> {
+        if self.pass_done {
+            return Ok(None);
+        }
+        let info = self
+            .info
+            .clone()
+            .ok_or_else(|| ArchiveError::open("inspect() must be called before extract_next()"))?;
+        let mut progress = progress;
+        loop {
+            let Some(decoder) = self.decoder.as_mut() else {
+                self.pass_done = true;
+                return Ok(None);
+            };
+            let Some(h) = decoder.read_header()? else {
+                self.decoder = None;
+                self.pass_done = true;
+                return Ok(None);
+            };
+            let index = self.next_index;
+            if index < self.stop_at {
+                // Already-committed entries: seek, or verify split files in
+                // TEST mode (the DLL cannot seek past split continuations).
+                let is_split = h.flags & 1 != 0 || h.flags & 2 != 0;
+                let op = if is_split { Operation::Test } else { Operation::Skip };
+                decoder.process_file(op, None, None, None, index, h.pack_size)?;
+                self.next_index += 1;
+                continue;
+            }
+            let entry = info
+                .entries
+                .iter()
+                .find(|e| e.index == index)
+                .ok_or_else(|| ArchiveError::NotFound(format!("entry {index}")))?;
+            self.next_index += 1;
+            if entry.is_directory {
+                // Directories are created by the engine; skip the record.
+                decoder.process_file(Operation::Skip, None, None, None, index, h.pack_size)?;
+                continue;
+            }
+            let partial = partial_output_path(options, index, &entry.name);
+            let partial_str = partial.to_string_lossy().into_owned();
+            decoder.process_file(
+                Operation::Extract,
+                None,
+                Some(&partial_str),
+                progress.as_deref_mut(),
+                index,
+                entry.unpacked_size,
+            )?;
+            return Ok(Some(ExtractedFile {
+                index,
+                partial_path: partial,
+            }));
+        }
     }
 
     fn decoder_requirements(&self) -> DecoderRequirements {
@@ -669,6 +765,146 @@ assert_eq!(std::fs::read(out.join("a.bin.sx-partial-mv")).unwrap(), vec![0x11; 4
         }
         assert_eq!(std::fs::read(out.join("one.bin.sx-partial-svc4")).unwrap(), vec![0x44; 3000]);
         assert_eq!(std::fs::read(out.join("two.bin.sx-partial-svc4")).unwrap(), vec![0x55; 3000]);
+    }
+
+    /// A file split in half across two volumes. The decoder must report ONE
+    /// entry for it (LIST mode skips the continuation header) and extraction
+    /// must reassemble it byte-exactly.
+    #[test]
+    fn split_file_across_volumes_rar5() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = vec![0xABu8; 50_000];
+        let files = vec![
+            FixtureFile::new("a.bin", &vec![0x11; 1000]),
+            FixtureFile::new("big.bin", &data),
+            FixtureFile::new("c.bin", &vec![0x33; 1000]),
+        ];
+        let opts = FixtureOptions {
+            force_split_file: Some(1),
+            ..Default::default()
+        };
+        let paths = write_rar(dir.path(), "sp", &files, &opts).unwrap();
+        assert_eq!(paths.len(), 2, "split archive must have 2 volumes");
+        let mut backend = RarBackend::new(&paths[0]);
+        let info = backend.inspect(&OpenOptions::default()).unwrap();
+        assert_eq!(info.entries.len(), 3, "split file must be ONE entry");
+        assert_eq!(info.volumes.len(), 2);
+        let split = info.entries.iter().find(|e| e.name == "big.bin").unwrap();
+        assert!(split.split_before && split.split_after, "split flags must be recorded");
+        // The split entry's packed ranges must span both volumes.
+        let unit = info
+            .recovery_units
+            .iter()
+            .find(|u| u.first_entry == split.index)
+            .unwrap();
+        assert_eq!(unit.packed_ranges.len(), 2, "packed range must span both volumes");
+
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut opts = ExtractOptions {
+            dest_dir: out.clone(),
+            job_id: "sp".into(),
+            password: None,
+            cancel: Some(cancel),
+            partial_suffix: String::new(),
+            name_map: std::collections::HashMap::new(),
+        };
+        opts.name_map.insert(0, "a.bin".to_string());
+        opts.name_map.insert(1, "big.bin".to_string());
+        opts.name_map.insert(2, "c.bin".to_string());
+        for u in &info.recovery_units {
+            let report = backend.extract_unit(u.seq, &opts, None).unwrap();
+            assert!(report.verified);
+        }
+        assert_eq!(std::fs::read(out.join("a.bin.sx-partial-sp")).unwrap(), vec![0x11; 1000]);
+        assert_eq!(std::fs::read(out.join("big.bin.sx-partial-sp")).unwrap(), data);
+        assert_eq!(std::fs::read(out.join("c.bin.sx-partial-sp")).unwrap(), vec![0x33; 1000]);
+    }
+
+    #[test]
+    fn split_file_across_volumes_rar4() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = vec![0xCDu8; 40_000];
+        let files = vec![
+            FixtureFile::new("a.bin", &vec![0x11; 1000]),
+            FixtureFile::new("big.bin", &data),
+            FixtureFile::new("c.bin", &vec![0x33; 1000]),
+        ];
+        let opts = FixtureOptions {
+            rar5: false,
+            force_split_file: Some(1),
+            ..Default::default()
+        };
+        let paths = write_rar(dir.path(), "sp4", &files, &opts).unwrap();
+        assert_eq!(paths.len(), 2);
+        let mut backend = RarBackend::new(&paths[0]);
+        let info = backend.inspect(&OpenOptions::default()).unwrap();
+        assert_eq!(info.entries.len(), 3);
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut opts = ExtractOptions {
+            dest_dir: out.clone(),
+            job_id: "sp4".into(),
+            password: None,
+            cancel: Some(cancel),
+            partial_suffix: String::new(),
+            name_map: std::collections::HashMap::new(),
+        };
+        opts.name_map.insert(0, "a.bin".to_string());
+        opts.name_map.insert(1, "big.bin".to_string());
+        opts.name_map.insert(2, "c.bin".to_string());
+        for u in &info.recovery_units {
+            let report = backend.extract_unit(u.seq, &opts, None).unwrap();
+            assert!(report.verified);
+        }
+        assert_eq!(std::fs::read(out.join("big.bin.sx-partial-sp4")).unwrap(), data);
+    }
+
+    /// Large archive: thousands of entries plus service subheaders must
+    /// cross-validate and extract. Regression for real-world archives.
+    #[test]
+    fn large_archive_cross_validates() {
+        let dir = tempfile::tempdir().unwrap();
+        let files: Vec<FixtureFile> = (0..3000)
+            .map(|i| {
+                let data: Vec<u8> = (0..2048).map(|b| ((b + i * 7) % 251) as u8).collect();
+                FixtureFile::new(&format!("file-{i}.bin"), &data)
+            })
+            .collect();
+        let opts = FixtureOptions {
+            service_headers: vec!["NTFS".into(), "ACL".into()],
+            ..Default::default()
+        };
+        let paths = write_rar(dir.path(), "big", &files, &opts).unwrap();
+        let mut backend = RarBackend::new(&paths[0]);
+        let info = backend.inspect(&OpenOptions::default()).unwrap();
+        assert_eq!(info.entries.len(), 3000);
+        assert_eq!(info.recovery_units.len(), 3000);
+        // Extract a handful of units across the archive to prove offsets are
+        // exact despite the service headers.
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut name_map = std::collections::HashMap::new();
+        for i in 0..3000u64 {
+            name_map.insert(i, format!("file-{i}.bin"));
+        }
+        let opts = ExtractOptions {
+            dest_dir: out.clone(),
+            job_id: "big".into(),
+            password: None,
+            cancel: Some(cancel),
+            partial_suffix: String::new(),
+            name_map,
+        };
+        for seq in [0u64, 500, 1499, 2500, 2999] {
+            let report = backend.extract_unit(seq, &opts, None).unwrap();
+            assert!(report.verified);
+        }
+        let expect: Vec<u8> = (0..2048).map(|b| ((b + 2999 * 7) % 251) as u8).collect();
+        assert_eq!(std::fs::read(out.join("file-2999.bin.sx-partial-big")).unwrap(), expect);
     }
 }
 

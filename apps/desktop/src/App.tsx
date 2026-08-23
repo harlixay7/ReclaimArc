@@ -62,6 +62,27 @@ const emptyProgress = (): ProgressState => ({
   error: null,
 });
 
+/// O(1) recovery-unit lookup for the file table. For archives with tens of
+/// thousands of entries a per-row linear search would freeze the UI.
+function unitForIndex(analysis: AnalyzeResult, index: number): number | null {
+  const units = analysis.info.recovery_units;
+  // Binary search over units (sorted by seq/first_entry).
+  let lo = 0;
+  let hi = units.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const u = units[mid]!;
+    if (index < u.first_entry) {
+      hi = mid - 1;
+    } else if (index > u.last_entry) {
+      lo = mid + 1;
+    } else {
+      return u.seq;
+    }
+  }
+  return null;
+}
+
 export default function App() {
   const [view, setView] = useState<View>("home");
   const [archive, setArchive] = useState("");
@@ -330,18 +351,16 @@ const [showExtractChoice, setShowExtractChoice] = useState(false);
                         <th>Status</th>
                       </tr>
                     </thead>
-                    <tbody>
+<tbody>
                       {analysis.info.entries.map((e) => {
-                        const unit = analysis.info.recovery_units.find(
-                          (u) => e.index >= u.first_entry && e.index <= u.last_entry,
-                        );
+                        const unit = unitForIndex(analysis, e.index);
                         return (
                           <tr key={e.index}>
                             <td>{e.name}</td>
                             <td className="num">{formatBytes(e.packed_size)}</td>
                             <td className="num">{formatBytes(e.unpacked_size)}</td>
                             <td className="num">{ratio(e.packed_size, e.unpacked_size)}</td>
-                            <td className="num">{unit?.seq ?? "—"}</td>
+                            <td className="num">{unit ?? "—"}</td>
                             <td>
                               {e.is_directory ? (
                                 <span className="status pending">dir</span>

@@ -37,9 +37,9 @@ const LHD_SPLIT_BEFORE: u16 = 0x0001;
 const LHD_SPLIT_AFTER: u16 = 0x0002;
 const LHD_PASSWORD: u16 = 0x0004;
 const LHD_SOLID: u16 = 0x0010;
-const LHD_UNICODE: u16 = 0x0100;
+const LHD_LARGE: u16 = 0x0100;
+const LHD_UNICODE: u16 = 0x0200;
 const LHD_DIRECTORY: u16 = 0x00e0;
-const LHD_LARGE: u16 = 0x8000;
 
 // RAR4 end-archive flags.
 const EARC_NEXT_VOLUME: u16 = 0x0001;
@@ -197,8 +197,9 @@ let first = &volumes[0];
         packed_size: 0,
     };
 
-    // Pending split entry: (entry index, remaining packed bytes to place).
-    let mut pending_split: Option<(usize, u64)> = None;
+// Entry index of the most recent split-after part; continuations attach
+    // to it (per-part conventions: each part's header sizes itself).
+    let mut last_split_after_entry: Option<usize> = None;
 
 for (vol_index, vol) in volumes.iter().enumerate() {
         let mut r = Reader::open(&vol.path)?;
@@ -237,10 +238,18 @@ for (vol_index, vol) in volumes.iter().enumerate() {
             }
         }
 
-        // Parse file records until end-archive header or volume end.
+// Parse file records until end-archive header or volume end.
         loop {
             if pos >= vol_len {
-                break; // volume ends mid-data of a split file; continue next volume
+                // Volume ends mid-data of a split file: the continuation
+                // lives in the next volume.
+                if last_split_after_entry.is_some() && vol_index + 1 >= volumes.len() {
+                    return Err(ArchiveError::missing_volume(format!(
+                        "volume {} ends in the middle of a split file; the next volume is missing",
+                        vol.path.display()
+                    )));
+                }
+                break;
             }
             let hdr = read_header(&mut r, format, pos)?;
             match hdr.kind {
@@ -255,19 +264,24 @@ for (vol_index, vol) in volumes.iter().enumerate() {
                     split_after,
                     encrypted,
                     redirection,
-                } => {
+} => {
                     let header_end = hdr.end;
 
-                    let (entry_index, remaining_pack): (usize, u64) = if split_before {
-                        match pending_split.take() {
-                            Some((idx, rem)) => (idx, rem),
-                            None => {
-                                return Err(ArchiveError::invalid(format!(
-                                    "split-before file '{}' without a preceding split-after file",
-                                    name
-                                )))
-                            }
-                        }
+                    // Per-part conventions: each part's header carries the
+                    // size of the data in ITS volume (the DLL reads exactly
+                    // that many bytes before merging to the next volume).
+                    // A split-after part's data runs to the trailing
+                    // end-archive header; continuations attach to the entry
+                    // that most recently had a split-after part and add their
+                    // own size.
+                    let (entry_index, portion) = if split_before {
+                        let idx = last_split_after_entry.ok_or_else(|| {
+                            ArchiveError::invalid(format!(
+                                "split-before file '{}' without a preceding split-after file",
+                                name
+                            ))
+                        })?;
+                        (idx, packed_size)
                     } else {
                         let idx = parsed.entries.len();
                         parsed.entries.push(Entry {
@@ -284,16 +298,16 @@ for (vol_index, vol) in volumes.iter().enumerate() {
                             redirection,
                         });
                         parsed.unpacked_size = parsed.unpacked_size.saturating_add(unpacked_size);
-                        (idx, packed_size)
-                    };
-
-                    // Data portion in this volume.
-                    let portion = if split_after {
-                        vol_len.saturating_sub(header_end)
-                    } else {
-                        remaining_pack
+                        let portion = if split_after {
+                            let data_end = split_data_end(&mut r, format, vol_len)?;
+                            data_end.saturating_sub(header_end)
+                        } else {
+                            packed_size
+                        };
+                        (idx, portion)
                     };
                     let portion = portion.min(vol_len.saturating_sub(header_end));
+
                     if portion > 0 {
                         if parsed.parts.len() <= entry_index {
                             parsed.parts.resize(entry_index + 1, Vec::new());
@@ -304,17 +318,21 @@ for (vol_index, vol) in volumes.iter().enumerate() {
                             data_len: portion,
                         });
                         parsed.packed_size = parsed.packed_size.saturating_add(portion);
-                        // Update the logical entry's split flags.
+                        // Update the logical entry's split flags and, for
+                        // continuations, accumulate the part size so the
+                        // entry's packed_size reflects the whole file.
                         let e = &mut parsed.entries[entry_index];
                         e.split_before = e.split_before || split_before;
                         e.split_after = e.split_after || split_after;
+                        if split_before {
+                            e.packed_size = e.packed_size.saturating_add(portion);
+                        }
                     }
 
-                    let new_remaining = remaining_pack.saturating_sub(portion);
-                    if split_after && new_remaining > 0 {
-                        pending_split = Some((entry_index, new_remaining));
+                    if split_after {
+                        last_split_after_entry = Some(entry_index);
                     } else {
-                        pending_split = None;
+                        last_split_after_entry = None;
                     }
                     pos = header_end.saturating_add(portion);
                 }
@@ -334,14 +352,13 @@ for (vol_index, vol) in volumes.iter().enumerate() {
         }
     }
 
-    if let Some((idx, remaining)) = pending_split {
-        if remaining > 0 {
-            return Err(ArchiveError::invalid(format!(
-                "archive ended in the middle of split file {} ({} bytes unaccounted)",
-                parsed.entries.get(idx).map(|e| e.name.as_str()).unwrap_or("?"),
-                remaining
-            )));
-        }
+if let Some(idx) = last_split_after_entry {
+        // The chain ended without its final part: the last volume ended
+        // mid-file.
+        return Err(ArchiveError::invalid(format!(
+            "archive ended in the middle of split file {}",
+            parsed.entries[idx].name
+        )));
     }
 
     Ok(parsed)
@@ -522,7 +539,7 @@ fn read_header4(r: &mut Reader, pos: u64) -> Result<HeaderInfo, ArchiveError> {
 fn read_header5(r: &mut Reader, pos: u64) -> Result<HeaderInfo, ArchiveError> {
     let _crc32 = r.u32_le_at(pos)?;
     // Header size varint occupies 1..=3 bytes.
-    let mut size_bytes = 1u64;
+let mut size_bytes = 1u64;
     let mut b0 = r.u8_at(pos + 4)?;
     let mut header_size: u64 = (b0 & 0x7f) as u64;
     while b0 & 0x80 != 0 {
@@ -766,6 +783,72 @@ fn scan_extras(body: &[u8], start: usize, len: usize) -> Result<(Option<Redirect
         pos = extra_start + extra_size as usize;
     }
     Ok((redirection, encrypted))
+}
+
+/// Locate the start of the trailing end-archive header in a volume.
+///
+/// Every WinRAR volume ends with an end-archive header (next-volume flag
+/// set, except the last). A split-after file's data runs up to that header.
+/// We scan backward for a header that parses as ENDARC, ends exactly at the
+/// volume end and has a matching checksum — a data byte sequence could
+/// otherwise be mistaken for a header.
+fn split_data_end(r: &mut Reader, format: RarFormat, vol_len: u64) -> Result<u64, ArchiveError> {
+    let max_len = if format == RarFormat::Rar5 { 32 } else { 16 };
+    let min_len = if format == RarFormat::Rar5 { 8 } else { 7 };
+    if vol_len < min_len {
+        return Ok(vol_len);
+    }
+    let lo = vol_len.saturating_sub(max_len);
+    let mut pos = vol_len - min_len;
+    loop {
+        if pos < lo {
+            break;
+        }
+        match read_header(r, format, pos) {
+            Ok(h) if matches!(h.kind, HeaderKind::EndArc) && h.end == vol_len => {
+                if endarc_crc_matches(r, format, pos, h.end)? {
+                    return Ok(pos);
+                }
+            }
+            _ => {}
+        }
+        if pos == lo {
+            break;
+        }
+        pos -= 1;
+    }
+    // No end-archive header found: the data extends to the end of the volume.
+    Ok(vol_len)
+}
+
+/// Verify the stored checksum of a header block at `pos..end`.
+fn endarc_crc_matches(r: &mut Reader, format: RarFormat, pos: u64, end: u64) -> Result<bool, ArchiveError> {
+    let len = (end - pos) as usize;
+    let mut buf = vec![0u8; len];
+    r.read_exact_at(pos, &mut buf)?;
+    match format {
+        RarFormat::Rar5 => {
+            let stored = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+            Ok(crc32(&buf[4..]) == stored)
+        }
+        RarFormat::Rar4 => {
+            let stored = u16::from_le_bytes([buf[0], buf[1]]);
+            Ok((crc32(&buf[2..]) & 0xffff) as u16 == stored)
+        }
+    }
+}
+
+/// CRC32 (zip/PNG polynomial) as used by RAR.
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+        }
+    }
+    crc ^ 0xffff_ffff
 }
 
 fn read_bytes(r: &mut Reader, offset: u64, len: u64) -> Result<Vec<u8>, ArchiveError> {

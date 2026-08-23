@@ -291,7 +291,7 @@ impl JobJournal {
             .ok_or_else(|| JournalError::missing(format!("recovery unit {seq}")))
     }
 
-    /// Transition a unit to a new state, recording the transition in the same
+/// Transition a unit to a new state, recording the transition in the same
     /// durable transaction.
     pub fn set_unit_state(&mut self, seq: u64, state: UnitState) -> Result<()> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -435,7 +435,24 @@ impl JobJournal {
         Ok(())
     }
 
-/// Record partial/final paths for an entry (set before extraction).
+/// Batch-update partial paths for many entries in one durable
+    /// transaction (used by the streaming extraction path).
+    pub fn set_partial_paths_batch(&mut self, updates: &[(u64, String)]) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        {
+            let mut stmt = tx.prepare_cached("UPDATE entries SET partial_path = ?1 WHERE index_in_archive = ?2")?;
+            for (index, partial) in updates {
+                stmt.execute(params![partial, *index as i64])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Record partial/final paths for an entry (set before extraction).
     /// Only the provided (non-None) columns are updated.
     pub fn set_entry_paths(&mut self, index: u64, partial: Option<&Path>, final_path: Option<&Path>) -> Result<()> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -464,12 +481,53 @@ impl JobJournal {
         Ok(())
     }
 
-    /// Mark an entry durably renamed into place and committed (durable).
+/// Mark an entry durably renamed into place and committed (durable).
     pub fn set_entry_committed(&mut self, index: u64, final_path: &Path, blake3: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE entries SET final_path = ?1, blake3 = ?2, status = 'COMMITTED' WHERE index_in_archive = ?3",
             params![final_path.to_string_lossy().into_owned(), blake3, index as i64],
         )?;
+        Ok(())
+    }
+
+    /// One durable transaction covering a unit's verify→durable pipeline:
+    /// OUTPUT_WRITTEN, entry VERIFIED, OUTPUT_VERIFIED, entry DURABLE and
+    /// OUTPUT_DURABLE. The intermediate states are still journaled (in the
+    /// same transaction) so crash recovery behaves identically, but the unit
+    /// pays a single WAL fsync instead of five.
+    pub fn mark_unit_verified_durable(
+        &mut self,
+        seq: u64,
+        verified: &[(u64, String)],
+    ) -> Result<()> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        {
+            tx.execute(
+                "UPDATE recovery_units SET state = 'OUTPUT_WRITTEN', updated_at = ?1 WHERE seq = ?2",
+                params![crate::now_iso(), seq as i64],
+            )?;
+            let mut v = tx.prepare_cached(
+                "UPDATE entries SET blake3 = ?1, status = 'VERIFIED' WHERE index_in_archive = ?2",
+            )?;
+            for (index, blake3) in verified {
+                v.execute(params![blake3, *index as i64])?;
+            }
+            tx.execute(
+                "UPDATE recovery_units SET state = 'OUTPUT_VERIFIED', updated_at = ?1 WHERE seq = ?2",
+                params![crate::now_iso(), seq as i64],
+            )?;
+            let mut d = tx.prepare_cached(
+                "UPDATE entries SET status = 'DURABLE' WHERE index_in_archive = ?1",
+            )?;
+            for (index, _) in verified {
+                d.execute(params![*index as i64])?;
+            }
+            tx.execute(
+                "UPDATE recovery_units SET state = 'OUTPUT_DURABLE', updated_at = ?1 WHERE seq = ?2",
+                params![crate::now_iso(), seq as i64],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -821,5 +879,7 @@ mod tests {
         assert_eq!(transitions[6].to_state, "RECLAIMED");
     }
 }
+
+
 
 
