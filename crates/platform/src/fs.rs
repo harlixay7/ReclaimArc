@@ -54,7 +54,7 @@ pub fn open_for_identity(path: &Path) -> Result<std::fs::File, PlatformError> {
     }
 }
 /// Identity of a file. Fails precisely when the file cannot be opened or when
-/// the identity cannot be read â€” the caller must never guess.
+/// the identity cannot be read — the caller must never guess.
 pub fn file_identity(path: &Path) -> Result<FileIdentity, PlatformError> {
     let file = open_for_identity(path)?;
     file_identity_from_handle(&file, path)

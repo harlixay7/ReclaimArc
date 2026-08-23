@@ -24,5 +24,5 @@ if errorlevel 1 ( echo build failed & exit /b 1 )
 popd
 
 echo Launching SpaceExtract...
-start "" "target\release\SpaceExtract.exe"
+start "" "target\release\spacextract-desktop.exe"
 endlocal

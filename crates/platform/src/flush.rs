@@ -1,4 +1,4 @@
-﻿//! Durable flushes. The engine treats a failed flush as a failed job â€” never
+﻿//! Durable flushes. The engine treats a failed flush as a failed job — never
 //! silently continued.
 
 use std::os::windows::io::{AsRawHandle, FromRawHandle};

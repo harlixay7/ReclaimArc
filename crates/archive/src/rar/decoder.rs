@@ -8,7 +8,7 @@
 //! Safety model:
 //! - The library is driven strictly sequentially from the first volume.
 //! - Entries before the current unit are processed with `RAR_SKIP`, which the
-//!   library implements as a seek in non-solid archives â€” it never reads
+//!   library implements as a seek in non-solid archives — it never reads
 //!   reclaimed (zeroed) data.
 //! - Callbacks run on the same thread as the caller; the context is a
 //!   `Box<CallbackCtx>` leaked to C and freed on close.
@@ -228,7 +228,7 @@ impl Unrar {
     /// `dest_path` / `dest_name`: wide strings; pass `None` to let the library
     /// use its defaults. `dest_name` replaces the output path entirely and
     /// disables the library's own path processing (the caller guarantees the
-    /// path is safe â€” this is the documented contract of the DLL).
+    /// path is safe — this is the documented contract of the DLL).
     pub fn process_file<'p, 'c>(
         &mut self,
         operation: Operation,

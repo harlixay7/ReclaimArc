@@ -270,7 +270,7 @@ pub fn prepare_resume(
         }
     }
 
-    // 5. Fingerprint sanity (only advisory â€” identity already validated).
+    // 5. Fingerprint sanity (only advisory — identity already validated).
     let _ = archive_fingerprint;
 
     // 6. Job state back to ACTIVE.

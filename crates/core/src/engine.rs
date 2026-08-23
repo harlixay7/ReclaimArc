@@ -384,7 +384,7 @@ let settings_json = {
         if !collisions.is_empty() {
             let (a, b) = collisions[0];
             return Err(CoreError::Precondition(format!(
-                "archive contains case-insensitive filename collisions: '{}' and '{}' â€” Windows would overwrite one with the other.",
+                "archive contains case-insensitive filename collisions: '{}' and '{}' — Windows would overwrite one with the other.",
                 safe_entries[a].original, safe_entries[b].original
             )));
         }
@@ -976,7 +976,7 @@ fn rename_into_place(
                     e.os,
                     "OUTPUT_DURABLE",
                     format!(
-                        "rename '{}' â†’ '{}' failed: {}",
+                        "rename '{}' → '{}' failed: {}",
                         partial.display(),
                         final_path.display(),
                         e.message

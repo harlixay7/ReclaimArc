@@ -124,7 +124,7 @@ fn child_driver() {
         std::process::exit(101);
     });
     let _ = outcome;
-    // The crash point must have fired â€” if we get here the fault never armed.
+    // The crash point must have fired — if we get here the fault never armed.
     eprintln!("CHILD: crash point {} never fired", point.as_str());
     std::process::exit(102);
 }
@@ -266,7 +266,7 @@ let allocated = spacextract_platform::sparse::query_allocated_ranges(
             total_alloc < logical,
             "source allocation must drop after reclamation: alloc {total_alloc} < logical {logical}"
         );
-        // Byte integrity: the remaining allocated bytes must still decode â€”
+        // Byte integrity: the remaining allocated bytes must still decode —
         // the final files were verified by the engine; additionally, the
         // journal must record the ranges as reclaimed.
         let ranges = journal.packed_ranges().unwrap();
@@ -389,7 +389,7 @@ fn path_traversal_is_rejected() {
     std::fs::create_dir_all(&archive_dir).unwrap();
     std::fs::create_dir_all(&dest).unwrap();
 
-    // Fixture with a traversal name â€” the fixture writer stores it verbatim.
+    // Fixture with a traversal name — the fixture writer stores it verbatim.
     let files = vec![FixtureFile::new("../evil.txt", b"boom")];
     let paths = write_rar(&archive_dir, "evil", &files, &FixtureOptions::default()).unwrap();
 
@@ -512,7 +512,7 @@ fn source_modification_is_detected() {
     let (handle, mut job) = engine
         .start_job(&paths[0], &dest, ExtractionMode::Normal, None, tx)
         .unwrap();
-    // Crash after the first unit (partial write point) â€” the source is still
+    // Crash after the first unit (partial write point) — the source is still
     // fully present afterwards.
     std::env::set_var("SPACEEXTRACT_FAULT_AT", "after-partial-write");
     let _ = engine.run_job(&mut job, &handle);

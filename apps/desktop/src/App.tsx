@@ -261,10 +261,10 @@ const [showExtractChoice, setShowExtractChoice] = useState(false);
     <>
       <div className="command-bar">
         <span className="title">SpaceExtract</span>
-        <button onClick={openArchive}>Open Archiveâ€¦</button>
-        <button onClick={openDestination}>Destinationâ€¦</button>
+        <button onClick={openArchive}>Open Archive…</button>
+        <button onClick={openDestination}>Destination…</button>
         <button className="primary" onClick={doAnalyze} disabled={!archive || analyzing}>
-          {analyzing ? "Analyzingâ€¦" : "Analyze"}
+          {analyzing ? "Analyzing…" : "Analyze"}
         </button>
         <div className="spacer" />
         <button onClick={() => setShowLogs(true)}>Logs</button>
@@ -284,7 +284,7 @@ const [showExtractChoice, setShowExtractChoice] = useState(false);
                 placeholder="Path to a .rar archive"
                 onChange={(e) => setArchive(e.target.value)}
               />
-              <button onClick={openArchive}>Browseâ€¦</button>
+              <button onClick={openArchive}>Browse…</button>
             </div>
             <div style={{ height: 8 }} />
             <div className="path-field">
@@ -294,7 +294,7 @@ const [showExtractChoice, setShowExtractChoice] = useState(false);
                 placeholder="Destination folder"
                 onChange={(e) => setDestination(e.target.value)}
               />
-              <button onClick={openDestination}>Browseâ€¦</button>
+              <button onClick={openDestination}>Browse…</button>
             </div>
             <div style={{ height: 8 }} />
             <input
@@ -311,12 +311,12 @@ const [showExtractChoice, setShowExtractChoice] = useState(false);
                 <h2>Archive summary</h2>
                 <div className="summary">
                   <span className="strong">{analysis.info.format.toUpperCase()}</span>
-                  {" Â· "}
-                  {formatBytes(analysis.info.packed_size)} packed Â·{" "}
-                  {formatBytes(analysis.info.unpacked_size)} unpacked Â·{" "}
+                  {" · "}
+                  {formatBytes(analysis.info.packed_size)} packed ·{" "}
+                  {formatBytes(analysis.info.unpacked_size)} unpacked ·{" "}
                   {analysis.info.solid_archive ? "Solid" : "Non-solid"}
-                  {analysis.info.encrypted_headers && " Â· Encrypted headers"}
-                  {analysis.info.volumes.length > 1 && ` Â· ${analysis.info.volumes.length} volumes`}
+                  {analysis.info.encrypted_headers && " · Encrypted headers"}
+                  {analysis.info.volumes.length > 1 && ` · ${analysis.info.volumes.length} volumes`}
                 </div>
                 <div style={{ maxHeight: 260, overflow: "auto" }}>
                   <table>
@@ -341,7 +341,7 @@ const [showExtractChoice, setShowExtractChoice] = useState(false);
                             <td className="num">{formatBytes(e.packed_size)}</td>
                             <td className="num">{formatBytes(e.unpacked_size)}</td>
                             <td className="num">{ratio(e.packed_size, e.unpacked_size)}</td>
-                            <td className="num">{unit?.seq ?? "â€”"}</td>
+                            <td className="num">{unit?.seq ?? "—"}</td>
                             <td>
                               {e.is_directory ? (
                                 <span className="status pending">dir</span>
@@ -388,8 +388,8 @@ const [showExtractChoice, setShowExtractChoice] = useState(false);
                 {analysis.plan.progressive_feasible ? (
                   <div className="verdict ok">
                     {analysis.plan.normal_feasible
-                      ? "Normal extraction: POSSIBLE Â· Progressive extraction: POSSIBLE"
-                      : "Normal extraction: IMPOSSIBLE Â· Progressive extraction: POSSIBLE"}
+                      ? "Normal extraction: POSSIBLE · Progressive extraction: POSSIBLE"
+                      : "Normal extraction: IMPOSSIBLE · Progressive extraction: POSSIBLE"}
                   </div>
                 ) : (
                   <div className="verdict bad">
@@ -631,12 +631,12 @@ function ProgressView({
         <div className="summary">
           Job <span className="strong">{progress.jobId.slice(0, 8)}</span>
           {progress.currentUnit !== null && (
-            <> Â· Recovery unit <span className="strong">{progress.currentUnit}</span></>
+            <> · Recovery unit <span className="strong">{progress.currentUnit}</span></>
           )}
         </div>
         {progress.preTest ? (
           <>
-            <div className="summary">Testing archive integrityâ€¦</div>
+            <div className="summary">Testing archive integrity…</div>
             <div className="progress-track">
               <div
                 className="progress-fill"
@@ -649,7 +649,7 @@ function ProgressView({
         ) : (
           <>
             <div className="summary">
-              {progress.currentEntry || "Preparingâ€¦"}
+              {progress.currentEntry || "Preparing…"}
               {progress.entryTotal > 0 &&
                 ` (${formatBytes(progress.entryCurrent)} / ${formatBytes(progress.entryTotal)})`}
             </div>
@@ -665,7 +665,7 @@ function ProgressView({
               <span className="value">{formatBytes(progress.reclaimedBytes)}</span>
               <span className="label">Current free space</span>
               <span className="value">
-                {progress.freeSpace !== null ? formatBytes(progress.freeSpace) : "â€”"}
+                {progress.freeSpace !== null ? formatBytes(progress.freeSpace) : "—"}
               </span>
             </div>
           </>

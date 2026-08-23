@@ -2,7 +2,7 @@
 //!
 //! Computes the things the engine needs that the decoder library does not
 //! expose: exact packed data ranges per volume, solid chains, and the
-//! recovery-unit structure. This is format *structure* parsing â€” it never
+//! recovery-unit structure. This is format *structure* parsing — it never
 //! attempts to decompress anything. Compression is handled exclusively by the
 //! official UnRAR library behind the decoder boundary.
 //!
@@ -462,8 +462,15 @@ fn read_header4(r: &mut Reader, pos: u64) -> Result<HeaderInfo, ArchiveError> {
                 None
             };
 
-            Ok(HeaderInfo {
-                kind: HeaderKind::File {
+// Service subheaders (0x7A: NTFS streams, ACLs, comments) share
+            // the file-record layout but are NOT archive entries. The decoder
+            // skips them (SearchBlock(HEAD_FILE)); we must too, while still
+            // skipping their packed data so positions stay exact.
+            let is_service = htype == HEAD3_SERVICE;
+            let kind = if is_service {
+                HeaderKind::Other
+            } else {
+                HeaderKind::File {
                     name,
                     packed_size,
                     unpacked_size,
@@ -474,8 +481,12 @@ fn read_header4(r: &mut Reader, pos: u64) -> Result<HeaderInfo, ArchiveError> {
                     split_after,
                     encrypted,
                     redirection,
-                },
-                end: pos + full_size,
+                }
+            };
+            let end = pos + full_size + if is_service { packed_size } else { 0 };
+            Ok(HeaderInfo {
+                kind,
+                end,
                 solid: false,
                 encrypted_headers: false,
                 next_volume: false,
@@ -602,8 +613,15 @@ fn read_header5(r: &mut Reader, pos: u64) -> Result<HeaderInfo, ArchiveError> {
                 (None, false)
             };
 
-            Ok(HeaderInfo {
-                kind: HeaderKind::File {
+// RAR5 service subheaders (type 3: NTFS streams, ACLs, comments) share
+            // the record layout but are NOT archive entries — the decoder
+            // skips them, so we skip them too while advancing over their
+            // packed data so positions stay exact.
+            let is_service = htype == HEAD5_SERVICE;
+            let kind = if is_service {
+                HeaderKind::Other
+            } else {
+                HeaderKind::File {
                     name,
                     packed_size: data_size,
                     unpacked_size,
@@ -614,8 +632,12 @@ fn read_header5(r: &mut Reader, pos: u64) -> Result<HeaderInfo, ArchiveError> {
                     split_after,
                     encrypted: file_encrypted,
                     redirection,
-                },
-                end: pos + header_total,
+                }
+            };
+            let end = pos + header_total + if is_service { data_size } else { 0 };
+            Ok(HeaderInfo {
+                kind,
+                end,
                 solid: false,
                 encrypted_headers: false,
                 next_volume: false,

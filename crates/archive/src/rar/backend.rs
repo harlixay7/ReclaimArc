@@ -581,9 +581,94 @@ mod tests {
             let report = backend.extract_unit(u.seq, &opts, None).unwrap();
             assert_eq!(report.verified, true);
         }
-        assert_eq!(std::fs::read(out.join("a.bin.sx-partial-mv")).unwrap(), vec![0x11; 4000]);
+assert_eq!(std::fs::read(out.join("a.bin.sx-partial-mv")).unwrap(), vec![0x11; 4000]);
         assert_eq!(std::fs::read(out.join("b.bin.sx-partial-mv")).unwrap(), vec![0x22; 4000]);
         assert_eq!(std::fs::read(out.join("c.bin.sx-partial-mv")).unwrap(), vec![0x33; 4000]);
+    }
+
+    /// Real WinRAR archives contain service subheaders (NTFS streams, ACLs,
+    /// comments). They must NOT be counted as entries and must not disturb
+    /// packed-range positions. Regression for "decoder reported fewer
+    /// entries than the parser found" on real archives.
+    #[test]
+    fn service_headers_are_not_entries_rar5() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = vec![
+            FixtureFile::new("one.bin", &vec![0x11; 3000]),
+            FixtureFile::new("two.bin", &vec![0x22; 3000]),
+            FixtureFile::new("three.bin", &vec![0x33; 3000]),
+        ];
+        let opts = FixtureOptions {
+            service_headers: vec!["NTFS".into(), "ACL".into(), "CMT".into()],
+            ..Default::default()
+        };
+        let paths = write_rar(dir.path(), "svc", &files, &opts).unwrap();
+        let mut backend = RarBackend::new(&paths[0]);
+        // inspect() cross-validates parser vs decoder; it fails if counts
+        // disagree, so this single call covers the regression.
+        let info = backend.inspect(&OpenOptions::default()).unwrap();
+        assert_eq!(info.entries.len(), 3, "service headers must not be entries");
+        assert_eq!(info.recovery_units.len(), 3);
+
+        // Extraction of every unit must still produce byte-identical output.
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut opts = ExtractOptions {
+            dest_dir: out.clone(),
+            job_id: "svc".into(),
+            password: None,
+            cancel: Some(cancel),
+            partial_suffix: String::new(),
+            name_map: std::collections::HashMap::new(),
+        };
+        opts.name_map.insert(0, "one.bin".to_string());
+        opts.name_map.insert(1, "two.bin".to_string());
+        opts.name_map.insert(2, "three.bin".to_string());
+        for u in &info.recovery_units {
+            let report = backend.extract_unit(u.seq, &opts, None).unwrap();
+            assert!(report.verified);
+        }
+        assert_eq!(std::fs::read(out.join("one.bin.sx-partial-svc")).unwrap(), vec![0x11; 3000]);
+        assert_eq!(std::fs::read(out.join("two.bin.sx-partial-svc")).unwrap(), vec![0x22; 3000]);
+        assert_eq!(std::fs::read(out.join("three.bin.sx-partial-svc")).unwrap(), vec![0x33; 3000]);
+    }
+
+    #[test]
+    fn service_headers_are_not_entries_rar4() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = vec![
+            FixtureFile::new("one.bin", &vec![0x44; 3000]),
+            FixtureFile::new("two.bin", &vec![0x55; 3000]),
+        ];
+        let opts = FixtureOptions {
+            rar5: false,
+            service_headers: vec!["ACL".into()],
+            ..Default::default()
+        };
+        let paths = write_rar(dir.path(), "svc4", &files, &opts).unwrap();
+        let mut backend = RarBackend::new(&paths[0]);
+        let info = backend.inspect(&OpenOptions::default()).unwrap();
+        assert_eq!(info.entries.len(), 2);
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut opts = ExtractOptions {
+            dest_dir: out.clone(),
+            job_id: "svc4".into(),
+            password: None,
+            cancel: Some(cancel),
+            partial_suffix: String::new(),
+            name_map: std::collections::HashMap::new(),
+        };
+        opts.name_map.insert(0, "one.bin".to_string());
+        opts.name_map.insert(1, "two.bin".to_string());
+        for u in &info.recovery_units {
+            let report = backend.extract_unit(u.seq, &opts, None).unwrap();
+            assert!(report.verified);
+        }
+        assert_eq!(std::fs::read(out.join("one.bin.sx-partial-svc4")).unwrap(), vec![0x44; 3000]);
+        assert_eq!(std::fs::read(out.join("two.bin.sx-partial-svc4")).unwrap(), vec![0x55; 3000]);
     }
 }
 

@@ -4,7 +4,7 @@
 //! This exists so the test suite can construct exact, controlled corpora:
 //! non-solid archives, solid chains, multiple chains, split files, multipart
 //! volumes, Unicode names, zero-byte files and deliberately corrupted
-//! archives â€” with byte-exact knowledge of every packed range.
+//! archives — with byte-exact knowledge of every packed range.
 //!
 //! It does not implement any compression or encryption.
 
@@ -62,11 +62,14 @@ pub struct FixtureOptions {
     pub corrupt: Option<(u64, u8)>,
     /// Truncate the archive to this length (simulates an incomplete archive).
     pub truncate_to: Option<u64>,
-    /// Add a CRC32 field to RAR5 file headers (default true).
+/// Add a CRC32 field to RAR5 file headers (default true).
     pub include_crc32: bool,
     /// Split a single file's data across volumes even if it fits (tests the
     /// split-file path). The file must be larger than 0.
     pub force_split_file: Option<usize>,
+    /// Service subheader names emitted after every file (simulates real
+    /// WinRAR archives with NTFS streams/ACLs/comments).
+    pub service_headers: Vec<String>,
 }
 
 impl Default for FixtureOptions {
@@ -80,6 +83,7 @@ impl Default for FixtureOptions {
             truncate_to: None,
             include_crc32: true,
             force_split_file: None,
+            service_headers: Vec::new(),
         }
     }
 }
@@ -228,11 +232,12 @@ for f in files {
             put_varint(&mut fields, f.name.len() as u64);
             fields.extend_from_slice(f.name.as_bytes());
 
-            let block = rar5_header(fields, Some(f.data.len() as u64), false, false);
+let block = rar5_header(fields, Some(f.data.len() as u64), false, false);
             let data_start = stream.len() + block.bytes.len();
             stream.extend_from_slice(&block.bytes);
             stream.extend_from_slice(&f.data);
             offsets.push((data_start, data_start + f.data.len()));
+            emit_service_headers_r5(&mut stream, opts);
         }
 
         // End of archive.
@@ -306,10 +311,11 @@ fields.extend_from_slice(f.name.as_bytes());
             let mut hdr = Vec::new();
             put_u16(&mut hdr, crc16(&hdr_body));
             hdr.extend_from_slice(&hdr_body);
-            let data_start = stream.len() + hdr.len();
+let data_start = stream.len() + hdr.len();
             stream.extend_from_slice(&hdr);
             stream.extend_from_slice(&f.data);
             offsets.push((data_start, data_start + f.data.len()));
+            emit_service_headers_r4(&mut stream, opts);
         }
 
         // End of archive (0x7B).
@@ -406,6 +412,64 @@ if stream.len() as u64 <= volume_size {
     Ok(paths)
 }
 
+/// Emit RAR5 service subheaders (type 3) after a file, cycling through the
+/// configured names. They carry a small dummy payload.
+fn emit_service_headers_r5(stream: &mut Vec<u8>, opts: &FixtureOptions) {
+    for (n, name) in opts.service_headers.iter().enumerate() {
+        let payload = vec![0x5A; 8 + n as usize % 4];
+        let mut fields = Vec::new();
+        put_varint(&mut fields, 0u64); // file flags
+        put_varint(&mut fields, 0u64); // unp size
+        put_varint(&mut fields, 0x20u64); // attr
+        put_varint(&mut fields, 0u64); // comp info
+        put_varint(&mut fields, 0u64); // host os
+        put_varint(&mut fields, name.len() as u64);
+        fields.extend_from_slice(name.as_bytes());
+        let mut head = Vec::new();
+        head.push(3u8); // HEAD_SERVICE
+        put_varint(&mut head, 0x0002u64); // HFL_DATA
+        put_varint(&mut head, payload.len() as u64);
+        head.extend_from_slice(&fields);
+        let block_size = head.len() as u64;
+        let mut block = Vec::new();
+        put_varint(&mut block, block_size);
+        block.extend_from_slice(&head);
+        let mut hdr = Vec::new();
+        put_u32(&mut hdr, crc32(&block));
+        hdr.extend_from_slice(&block);
+        stream.extend_from_slice(&hdr);
+        stream.extend_from_slice(&payload);
+    }
+}
+
+/// Emit RAR4 service subheaders (0x7A) after a file, cycling through the
+/// configured names. They carry a small dummy payload.
+fn emit_service_headers_r4(stream: &mut Vec<u8>, opts: &FixtureOptions) {
+    for (n, name) in opts.service_headers.iter().enumerate() {
+        let payload = vec![0xA5; 8 + n as usize % 4];
+        let mut fields = Vec::new();
+        put_u16(&mut fields, 0x0000); // flags
+        put_u16(&mut fields, (7 + 25 + name.len()) as u16); // head size
+        put_u32(&mut fields, payload.len() as u32); // pack size
+        put_u32(&mut fields, payload.len() as u32); // unp size
+        fields.push(2u8); // HOST_WIN32
+        put_u32(&mut fields, 0); // crc
+        put_u32(&mut fields, 0); // ftime
+        fields.push(29u8); // unp ver
+        fields.push(0x30u8); // method: stored
+        put_u16(&mut fields, name.len() as u16); // name size
+        put_u32(&mut fields, 0x20u32); // attr
+        fields.extend_from_slice(name.as_bytes());
+        let mut hdr_body = vec![0x7Au8]; // HEAD_SERVICE
+        hdr_body.extend_from_slice(&fields);
+        let mut hdr = Vec::new();
+        put_u16(&mut hdr, crc16(&hdr_body));
+        hdr.extend_from_slice(&hdr_body);
+        stream.extend_from_slice(&hdr);
+        stream.extend_from_slice(&payload);
+    }
+}
+
 /// End-archive header with the next-volume flag set.
 fn endarc_with_next_volume(opts: &FixtureOptions) -> Vec<u8> {
     if opts.rar5 {
@@ -488,7 +552,7 @@ mod tests {
 
     #[test]
     fn crc32_known_vector() {
-        // "123456789" â†’ 0xCBF43926.
+        // "123456789" → 0xCBF43926.
         assert_eq!(crc32(b"123456789"), 0xCBF43926);
     }
 

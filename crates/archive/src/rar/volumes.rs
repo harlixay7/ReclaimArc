@@ -124,7 +124,7 @@ let entries = std::fs::read_dir(&dir).map_err(|e| {
     let first_num = parts[0].0;
     if first_num != expected_first {
         return Err(ArchiveError::open(format!(
-            "volume set for '{}' starts at part {first_num} (expected {expected_first}) â€” is the first volume missing?",
+            "volume set for '{}' starts at part {first_num} (expected {expected_first}) — is the first volume missing?",
             given.display()
         )));
     }

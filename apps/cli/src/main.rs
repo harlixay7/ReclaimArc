@@ -52,7 +52,7 @@ fn main() {
 
 fn print_help() {
     println!(
-        "SpaceExtract â€” low-space archive extraction\n\
+        "SpaceExtract — low-space archive extraction\n\
          \n\
          USAGE:\n\
          \x20 spacextract <command> [options]\n\
@@ -116,7 +116,7 @@ fn cmd_inspect(args: &[String]) -> Result<(), String> {
 
     println!("Archive: {}", archive.display());
     println!(
-        "{} Â· {} packed Â· {} unpacked Â· {}",
+        "{} · {} packed · {} unpacked · {}",
         info.format.to_uppercase(),
         format_bytes(info.packed_size),
         format_bytes(info.unpacked_size),
@@ -143,7 +143,7 @@ fn cmd_inspect(args: &[String]) -> Result<(), String> {
             .map(|u| u.seq.to_string())
             .unwrap_or_else(|| "-".into());
         let name = if e.name.len() > 40 {
-            format!("{}â€¦", &e.name[..39])
+            format!("{}…", &e.name[..39])
         } else {
             e.name.clone()
         };
@@ -267,7 +267,7 @@ fn cmd_extract(args: &[String]) -> Result<(), String> {
                     println!("\rintegrity test: {}", if ok { "OK" } else { "FAILED" });
                 }
                 Event::UnitStarted { seq, .. } => {
-                    println!("[unit {seq}] extractingâ€¦");
+                    println!("[unit {seq}] extracting…");
                 }
                 Event::EntryProgress { index, current, total } => {
                     if total > 0 {
@@ -304,7 +304,7 @@ Event::RangeReclaimed { volume_index, bytes } => {
                     eprintln!("recommended: {recommended_action}");
                 }
                 Event::LowSpace { free, reserve } => {
-                    println!("warning: free space {} below comfortable reserve {} â€” pausing soon", format_bytes(free), format_bytes(reserve));
+                    println!("warning: free space {} below comfortable reserve {} — pausing soon", format_bytes(free), format_bytes(reserve));
                 }
                 _ => {}
             }
@@ -314,7 +314,7 @@ Event::RangeReclaimed { volume_index, bytes } => {
     // Allow Ctrl+C to pause safely.
     let pause_flag = handle_ui.pause.clone();
     ctrlc::set_handler(move || {
-        eprintln!("\nSIGINT: pausing safely after the current unitâ€¦");
+        eprintln!("\nSIGINT: pausing safely after the current unit…");
         pause_flag.store(true, Ordering::SeqCst);
     })
     .map_err(|e| format!("cannot install Ctrl+C handler: {e}"))?;
@@ -325,9 +325,9 @@ Event::RangeReclaimed { volume_index, bytes } => {
     ui_thread.join().map_err(|_| "ui thread panicked")?;
     match outcome {
         JobOutcome::Completed { .. } => Ok(()),
-        JobOutcome::Paused => Err("paused â€” run `spacextract resume <archive>` to continue".into()),
-        JobOutcome::Cancelled => Err("cancelled â€” run `spacextract resume <archive>` to continue".into()),
-        JobOutcome::Failed { failure } => Err(format!("{} â€” {}", failure.message, failure.recommended_action)),
+        JobOutcome::Paused => Err("paused — run `spacextract resume <archive>` to continue".into()),
+        JobOutcome::Cancelled => Err("cancelled — run `spacextract resume <archive>` to continue".into()),
+        JobOutcome::Failed { failure } => Err(format!("{} — {}", failure.message, failure.recommended_action)),
     }
 }
 
@@ -355,12 +355,12 @@ fn cmd_resume(args: &[String]) -> Result<(), String> {
     let (tx, rx) = mpsc::channel();
     let mut engine = Engine::new(EngineConfig::default());
     let (handle, mut job) = engine.resume_job(&journal_path, tx).map_err(|e| e.to_string())?;
-    println!("resuming job {} â†’ {}", job.job_id, job.destination.display());
+    println!("resuming job {} → {}", job.job_id, job.destination.display());
     let handle_ui = handle.clone();
     let ui_thread = std::thread::spawn(move || {
         while let Ok(event) = rx.recv() {
             match event {
-                Event::UnitStarted { seq, .. } => println!("[unit {seq}] extractingâ€¦"),
+                Event::UnitStarted { seq, .. } => println!("[unit {seq}] extracting…"),
                 Event::UnitCommitted { seq, bytes } => println!("[unit {seq}] committed ({})", format_bytes(bytes)),
                 Event::UnitReclaimed { seq, bytes } => println!("[unit {seq}] source reclaimed ({})", format_bytes(bytes)),
                 Event::EntryCommitted { index, path } => println!("  entry {index}: {}", path.display()),
@@ -386,9 +386,9 @@ fn cmd_resume(args: &[String]) -> Result<(), String> {
     ui_thread.join().map_err(|_| "ui thread panicked")?;
     match outcome {
         JobOutcome::Completed { .. } => Ok(()),
-        JobOutcome::Paused => Err("paused again â€” run `spacextract resume <archive>` to continue".into()),
-        JobOutcome::Cancelled => Err("cancelled â€” run `spacextract resume <archive>` to continue".into()),
-        JobOutcome::Failed { failure } => Err(format!("{} â€” {}", failure.message, failure.recommended_action)),
+        JobOutcome::Paused => Err("paused again — run `spacextract resume <archive>` to continue".into()),
+        JobOutcome::Cancelled => Err("cancelled — run `spacextract resume <archive>` to continue".into()),
+        JobOutcome::Failed { failure } => Err(format!("{} — {}", failure.message, failure.recommended_action)),
     }
 }
 
