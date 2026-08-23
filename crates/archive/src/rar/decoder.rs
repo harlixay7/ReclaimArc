@@ -202,9 +202,9 @@ impl Unrar {
 
 /// Read the next file header. Returns `Ok(None)` at end of archive.
     pub fn read_header(&mut self) -> Result<Option<RawHeader>, ArchiveError> {
-        let mut h = HeaderDataEx::default();
+        let h = HeaderDataEx::default();
         let code = unsafe { RARReadHeaderEx(self.handle, &h) };
-                if code == ERAR_END_ARCHIVE {
+        if code == ERAR_END_ARCHIVE {
             return Ok(None);
         }
         if code != 0 {
