@@ -9,6 +9,7 @@ serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 blake3.workspace = true
+unrar_sys = "0.5.8"
 
 [dev-dependencies]
 tempfile.workspace = true
