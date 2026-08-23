@@ -67,7 +67,7 @@ cmd /k "target\release\reclaimarc.exe --help"
 exit /b 0
 
 :run_tests
-echo [*] Executing full workspace test suite [76 tests]...
+echo [*] Executing full workspace test suite...
 cargo test --workspace
 exit /b %errorlevel%
 
@@ -95,9 +95,9 @@ echo.
 echo ReclaimArc Launcher Commands:
 echo   run.bat          -- Launch the Desktop GUI Application [default]
 echo   run.bat --cli    -- Open the CLI interactive console
-echo   run.bat --test   -- Run the automated 76-test verification suite
+echo   run.bat --test   -- Run the automated verification test suite
 echo   run.bat --build  -- Build release binaries and installer packages
 echo   run.bat --setup  -- Run universal dependency bootstrap
-echo   run.bat --help   -- Display this help message
+echo   run.bat --help   -- Display this reference manual
 echo.
 exit /b 0

@@ -1,4 +1,4 @@
-﻿# ReclaimArc — Safety Model
+# ReclaimArc — Safety Model
 
 ReclaimArc converts disk allocation occupied by an archive into allocation
 occupied by verified extracted files. This document states exactly when the
@@ -9,15 +9,13 @@ engine is allowed to destroy source bytes — and when it is not.
 > SOURCE BYTES MAY ONLY BE RECLAIMED AFTER THE OUTPUT DEPENDING ON THEM IS:
 > 1. completely decoded,
 > 2. integrity-verified,
-> 3. flushed durably to disk,
+> 3. synchronized durably to disk,
 > 4. atomically committed,
 > 5. recorded in the durable recovery journal.
 >
-> If safety cannot be proven, DO NOT reclaim the source.
+> If safety cannot be proven for the next destructive operation, ReclaimArc stops before reclaiming any additional source data. The current uncommitted unit remains recoverable; previously reclaimed source ranges are irreversible.
 
-The engine never infers reclaimability from the decoder's file pointer. Every
-retirement is justified by an explicit `RetirementProof` produced by the
-archive backend from format-level knowledge:
+The engine never infers reclaimability from the decoder's file pointer. Every retirement is governed by explicit recovery unit structure and packed range accounting constructed from archive metadata and format rules:
 
 - a **non-solid** RAR file is independently decodable → its packed data range
   is one restartable unit;
@@ -38,15 +36,15 @@ PENDING → EXTRACTING → OUTPUT_WRITTEN → OUTPUT_VERIFIED → OUTPUT_DURABLE
 Every transition is written to the SQLite journal (`synchronous=FULL`, WAL)
 *before* the corresponding filesystem action:
 
-| Transition | Journaled before | Filesystem action follows |
+| Transition | Journaled / Precondition | Filesystem action follows |
 |---|---|---|
 | EXTRACTING | unit marked extracting | decoder writes `<name>.sx-partial-<job>` |
-| OUTPUT_WRITTEN | unit marked written | BLAKE3 + size verification |
-| OUTPUT_VERIFIED | per-entry BLAKE3 stored | `FlushFileBuffers` on partials |
-| OUTPUT_DURABLE | unit marked durable | atomic rename to final name |
-| COMMITTED | per-entry commit + unit committed | directory flush |
-| RECLAIM_INTENT | per-range intent persisted | `FSCTL_SET_ZERO_DATA` |
-| RECLAIMED | measured allocation persisted | — |
+| OUTPUT_WRITTEN | unit marked written | BLAKE3 read-back + size verification |
+| OUTPUT_VERIFIED | per-entry BLAKE3 stored | `FlushFileBuffers` requests filesystem synchronization |
+| OUTPUT_DURABLE | unit marked durable | atomic rename to final destination path |
+| COMMITTED | per-entry commit + unit committed | periodic destination directory flush |
+| RECLAIM_INTENT | per-range intent persisted | `FSCTL_SET_ZERO_DATA` (physical hole punch) |
+| RECLAIMED | measured physical allocation persisted | — |
 
 ## Crash windows
 
@@ -56,9 +54,9 @@ A crash between **any** two operations is recovered by `prepare_resume`:
 - after rename, before commit: the final file is verified against its stored
   BLAKE3 and adopted, or discarded and re-extracted;
 - after commit, before reclaim: nothing to do — the unit is committed;
-- after RECLAIM_INTENT, before RECLAIMED: the engine inspects the actual
-  filesystem allocation, completes the punch, and records RECLAIMED;
-- after reclaim: allocation queries reconcile the journal.
+- after physical hole-punch, before journal update: `FSCTL_QUERY_ALLOCATED_RANGES`
+  queries the actual filesystem allocation and reconciles ranges to RECLAIMED/PARTIAL;
+- after RECLAIM_INTENT: the engine inspects actual allocation and completes pending punches.
 
 Rollback is never advertised after source data has been reclaimed.
 

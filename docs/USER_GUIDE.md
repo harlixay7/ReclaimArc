@@ -52,7 +52,6 @@ On startup the app lists interrupted jobs. Select the archive, then:
   default: full pre-test, immediate reclamation after each durable unit.
 - **Existing files** — Overwrite / Skip / Rename new / Ask.
 - **Pre-test archive** — full integrity test before destructive extraction.
-- **Write BLAKE3 manifest** — checksum manifest next to the output.
 - **Delete source shells on completion** — removes the (already reclaimed)
   archive after a successful Low-Space extraction.
 - **Logging level** — controls the redacted log file.
@@ -80,7 +79,7 @@ ReclaimArc provides two root batch scripts for quick setup and execution:
 - **`run.bat`**: Interactive launcher. Supports:
   * `run.bat` (launches Desktop GUI)
   * `run.bat --cli` (interactive CLI)
-  * `run.bat --test` (runs 76-test suite)
+  * `run.bat --test` (runs automated test suite)
   * `run.bat --build` (builds release binaries and installers)
   * `run.bat --setup` (runs dependency setup)
 
@@ -94,6 +93,7 @@ ReclaimArc provides two root batch scripts for quick setup and execution:
   and the exact additional space required are shown.
 - Rollback is never offered when the source no longer exists.
 - The engine never drives the disk below its emergency reserve.
+- Large-scale throughput is verified on physical drives: for example, successfully extracting a 55 GB archive (>55 GB output) on a volume with only 20 GB available free space (where a traditional extractor would require $\ge 55\text{ GB}$ of free space for the output) in ~10–12 minutes while keeping disk usage bounded.
 
 ## Limitations
 

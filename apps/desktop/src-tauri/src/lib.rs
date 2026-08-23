@@ -1,14 +1,12 @@
-﻿//! ReclaimArc desktop backend: Tauri commands over the shared engine.
+//! ReclaimArc desktop backend: Tauri commands over the shared engine.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
+use reclaimarc_core::{Engine, EngineConfig, Event, ExtractionMode, JobOutcome, SafetyMode};
 use serde::{Deserialize, Serialize};
-use reclaimarc_core::{
-    Engine, EngineConfig, Event, ExtractionMode, JobOutcome, SafetyMode,
-};
 use tauri::Emitter;
 
 /// A running or paused job in this process.
@@ -29,7 +27,10 @@ impl ActiveJob {
             JobStarted { job_id } => serde_json::json!({
                 "type": "job-started", "job_id": job_id,
             }),
-            Analyzed { archive, plan_bytes } => serde_json::json!({
+            Analyzed {
+                archive,
+                plan_bytes,
+            } => serde_json::json!({
                 "type": "analyzed", "archive": archive, "plan": plan_bytes,
             }),
             PreTestStarted { bytes_total } => serde_json::json!({
@@ -41,13 +42,21 @@ impl ActiveJob {
             PreTestFinished { ok, bytes_tested } => serde_json::json!({
                 "type": "pre-test-finished", "ok": ok, "bytes": bytes_tested,
             }),
-            UnitStarted { seq, first_entry, last_entry } => serde_json::json!({
+            UnitStarted {
+                seq,
+                first_entry,
+                last_entry,
+            } => serde_json::json!({
                 "type": "unit-started", "seq": seq, "first": first_entry, "last": last_entry,
             }),
             EntryStarted { index, name } => serde_json::json!({
                 "type": "entry-started", "index": index, "name": name,
             }),
-            EntryProgress { index, current, total } => serde_json::json!({
+            EntryProgress {
+                index,
+                current,
+                total,
+            } => serde_json::json!({
                 "type": "entry-progress", "index": index, "current": current, "total": total,
             }),
             EntryVerified { index, blake3 } => serde_json::json!({
@@ -59,7 +68,10 @@ impl ActiveJob {
             UnitCommitted { seq, bytes } => serde_json::json!({
                 "type": "unit-committed", "seq": seq, "bytes": bytes,
             }),
-            RangeReclaimed { volume_index, bytes } => serde_json::json!({
+            RangeReclaimed {
+                volume_index,
+                bytes,
+            } => serde_json::json!({
                 "type": "range-reclaimed", "volume": volume_index, "bytes": bytes,
             }),
             UnitReclaimed { seq, bytes } => serde_json::json!({
@@ -70,15 +82,29 @@ impl ActiveJob {
             }),
             JobPaused { .. } => serde_json::json!({ "type": "job-paused" }),
             JobCancelled { .. } => serde_json::json!({ "type": "job-cancelled" }),
-            JobFinished { job_id, committed_bytes, reclaimed_bytes } => serde_json::json!({
+            JobFinished {
+                job_id,
+                committed_bytes,
+                reclaimed_bytes,
+            } => serde_json::json!({
                 "type": "job-finished", "job": job_id,
                 "committed": committed_bytes, "reclaimed": reclaimed_bytes,
             }),
-            JobFailed { operation, path, os_error, message, recommended_action } => serde_json::json!({
+            JobFailed {
+                operation,
+                path,
+                os_error,
+                message,
+                recommended_action,
+            } => serde_json::json!({
                 "type": "job-failed", "operation": operation, "path": path,
                 "os_error": os_error, "message": message, "recommended": recommended_action,
             }),
-            EntrySkipped { index, name, reason } => serde_json::json!({
+            EntrySkipped {
+                index,
+                name,
+                reason,
+            } => serde_json::json!({
                 "type": "entry-skipped", "index": index, "name": name, "reason": reason,
             }),
             LowSpace { free, reserve } => serde_json::json!({
@@ -173,13 +199,17 @@ fn analyze(
     } else {
         PathBuf::from(&destination)
     };
-    let engine = state.engine.lock().unwrap();
+    let config = state.config.lock().unwrap().clone();
+    let engine = Engine::new(config);
     let (info, plan) = engine
         .analyze(&archive_path, &dest_path, password)
         .map_err(err_msg)?;
     let info_json = serde_json::to_value(&info).map_err(err_msg)?;
     let plan_json = serde_json::to_value(&plan).map_err(err_msg)?;
-    Ok(AnalyzeResult { info: info_json, plan: plan_json })
+    Ok(AnalyzeResult {
+        info: info_json,
+        plan: plan_json,
+    })
 }
 
 /// Command: start a fresh extraction job.
@@ -230,15 +260,13 @@ fn start_extraction(
     }
     drop(active_lock);
 
-    let mode = if low_space { ExtractionMode::LowSpace } else { ExtractionMode::Normal };
+    let mode = if low_space {
+        ExtractionMode::LowSpace
+    } else {
+        ExtractionMode::Normal
+    };
     let (handle, mut job) = engine
-        .start_job(
-            &archive_path,
-            &dest_path,
-            mode,
-            password,
-            tx.clone(),
-        )
+        .start_job(&archive_path, &dest_path, mode, password, tx.clone())
         .map_err(err_msg)?;
 
     let outcome = Arc::new(Mutex::new(None::<JobOutcome>));
@@ -280,6 +308,7 @@ fn resume_extraction(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     archive: String,
+    password: Option<String>,
 ) -> Result<String, String> {
     if state.active.lock().unwrap().is_some() {
         return Err("an extraction is already running".into());
@@ -295,7 +324,9 @@ fn resume_extraction(
             let _ = app2.emit("sx://event", ActiveJob::event_json(&event));
         }
     });
-let (handle, mut job) = engine.resume_job(&journal_path, tx.clone()).map_err(err_msg)?;
+    let (handle, mut job) = engine
+        .resume_job(&journal_path, password, tx.clone())
+        .map_err(err_msg)?;
     let outcome = Arc::new(Mutex::new(None::<JobOutcome>));
     let outcome2 = outcome.clone();
     let job_id = handle.job_id.clone();
@@ -418,6 +449,33 @@ fn abandon_job(archive: String) -> Result<(), String> {
     reclaimarc_core::abandon_job(&journal_path, &job_id).map_err(err_msg)
 }
 
+fn settings_file_path() -> PathBuf {
+    let base = std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("ReclaimArc").join("settings.json")
+}
+
+fn load_persisted_config() -> EngineConfig {
+    let p = settings_file_path();
+    if let Ok(bytes) = std::fs::read(&p) {
+        if let Ok(config) = serde_json::from_slice::<EngineConfig>(&bytes) {
+            return config;
+        }
+    }
+    EngineConfig::default()
+}
+
+fn persist_config(config: &EngineConfig) -> Result<(), String> {
+    let p = settings_file_path();
+    if let Some(parent) = p.parent() {
+        std::fs::create_dir_all(parent).map_err(err_msg)?;
+    }
+    let json = serde_json::to_string_pretty(config).map_err(err_msg)?;
+    std::fs::write(&p, json).map_err(err_msg)?;
+    Ok(())
+}
+
 /// Command: get settings.
 #[tauri::command]
 fn get_settings(state: tauri::State<'_, AppState>) -> Result<SettingsDto, String> {
@@ -429,7 +487,8 @@ fn get_settings(state: tauri::State<'_, AppState>) -> Result<SettingsDto, String
 #[tauri::command]
 fn set_settings(state: tauri::State<'_, AppState>, settings: SettingsDto) -> Result<(), String> {
     let mut config = state.config.lock().unwrap();
-    config.safety_mode = SafetyMode::from_str(&settings.safety_mode).unwrap_or(SafetyMode::Balanced);
+    config.safety_mode =
+        SafetyMode::from_str(&settings.safety_mode).unwrap_or(SafetyMode::Balanced);
     config.conflict_policy = match settings.conflict_policy.as_str() {
         "skip" => reclaimarc_core::ConflictPolicy::Skip,
         "rename-new" => reclaimarc_core::ConflictPolicy::RenameNew,
@@ -441,6 +500,8 @@ fn set_settings(state: tauri::State<'_, AppState>, settings: SettingsDto) -> Res
     config.retain_previous_unit = settings.retain_previous_unit;
     config.delete_shells_on_completion = settings.delete_shells_on_completion;
     config.log_level = settings.log_level;
+    *state.engine.lock().unwrap() = Engine::new(config.clone());
+    persist_config(&config)?;
     Ok(())
 }
 
@@ -473,12 +534,7 @@ fn read_logs(last: usize) -> Result<String, String> {
     }
     let content = std::fs::read_to_string(&path).map_err(err_msg)?;
     let lines: Vec<&str> = content.lines().collect();
-    let tail: Vec<&str> = lines
-        .iter()
-        .rev()
-        .take(last.max(50))
-        .copied()
-        .collect();
+    let tail: Vec<&str> = lines.iter().rev().take(last.max(50)).copied().collect();
     let mut out = tail.clone();
     out.reverse();
     Ok(out.join("\n"))
@@ -507,7 +563,10 @@ fn find_journal(archive: &std::path::Path) -> Result<PathBuf, String> {
         .map(|p| p.join(".reclaimarc"))
         .ok_or_else(|| "archive has no parent directory".to_string())?;
     if !state.exists() {
-        return Err(format!("no ReclaimArc state found beside '{}'", archive.display()));
+        return Err(format!(
+            "no ReclaimArc state found beside '{}'",
+            archive.display()
+        ));
     }
     let mut candidates: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(&state)
         .map_err(err_msg)?
@@ -551,12 +610,13 @@ pub fn init_logging() {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     init_logging();
+    let initial_config = load_persisted_config();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .manage(AppState {
-            engine: Mutex::new(Engine::new(EngineConfig::default())),
-            config: Mutex::new(EngineConfig::default()),
+            engine: Mutex::new(Engine::new(initial_config.clone())),
+            config: Mutex::new(initial_config),
             active: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
@@ -589,7 +649,13 @@ mod tests {
     fn test_analyze_with_empty_destination_defaults_to_parent() {
         let dir = tempfile::tempdir().unwrap();
         let files = vec![FixtureFile::new("sample.txt", b"hello analyze world")];
-        let paths = write_rar(dir.path(), "test_analyze", &files, &FixtureOptions::default()).unwrap();
+        let paths = write_rar(
+            dir.path(),
+            "test_analyze",
+            &files,
+            &FixtureOptions::default(),
+        )
+        .unwrap();
         let archive_path = paths[0].to_str().unwrap().to_string();
 
         let state = AppState {
@@ -600,7 +666,10 @@ mod tests {
 
         // Test fallback resolution logic
         let archive = PathBuf::from(&archive_path);
-        let dest = archive.parent().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+        let dest = archive
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
         let engine = state.engine.lock().unwrap();
         let (info, plan) = engine.analyze(&archive, &dest, None).unwrap();
 
@@ -609,8 +678,3 @@ mod tests {
         assert!(plan.free_now > 0);
     }
 }
-
-
-
-
-

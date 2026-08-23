@@ -131,8 +131,8 @@ export async function startExtraction(
   });
 }
 
-export async function resumeExtraction(archive: string): Promise<string> {
-  return invoke("resume_extraction", { archive });
+export async function resumeExtraction(archive: string, password?: string | null): Promise<string> {
+  return invoke("resume_extraction", { archive, password: password ?? null });
 }
 
 export async function pauseJob(): Promise<void> {
@@ -189,7 +189,7 @@ export async function pickArchive(): Promise<string | null> {
     title: "Choose an archive",
     multiple: false,
     filters: [
-      { name: "Archives", extensions: ["rar", "zip", "7z", "tar"] },
+      { name: "RAR Archives", extensions: ["rar", "cbr", "001", "r00"] },
       { name: "All files", extensions: ["*"] },
     ],
   });

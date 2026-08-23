@@ -1,6 +1,3 @@
-/* Windows-native look: Segoe UI, neutral surfaces, 1px borders, 4px radii.
-   No gradients, no glows, no glassmorphism. */
-
 :root {
   --bg: #f3f3f3;
   --bg-panel: #ffffff;
@@ -53,6 +50,17 @@ body {
   color: var(--text);
   background: var(--bg);
   user-select: none;
+}
+
+.mono,
+.logs,
+.error-banner,
+.file-path,
+.path-field input,
+.diag-box,
+code,
+pre {
+  user-select: text;
 }
 
 button {
@@ -155,159 +163,46 @@ select {
   margin-left: 4px;
 }
 
-/* Panels & Step Cards */
+/* Panels */
 .panel {
   background: var(--bg-panel);
   border: 1px solid var(--border);
-  border-top: 1px solid var(--border-strong);
-  border-radius: 6px;
-  padding: 16px;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+  border-radius: 4px;
+  padding: 14px 16px;
 }
 
 .panel h2 {
   margin: 0 0 10px 0;
   font-size: 13px;
   font-weight: 600;
-  letter-spacing: 0.02em;
   color: var(--text);
   display: flex;
   align-items: center;
   gap: 8px;
 }
 
-.step-badge {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 22px;
-  height: 22px;
-  border-radius: 50%;
-  background: var(--accent);
-  color: #ffffff;
-  font-size: 12px;
-  font-weight: 700;
-}
-
-.step-card {
-  background: var(--bg-panel);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 14px 16px;
-  margin-bottom: 12px;
-  transition: border-color 0.15s ease;
-}
-
-.step-card.active {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 1px var(--accent);
-}
-
-.step-card .card-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 8px;
-}
-
-.step-card .card-title {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text);
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.step-card .card-subtitle {
-  font-size: 12px;
-  color: var(--text-dim);
-  margin-bottom: 10px;
-}
-
-.dropzone-box {
-  border: 2px dashed var(--border-strong);
-  border-radius: 6px;
-  padding: 20px;
-  text-align: center;
-  cursor: pointer;
-  background: var(--bg);
-  transition: all 0.15s ease;
-}
-
-.dropzone-box:hover {
-  background: var(--bg-hover);
-  border-color: var(--accent);
-}
-
-.dropzone-box .icon {
-  font-size: 28px;
-  margin-bottom: 6px;
-}
-
-.dropzone-box .primary-text {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--text);
-  margin-bottom: 4px;
-}
-
-.dropzone-box .secondary-text {
-  font-size: 12px;
-  color: var(--text-dim);
-}
-
-.file-selected-chip {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  background: var(--bg-hover);
-  border: 1px solid var(--accent);
-  border-radius: 6px;
-  padding: 10px 14px;
-  margin-bottom: 8px;
-}
-
-.file-selected-chip .file-info {
+/* Setup field rows */
+.setup-fields {
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  overflow: hidden;
+  gap: 10px;
 }
 
-.file-selected-chip .file-name {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.file-selected-chip .file-path {
-  font-size: 11px;
-  color: var(--text-dim);
-  font-family: Consolas, "Cascadia Mono", monospace;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.action-card {
+.field-row {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  padding: 14px 16px;
-  background: var(--bg-hover);
-  border: 1px solid var(--border-strong);
-  border-radius: 6px;
-  margin-top: 6px;
+  gap: 12px;
 }
 
-.action-card .action-desc {
+.field-label {
+  width: 140px;
   font-size: 12.5px;
   color: var(--text-dim);
-  max-width: 65%;
+  flex-shrink: 0;
+}
+
+.field-row .path-field {
+  flex: 1;
 }
 
 .search-bar {
@@ -319,23 +214,6 @@ select {
 
 .search-bar input {
   flex: 1;
-}
-
-.tag {
-  display: inline-block;
-  padding: 2px 8px;
-  border-radius: 4px;
-  font-size: 11px;
-  font-weight: 600;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  color: var(--text-dim);
-}
-
-.tag.accent {
-  background: var(--bg-hover);
-  border-color: var(--accent);
-  color: var(--accent);
 }
 
 .layout {

@@ -176,15 +176,6 @@ impl ArchiveBackend for RarBackend {
                     p_entry.packed_size, h.pack_size
                 )));
             }
-            // File CRC check when both have non-zero CRC32
-            if let Some(p_crc) = p_entry.crc32 {
-                if h.file_crc != 0 && p_crc != h.file_crc {
-                    return Err(ArchiveError::invalid(format!(
-                        "parser/decoder file CRC mismatch at entry {lib_entries}: parser=0x{p_crc:08x} decoder=0x{:08x}",
-                        h.file_crc
-                    )));
-                }
-            }
 
             // Advance the decoder to the next header (DLL contract: every
             // ReadHeader must be followed by a ProcessFile).

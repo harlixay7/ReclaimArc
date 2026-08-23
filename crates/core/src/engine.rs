@@ -654,8 +654,7 @@ impl ExtractionJob {
             .map(|ranges| {
                 ranges
                     .iter()
-                    .filter(|r| r.state == reclaimarc_journal::models::RangeState::Reclaimed)
-                    .map(|r| r.len)
+                    .map(|r| r.physically_released_bytes)
                     .sum::<u64>()
             })
             .unwrap_or(0);

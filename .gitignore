@@ -1,4 +1,4 @@
-﻿# Build outputs
+# Build outputs
 /target
 apps/desktop/src-tauri/target
 apps/desktop/dist
@@ -26,4 +26,14 @@ desktop.ini
 # Test datasets
 testdata/downloaded/
 testdata/work/
+
+# Planning directives
+Plan.txt
+Masterplan.txt
+
+# Proptest regressions
+proptest-regressions/
+**/proptest-regressions/
+
+
 

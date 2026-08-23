@@ -1,4 +1,4 @@
-﻿//! ReclaimArc command-line interface.
+//! ReclaimArc command-line interface.
 //!
 //! The CLI drives the same engine as the desktop app.
 //!
@@ -120,7 +120,11 @@ fn cmd_inspect(args: &[String]) -> Result<(), String> {
         info.format.to_uppercase(),
         format_bytes(info.packed_size),
         format_bytes(info.unpacked_size),
-        if info.solid_archive { "Solid" } else { "Non-solid" }
+        if info.solid_archive {
+            "Solid"
+        } else {
+            "Non-solid"
+        }
     );
     println!("Volumes: {}", info.volumes.len());
     println!("Entries: {}", info.entries.len());
@@ -128,13 +132,23 @@ fn cmd_inspect(args: &[String]) -> Result<(), String> {
         "Recovery units: {} ({} = largest, {} unpacked)",
         info.recovery_units.len(),
         format_bytes(
-            info.recovery_units.iter().map(|u| u.unpacked_bytes).max().unwrap_or(0)
+            info.recovery_units
+                .iter()
+                .map(|u| u.unpacked_bytes)
+                .max()
+                .unwrap_or(0)
         ),
         format_bytes(
-            info.recovery_units.iter().map(|u| u.unpacked_bytes).sum::<u64>()
+            info.recovery_units
+                .iter()
+                .map(|u| u.unpacked_bytes)
+                .sum::<u64>()
         )
     );
-    println!("\n{:<6} {:<40} {:>10} {:>10}  {}", "Unit", "Name", "Packed", "Size", "Solid");
+    println!(
+        "\n{:<6} {:<40} {:>10} {:>10}  Solid",
+        "Unit", "Name", "Packed", "Size"
+    );
     for e in &info.entries {
         let unit = info
             .recovery_units
@@ -158,9 +172,15 @@ fn cmd_inspect(args: &[String]) -> Result<(), String> {
     }
     println!("\nCapabilities:");
     println!("  format: {}", info.capability.format);
-    println!("  test_integrity: {}", info.capability.supports_test_integrity);
+    println!(
+        "  test_integrity: {}",
+        info.capability.supports_test_integrity
+    );
     println!("  restartable_units: {}", info.capability.restartable_units);
-    println!("  progressive_reclaim: {}", info.capability.progressive_reclaim);
+    println!(
+        "  progressive_reclaim: {}",
+        info.capability.progressive_reclaim
+    );
     for note in &info.capability.notes {
         println!("  note: {note}");
     }
@@ -180,19 +200,47 @@ fn cmd_plan(args: &[String]) -> Result<(), String> {
 
     println!("Space plan for: {}", archive.display());
     println!("Destination: {}", destination.display());
-    println!("  Free now:                    {}", format_bytes(plan.free_now));
+    println!(
+        "  Free now:                    {}",
+        format_bytes(plan.free_now)
+    );
     println!(
         "  Normal extraction requirement: {}",
         format_bytes(plan.normal_requirement())
     );
-    println!("  Total unpacked:              {}", format_bytes(plan.unpacked_total));
-    println!("  Progressive peak requirement: {}", format_bytes(plan.progressive_peak_requirement));
-    println!("  Safety reserve:              {}", format_bytes(plan.reserve));
-    println!("  Largest recovery unit:       {}", format_bytes(plan.largest_unit_bytes));
-    println!("  Estimated source reclaim:    {}", format_bytes(plan.estimated_source_reclaim));
-    println!("  Archive packed (logical):    {}", format_bytes(info.packed_size));
+    println!(
+        "  Total unpacked:              {}",
+        format_bytes(plan.unpacked_total)
+    );
+    println!(
+        "  Progressive peak requirement: {}",
+        format_bytes(plan.progressive_peak_requirement)
+    );
+    println!(
+        "  Safety reserve:              {}",
+        format_bytes(plan.reserve)
+    );
+    println!(
+        "  Largest recovery unit:       {}",
+        format_bytes(plan.largest_unit_bytes)
+    );
+    println!(
+        "  Estimated source reclaim:    {}",
+        format_bytes(plan.estimated_source_reclaim)
+    );
+    println!(
+        "  Archive packed (logical):    {}",
+        format_bytes(info.packed_size)
+    );
     if plan.progressive_feasible {
-        println!("\nNormal extraction:      {}", if plan.normal_feasible { "POSSIBLE" } else { "IMPOSSIBLE" });
+        println!(
+            "\nNormal extraction:      {}",
+            if plan.normal_feasible {
+                "POSSIBLE"
+            } else {
+                "IMPOSSIBLE"
+            }
+        );
         println!("Progressive extraction: POSSIBLE");
     } else {
         println!("\nProgressive extraction: NOT SAFE");
@@ -211,8 +259,16 @@ fn cmd_extract(args: &[String]) -> Result<(), String> {
         .filter(|a| !a.starts_with("--"))
         .cloned()
         .collect();
-    let archive = PathBuf::from(positional.first().ok_or("usage: extract <archive> <destination>")?);
-    let destination = PathBuf::from(positional.get(1).ok_or("usage: extract <archive> <destination>")?);
+    let archive = PathBuf::from(
+        positional
+            .first()
+            .ok_or("usage: extract <archive> <destination>")?,
+    );
+    let destination = PathBuf::from(
+        positional
+            .get(1)
+            .ok_or("usage: extract <archive> <destination>")?,
+    );
     let password = parse_password(args);
     let mut config = EngineConfig::default();
     parse_mode(args, &mut config);
@@ -239,7 +295,11 @@ fn cmd_extract(args: &[String]) -> Result<(), String> {
         .start_job(
             &archive,
             &destination,
-            if low_space { ExtractionMode::LowSpace } else { ExtractionMode::Normal },
+            if low_space {
+                ExtractionMode::LowSpace
+            } else {
+                ExtractionMode::Normal
+            },
             password,
             tx,
         )
@@ -269,10 +329,18 @@ fn cmd_extract(args: &[String]) -> Result<(), String> {
                 Event::UnitStarted { seq, .. } => {
                     println!("[unit {seq}] extracting…");
                 }
-                Event::EntryProgress { index, current, total } => {
+                Event::EntryProgress {
+                    index,
+                    current,
+                    total,
+                } => {
                     if total > 0 {
                         let pct = current as f64 * 100.0 / total as f64;
-                        print!("\r  entry {index}: {pct:.1}% ({}/{})", format_bytes(current), format_bytes(total));
+                        print!(
+                            "\r  entry {index}: {pct:.1}% ({}/{})",
+                            format_bytes(current),
+                            format_bytes(total)
+                        );
                         use std::io::Write;
                         std::io::stdout().flush().ok();
                     }
@@ -283,28 +351,48 @@ fn cmd_extract(args: &[String]) -> Result<(), String> {
                 Event::UnitCommitted { seq, bytes } => {
                     println!("[unit {seq}] committed ({})", format_bytes(bytes));
                 }
-Event::RangeReclaimed { volume_index, bytes } => {
-                    println!("  source reclaimed: vol {volume_index} -{}", format_bytes(bytes));
+                Event::RangeReclaimed {
+                    volume_index,
+                    bytes,
+                } => {
+                    println!(
+                        "  source reclaimed: vol {volume_index} -{}",
+                        format_bytes(bytes)
+                    );
                 }
                 Event::UnitReclaimed { seq, bytes } => {
                     println!("[unit {seq}] source reclaimed ({})", format_bytes(bytes));
                 }
                 Event::FreeSpace { bytes } => println!("  free space: {}", format_bytes(bytes)),
-                Event::JobPaused { .. } => println!("job paused (resume with: reclaimarc resume <archive>)"),
+                Event::JobPaused { .. } => {
+                    println!("job paused (resume with: reclaimarc resume <archive>)")
+                }
                 Event::JobCancelled { .. } => println!("job cancelled (resumable)"),
-                Event::JobFinished { committed_bytes, reclaimed_bytes, .. } => {
+                Event::JobFinished {
+                    committed_bytes,
+                    reclaimed_bytes,
+                    ..
+                } => {
                     println!(
                         "job finished: {} committed, {} source reclaimed",
                         format_bytes(committed_bytes),
                         format_bytes(reclaimed_bytes)
                     );
                 }
-                Event::JobFailed { message, recommended_action, .. } => {
+                Event::JobFailed {
+                    message,
+                    recommended_action,
+                    ..
+                } => {
                     eprintln!("job failed: {message}");
                     eprintln!("recommended: {recommended_action}");
                 }
                 Event::LowSpace { free, reserve } => {
-                    println!("warning: free space {} below comfortable reserve {} — pausing soon", format_bytes(free), format_bytes(reserve));
+                    println!(
+                        "warning: free space {} below comfortable reserve {} — pausing soon",
+                        format_bytes(free),
+                        format_bytes(reserve)
+                    );
                 }
                 _ => {}
             }
@@ -319,15 +407,22 @@ Event::RangeReclaimed { volume_index, bytes } => {
     })
     .map_err(|e| format!("cannot install Ctrl+C handler: {e}"))?;
 
-    let outcome = engine.run_job(&mut job, &handle_ui).map_err(|e| e.to_string())?;
+    let outcome = engine
+        .run_job(&mut job, &handle_ui)
+        .map_err(|e| e.to_string())?;
     drop(job);
     let _ = rx;
     ui_thread.join().map_err(|_| "ui thread panicked")?;
     match outcome {
         JobOutcome::Completed { .. } => Ok(()),
         JobOutcome::Paused => Err("paused — run `reclaimarc resume <archive>` to continue".into()),
-        JobOutcome::Cancelled => Err("cancelled — run `reclaimarc resume <archive>` to continue".into()),
-        JobOutcome::Failed { failure } => Err(format!("{} — {}", failure.message, failure.recommended_action)),
+        JobOutcome::Cancelled => {
+            Err("cancelled — run `reclaimarc resume <archive>` to continue".into())
+        }
+        JobOutcome::Failed { failure } => Err(format!(
+            "{} — {}",
+            failure.message, failure.recommended_action
+        )),
     }
 }
 
@@ -350,29 +445,65 @@ fn cmd_jobs() -> Result<(), String> {
 }
 
 fn cmd_resume(args: &[String]) -> Result<(), String> {
-    let archive = PathBuf::from(args.first().ok_or("usage: resume <archive>")?);
+    let mut archive: Option<PathBuf> = None;
+    let mut password: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--password" | "-p" => {
+                i += 1;
+                password = args.get(i).cloned();
+            }
+            s if !s.starts_with('-') && archive.is_none() => {
+                archive = Some(PathBuf::from(s));
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let archive = archive.ok_or("usage: resume <archive> [--password <pass>]")?;
     let journal_path = find_journal_for(&archive)?;
     let (tx, rx) = mpsc::channel();
     let mut engine = Engine::new(EngineConfig::default());
-    let (handle, mut job) = engine.resume_job(&journal_path, tx).map_err(|e| e.to_string())?;
-    println!("resuming job {} → {}", job.job_id, job.destination.display());
+    let (handle, mut job) = engine
+        .resume_job(&journal_path, password, tx)
+        .map_err(|e| e.to_string())?;
+    println!(
+        "resuming job {} → {}",
+        job.job_id,
+        job.destination.display()
+    );
     let handle_ui = handle.clone();
     let ui_thread = std::thread::spawn(move || {
         while let Ok(event) = rx.recv() {
             match event {
                 Event::UnitStarted { seq, .. } => println!("[unit {seq}] extracting…"),
-                Event::UnitCommitted { seq, bytes } => println!("[unit {seq}] committed ({})", format_bytes(bytes)),
-                Event::UnitReclaimed { seq, bytes } => println!("[unit {seq}] source reclaimed ({})", format_bytes(bytes)),
-                Event::EntryCommitted { index, path } => println!("  entry {index}: {}", path.display()),
+                Event::UnitCommitted { seq, bytes } => {
+                    println!("[unit {seq}] committed ({})", format_bytes(bytes))
+                }
+                Event::UnitReclaimed { seq, bytes } => {
+                    println!("[unit {seq}] source reclaimed ({})", format_bytes(bytes))
+                }
+                Event::EntryCommitted { index, path } => {
+                    println!("  entry {index}: {}", path.display())
+                }
                 Event::JobPaused { .. } => println!("job paused"),
-                Event::JobFinished { committed_bytes, reclaimed_bytes, .. } => {
+                Event::JobFinished {
+                    committed_bytes,
+                    reclaimed_bytes,
+                    ..
+                } => {
                     println!(
                         "job finished: {} committed, {} source reclaimed",
                         format_bytes(committed_bytes),
                         format_bytes(reclaimed_bytes)
                     );
                 }
-                Event::JobFailed { message, recommended_action, .. } => {
+                Event::JobFailed {
+                    message,
+                    recommended_action,
+                    ..
+                } => {
                     eprintln!("job failed: {message}");
                     eprintln!("recommended: {recommended_action}");
                 }
@@ -380,15 +511,24 @@ fn cmd_resume(args: &[String]) -> Result<(), String> {
             }
         }
     });
-    let outcome = engine.run_job(&mut job, &handle_ui).map_err(|e| e.to_string())?;
+    let outcome = engine
+        .run_job(&mut job, &handle_ui)
+        .map_err(|e| e.to_string())?;
     drop(job);
     let _ = rx;
     ui_thread.join().map_err(|_| "ui thread panicked")?;
     match outcome {
         JobOutcome::Completed { .. } => Ok(()),
-        JobOutcome::Paused => Err("paused again — run `reclaimarc resume <archive>` to continue".into()),
-        JobOutcome::Cancelled => Err("cancelled — run `reclaimarc resume <archive>` to continue".into()),
-        JobOutcome::Failed { failure } => Err(format!("{} — {}", failure.message, failure.recommended_action)),
+        JobOutcome::Paused => {
+            Err("paused again — run `reclaimarc resume <archive>` to continue".into())
+        }
+        JobOutcome::Cancelled => {
+            Err("cancelled — run `reclaimarc resume <archive>` to continue".into())
+        }
+        JobOutcome::Failed { failure } => Err(format!(
+            "{} — {}",
+            failure.message, failure.recommended_action
+        )),
     }
 }
 
@@ -396,7 +536,8 @@ fn cmd_abandon(args: &[String]) -> Result<(), String> {
     let archive = PathBuf::from(args.first().ok_or("usage: abandon <archive>")?);
     let journal_path = find_journal_for(&archive)?;
     let job_id = {
-        let journal = reclaimarc_journal::JobJournal::open(&journal_path).map_err(|e| e.to_string())?;
+        let journal =
+            reclaimarc_journal::JobJournal::open(&journal_path).map_err(|e| e.to_string())?;
         journal.job_meta().map_err(|e| e.to_string())?.job_id
     };
     println!(
@@ -404,7 +545,9 @@ fn cmd_abandon(args: &[String]) -> Result<(), String> {
          Continue? [y/N]"
     );
     let mut input = String::new();
-    std::io::stdin().read_line(&mut input).map_err(|e| e.to_string())?;
+    std::io::stdin()
+        .read_line(&mut input)
+        .map_err(|e| e.to_string())?;
     if !input.trim().eq_ignore_ascii_case("y") {
         println!("aborted");
         return Ok(());
@@ -423,9 +566,18 @@ fn cmd_diagnostics(args: &[String]) -> Result<(), String> {
     println!("  archive:      {}", summary.archive.display());
     println!("  destination:  {}", summary.destination.display());
     println!("  job state:    {:?}", summary.job_state);
-    println!("  committed:    {}", format_bytes(summary.committed_output_bytes));
-    println!("  reclaimed:    {}", format_bytes(summary.source_reclaimed_bytes));
-    println!("  remaining:    {}", format_bytes(summary.remaining_source_bytes));
+    println!(
+        "  committed:    {}",
+        format_bytes(summary.committed_output_bytes)
+    );
+    println!(
+        "  reclaimed:    {}",
+        format_bytes(summary.source_reclaimed_bytes)
+    );
+    println!(
+        "  remaining:    {}",
+        format_bytes(summary.remaining_source_bytes)
+    );
     println!("  checkpoint:   {}", summary.last_checkpoint);
     println!("\nUnits:");
     for (seq, state) in &summary.units {
@@ -464,7 +616,7 @@ fn find_journal_for(archive: &std::path::Path) -> Result<PathBuf, String> {
                 .map(|t| (t, p))
         })
         .collect();
-candidates.sort_by_key(|(t, _)| *t);
+    candidates.sort_by_key(|(t, _)| *t);
     candidates
         .last()
         .map(|(_, p)| p.clone())
@@ -475,4 +627,3 @@ candidates.sort_by_key(|(t, _)| *t);
 fn _assert_send(_: &JobHandle) {}
 #[allow(dead_code)]
 fn _assert_send2(_: &Arc<AtomicBool>) {}
-

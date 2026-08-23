@@ -1,4 +1,4 @@
-﻿import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
   abandonJob,
@@ -21,6 +21,7 @@ import {
   startExtraction,
   stopJob,
   type AnalyzeResult,
+  type ArchiveEntry,
   type JobListEntry,
   type RecoveryView,
   type SettingsDto,
@@ -46,6 +47,7 @@ interface ProgressState {
   paused: boolean;
   cancelled: boolean;
   error: string | null;
+  hadRedirections: boolean;
 }
 
 const emptyProgress = (): ProgressState => ({
@@ -65,6 +67,7 @@ const emptyProgress = (): ProgressState => ({
   paused: false,
   cancelled: false,
   error: null,
+  hadRedirections: false,
 });
 
 /// O(1) recovery-unit lookup for the file table. For archives with tens of
@@ -102,6 +105,7 @@ export default function App() {
   const [archive, setArchive] = useState("");
   const [destination, setDestination] = useState("");
   const [password, setPassword] = useState("");
+  const [recoveryPassword, setRecoveryPassword] = useState("");
   const [analyzing, setAnalyzing] = useState(false);
   const [analysis, setAnalysis] = useState<AnalyzeResult | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -196,17 +200,14 @@ export default function App() {
             verifiedBytes: p.verifiedBytes + Number(ev.bytes),
           }));
           break;
-        case "unit-reclaimed":
-          setProgress((p) => ({
-            ...p,
-            reclaimedBytes: p.reclaimedBytes + Number(ev.bytes),
-          }));
-          break;
         case "range-reclaimed":
           setProgress((p) => ({
             ...p,
             reclaimedBytes: p.reclaimedBytes + Number(ev.bytes),
           }));
+          break;
+        case "unit-reclaimed":
+          // Unit completion marker; physical bytes are tracked incrementally via range-reclaimed.
           break;
         case "free-space":
           setProgress((p) => ({
@@ -281,7 +282,10 @@ export default function App() {
   const doExtract = async (lowSpace: boolean) => {
     if (!archive) return;
     setError(null);
-    setProgress(emptyProgress());
+    const hadRedirections = analysis
+      ? analysis.info.entries.some((e) => e.redirection !== null)
+      : false;
+    setProgress({ ...emptyProgress(), hadRedirections });
     try {
       const targetDest = destRef.current || destination.trim() || getParentDirectory(archive);
       const id = await startExtraction(
@@ -290,7 +294,7 @@ export default function App() {
         lowSpace,
         password || undefined,
       );
-      setProgress((p) => ({ ...p, jobId: id }));
+      setProgress((p) => ({ ...p, jobId: id, hadRedirections }));
       setRunning(true);
       setView("extracting");
     } catch (e) {
@@ -312,15 +316,19 @@ export default function App() {
     } catch {
       // not fatal
     }
+    const hadRedirections = analysis
+      ? analysis.info.entries.some((e) => e.redirection !== null)
+      : false;
     setProgress({
       ...emptyProgress(),
       writtenBytes: initialWritten,
       verifiedBytes: initialWritten,
       reclaimedBytes: initialReclaimed,
+      hadRedirections,
     });
     try {
-      const id = await resumeExtraction(archive);
-      setProgress((p) => ({ ...p, jobId: id }));
+      const id = await resumeExtraction(archive, recoveryPassword || password || undefined);
+      setProgress((p) => ({ ...p, jobId: id, hadRedirections }));
       setRunning(true);
       setView("extracting");
     } catch (e) {
@@ -395,21 +403,11 @@ export default function App() {
     }
   };
 
-  const [filterText, setFilterText] = useState("");
-  const [hasPassword, setHasPassword] = useState(false);
-
-  const filteredEntries = analysis
-    ? analysis.info.entries.filter((e) =>
-        e.name.toLowerCase().includes(filterText.toLowerCase()),
-      )
-    : [];
-
   const effectiveDest = destination.trim() || (archive ? getParentDirectory(archive) : "");
-  const archiveFileName = archive ? archive.split(/[/\\]/).pop() || archive : "";
 
   return (
     <>
-      <div className="command-bar">
+      <header className="command-bar">
         <span className="title">ReclaimArc</span>
         <button
           className={view === "home" ? "tab-active" : ""}
@@ -433,291 +431,57 @@ export default function App() {
         <div className="spacer" />
         <button onClick={() => setShowLogs(true)}>Logs</button>
         <button onClick={() => setShowSettings(true)}>Settings</button>
-      </div>
+      </header>
 
       {error && <div className="error-banner">{error}</div>}
 
       {view === "home" && (
         <div className="layout">
-          {/* Step 1: Select Archive */}
-          <div className={`step-card ${!archive ? "active" : ""}`}>
-            <div className="card-header">
-              <div className="card-title">
-                <span className="step-badge">1</span>
-                <span>Select Archive File</span>
-              </div>
-              <span className="tag">RAR4 · RAR5 · Solid · Multi-part</span>
-            </div>
-            <div className="card-subtitle">
-              Choose the RAR or compressed archive you want to inspect and extract.
-            </div>
+          <ArchiveSetup
+            archive={archive}
+            destination={effectiveDest}
+            password={password}
+            onArchiveChange={(a) => {
+              setArchive(a);
+              setAnalysis(null);
+            }}
+            onDestinationChange={(d) => {
+              setDestination(d);
+              destRef.current = d;
+            }}
+            onPasswordChange={setPassword}
+            onOpenArchive={openArchive}
+            onOpenDestination={openDestination}
+            onAnalyze={doAnalyze}
+            analyzing={analyzing}
+          />
 
-            {archive ? (
-              <div className="file-selected-chip">
-                <div className="file-info">
-                  <span className="file-name">📦 {archiveFileName}</span>
-                  <span className="file-path">{archive}</span>
-                </div>
-                <div style={{ display: "flex", gap: 6 }}>
-                  <button onClick={openArchive}>Change…</button>
-                  <button
-                    onClick={() => {
-                      setArchive("");
-                      setAnalysis(null);
-                    }}
-                  >
-                    Clear
-                  </button>
-                </div>
-              </div>
-            ) : (
-              <div className="dropzone-box" onClick={openArchive}>
-                <div className="icon">📦</div>
-                <div className="primary-text">Click to browse archive (.rar, .zip, .7z)</div>
-                <div className="secondary-text">
-                  Or select multi-part sets (.part1.rar, .r00)
-                </div>
-              </div>
-            )}
-
-            <div style={{ marginTop: 8 }}>
-              <div className="path-field">
-                <input
-                  type="text"
-                  value={archive}
-                  placeholder="Or enter/paste full archive path here (e.g. C:\Downloads\archive.rar)"
-                  onChange={(e) => {
-                    setArchive(e.target.value);
-                    setAnalysis(null);
-                  }}
-                />
-                <button onClick={openArchive}>Browse…</button>
-              </div>
-            </div>
-          </div>
-
-          {/* Step 2: Choose Destination */}
-          <div className="step-card">
-            <div className="card-header">
-              <div className="card-title">
-                <span className="step-badge">2</span>
-                <span>Extraction Destination</span>
-              </div>
-              <span className="tag">Destination Folder</span>
-            </div>
-            <div className="card-subtitle">
-              Where the unpacked files will be saved. Defaults to the archive's folder.
-            </div>
-
-            <div className="path-field">
-              <input
-                type="text"
-                value={effectiveDest}
-                placeholder="Choose extraction destination folder"
-                onChange={(e) => setDestination(e.target.value)}
-              />
-              <button onClick={openDestination}>Browse Folder…</button>
-            </div>
-
-            <div style={{ marginTop: 10, display: "flex", alignItems: "center", gap: 12 }}>
-              <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer", fontSize: 12.5 }}>
-                <input
-                  type="checkbox"
-                  checked={hasPassword}
-                  onChange={(e) => setHasPassword(e.target.checked)}
-                />
-                <span>Archive is password-protected</span>
-              </label>
-            </div>
-
-            {hasPassword && (
-              <div style={{ marginTop: 8 }}>
-                <input
-                  type="password"
-                  value={password}
-                  placeholder="Enter archive password (held in memory only, never saved to disk)"
-                  onChange={(e) => setPassword(e.target.value)}
-                />
-              </div>
-            )}
-          </div>
-
-          {/* Step 3: Analyze & Verification Action */}
-          {!analysis && (
-            <div className="action-card">
-              <div className="action-desc">
-                <strong>Step 3: Analyze & Check Safety</strong>
-                <div style={{ marginTop: 4, color: "var(--text-dim)", fontSize: 12 }}>
-                  Inspects compression structure, calculates recovery units, and checks if your destination volume has enough space for normal or low-space progressive extraction.
-                </div>
-              </div>
-              <button
-                className="primary"
-                style={{ minWidth: 160, padding: "8px 20px", fontSize: 13.5, fontWeight: 600 }}
-                onClick={doAnalyze}
-                disabled={!archive || analyzing}
-              >
-                {analyzing ? "Analyzing Archive…" : "🔍 Analyze Archive"}
-              </button>
-            </div>
-          )}
-
-          {/* Analysis Dashboard */}
           {analysis && (
             <>
-              <div className="panel">
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
-                  <h2>Archive Summary</h2>
-                  <button onClick={doAnalyze} disabled={analyzing}>
-                    {analyzing ? "Re-analyzing…" : "Re-analyze"}
-                  </button>
-                </div>
-                <div className="summary">
-                  <span className="strong">{analysis.info.format.toUpperCase()}</span>
-                  {" · "}
-                  {formatBytes(analysis.info.packed_size)} packed ·{" "}
-                  {formatBytes(analysis.info.unpacked_size)} unpacked ·{" "}
-                  {analysis.info.solid_archive ? "Solid Archive" : "Non-solid"}
-                  {analysis.info.encrypted_headers && " · Encrypted headers"}
-                  {analysis.info.volumes.length > 1 && ` · ${analysis.info.volumes.length} volumes`}
-                  {` · ${analysis.info.entries.length} items`}
-                </div>
+              <ArchiveAnalysisPanel
+                analysis={analysis}
+                onReanalyze={doAnalyze}
+                analyzing={analyzing}
+              />
 
-                <div className="search-bar">
-                  <input
-                    type="text"
-                    value={filterText}
-                    placeholder="Search / filter files in archive by name..."
-                    onChange={(e) => setFilterText(e.target.value)}
-                  />
-                  {filterText && (
-                    <button onClick={() => setFilterText("")}>Clear Filter</button>
-                  )}
-                  <span style={{ fontSize: 12, color: "var(--text-dim)", whiteSpace: "nowrap" }}>
-                    Showing {filteredEntries.length} of {analysis.info.entries.length}
-                  </span>
-                </div>
-
-                <div style={{ maxHeight: 240, overflow: "auto" }}>
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Name</th>
-                        <th className="num">Packed</th>
-                        <th className="num">Size</th>
-                        <th className="num">Ratio</th>
-                        <th className="num">Unit</th>
-                        <th>Status</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {filteredEntries.map((e) => {
-                        const unit = unitForIndex(analysis, e.index);
-                        return (
-                          <tr key={e.index}>
-                            <td>{e.name}</td>
-                            <td className="num">{formatBytes(e.packed_size)}</td>
-                            <td className="num">{formatBytes(e.unpacked_size)}</td>
-                            <td className="num">{ratio(e.packed_size, e.unpacked_size)}</td>
-                            <td className="num">{unit ?? "—"}</td>
-                            <td>
-                              {e.is_directory ? (
-                                <span className="status pending">dir</span>
-                              ) : e.is_solid ? (
-                                <span className="status running">solid</span>
-                              ) : (
-                                <span className="status pending">file</span>
-                              )}
-                            </td>
-                          </tr>
-                        );
-                      })}
-                      {filteredEntries.length === 0 && (
-                        <tr>
-                          <td colSpan={6} style={{ textAlign: "center", color: "var(--text-dim)", padding: 16 }}>
-                            No entries matching "{filterText}"
-                          </td>
-                        </tr>
-                      )}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-
-              <div className="panel">
-                <h2>Space Plan & Feasibility</h2>
-                <div className="plan-grid">
-                  <span className="label">Free Disk Space Now</span>
-                  <span className="value">{formatBytes(analysis.plan.free_now)}</span>
-                  <span />
-                  <span className="label">Normal Extraction Needed</span>
-                  <span className="value">{formatBytes(analysis.plan.unpacked_total)}</span>
-                  <span />
-                  <span className="label">Progressive Peak Requirement</span>
-                  <span className="value">
-                    {analysis.plan.progressive_peak_requirement === 0
-                      ? "Fits without reclamation"
-                      : formatBytes(analysis.plan.progressive_peak_requirement)}
-                  </span>
-                  <span />
-                  <span className="label">Safety Reserve</span>
-                  <span className="value">{formatBytes(analysis.plan.reserve)}</span>
-                  <span />
-                  <span className="label">Largest Recovery Unit</span>
-                  <span className="value">{formatBytes(analysis.plan.largest_unit_bytes)}</span>
-                  <span />
-                  <span className="label">Estimated Space Reclaimed</span>
-                  <span className="value">{formatBytes(analysis.plan.estimated_source_reclaim)}</span>
-                  <span />
-                </div>
-                {analysis.plan.progressive_feasible ? (
-                  <div className="verdict ok">
-                    <strong>
-                      {analysis.plan.normal_feasible
-                        ? "✅ Ready for Extraction: Both Normal and Progressive extraction are SAFE on this drive."
-                        : "⚡ Low-Space Feasible: Normal extraction exceeds capacity, but Progressive Low-Space extraction is SAFE."}
-                    </strong>
-                  </div>
-                ) : (
-                  <div className="verdict bad">
-                    <strong>⚠️ Progressive extraction is NOT SAFE on this volume.</strong>
-                    {analysis.plan.reason && (
-                      <div style={{ marginTop: 6, color: "var(--text-dim)" }}>
-                        Reason: {analysis.plan.reason}
-                      </div>
-                    )}
-                  </div>
-                )}
-              </div>
-
-              <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", alignItems: "center" }}>
-                <button
-                  className="primary"
-                  disabled={running || !analysis.plan.normal_feasible}
-                  onClick={() => {
-                    setPendingChoice("normal");
-                    setShowExtractChoice(true);
-                  }}
-                >
-                  Extract
-                </button>
-                <button
-                  className="primary"
-                  disabled={running || !analysis.plan.progressive_feasible}
-                  onClick={() => {
-                    setPendingChoice("low");
-                    setShowExtractChoice(true);
-                  }}
-                >
-                  Extract (Low-Space)
-                </button>
-              </div>
+              <SpacePlanPanel
+                plan={analysis.plan}
+                running={running}
+                onStartNormal={() => {
+                  setPendingChoice("normal");
+                  setShowExtractChoice(true);
+                }}
+                onStartLowSpace={() => {
+                  setPendingChoice("low");
+                  setShowExtractChoice(true);
+                }}
+              />
             </>
           )}
 
           {!analysis && !error && (
             <div className="empty">
-              Open an archive and choose a destination, then press Analyze.
+              Open a RAR archive and select a destination, then click Analyze.
             </div>
           )}
         </div>
@@ -739,177 +503,322 @@ export default function App() {
       )}
 
       {view === "recovery" && (
-        <div className="layout">
-          <div className="panel">
-            <h2>Extraction was interrupted</h2>
-            {(recovery ?? null) ? (
-              <>
-                <div className="summary">
-                  Archive: <span className="strong">{recovery!.archive}</span>
-                  <br />
-                  Destination: <span className="strong">{recovery!.destination}</span>
-                </div>
-                <div className="recovery-stats">
-                  <span className="label">Committed output</span>
-                  <span className="value">{formatBytes(recovery!.committed_output_bytes)}</span>
-                  <span className="label">Source reclaimed</span>
-                  <span className="value">{formatBytes(recovery!.source_reclaimed_bytes)}</span>
-                  <span className="label">Remaining source</span>
-                  <span className="value">{formatBytes(recovery!.remaining_source_bytes)}</span>
-                  <span className="label">Last safe checkpoint</span>
-                  <span className="value">{recovery!.last_checkpoint}</span>
-                </div>
-                {recovery!.units.length > 0 && (
-                  <div style={{ maxHeight: 140, overflow: "auto", marginTop: 8 }}>
-                    <table>
-                      <thead>
-                        <tr>
-                          <th>Unit</th>
-                          <th>State</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {recovery!.units.map((u) => (
-                          <tr key={u.seq}>
-                            <td>{u.seq}</td>
-                            <td>
-                              <span className={u.state.includes("COMMITTED") || u.state.includes("RECLAIMED") ? "status done" : "status pending"}>
-                                {u.state}
-                              </span>
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
-                {recovery!.errors.length > 0 && (
-                  <div style={{ marginTop: 8, fontSize: 12 }}>
-                    <span className="warning-text">Recorded errors:</span>
-                    {recovery!.errors.map((e, i) => (
-                      <div key={i} className="mono" style={{ color: "var(--text-dim)" }}>
-                        {e}
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </>
-            ) : (
-              <div className="summary">
-                Interrupted jobs found. Select the archive in the command bar to inspect its job.
-              </div>
-            )}
-            {interrupted.length > 0 && (
-              <div style={{ marginTop: 10 }}>
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Job</th>
-                      <th>Archive</th>
-                      <th>Destination</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {interrupted.map((j) => (
-                      <tr
-                        key={j.job_id}
-                        style={{ cursor: "pointer" }}
-                        onClick={() => void selectInterruptedJob(j)}
-                        title="Click to select this job"
-                      >
-                        <td className="mono">{j.job_id.slice(0, 8)}</td>
-                        <td>{j.archive}</td>
-                        <td>{j.destination}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-            <div style={{ display: "flex", gap: 8, justifyContent: "space-between", marginTop: 12 }}>
-              <button onClick={() => setView("home")}>Back to Extract</button>
-              <div style={{ display: "flex", gap: 8 }}>
-                <button className="primary" onClick={doResume} disabled={!archive}>
-                  Resume
-                </button>
-                <button onClick={inspectRecovery} disabled={!archive}>
-                  Inspect
-                </button>
-                <button className="danger" onClick={doAbandon} disabled={!archive}>
-                  Abandon Job
-                </button>
-              </div>
-            </div>
-            <div className="summary" style={{ color: "var(--text-dim)", fontSize: 12 }}>
-              Previously reclaimed source data cannot be restored. ReclaimArc never offers rollback
-              when the source no longer exists.
-            </div>
-          </div>
-        </div>
+        <RecoveryViewComponent
+          archive={archive}
+          recovery={recovery}
+          interrupted={interrupted}
+          recoveryPassword={recoveryPassword}
+          onPasswordChange={setRecoveryPassword}
+          onSelectJob={selectInterruptedJob}
+          onResume={doResume}
+          onInspect={inspectRecovery}
+          onAbandon={doAbandon}
+          onBackToHome={() => setView("home")}
+        />
       )}
 
       {showExtractChoice && (
-        <div className="overlay">
-          <div className="dialog">
-            <h2>Extract</h2>
-            <div className="body">
-              <p>
-                <strong>Normal Extraction</strong> keeps the original archive and requires enough
-                free space for the full unpacked output.
-              </p>
-              <p>
-                <strong>Low-Space Extraction</strong> progressively destroys verified portions of
-                the source archive to reclaim space during extraction.
-              </p>
-              {pendingChoice === "low" && (
-                <p className="danger-text">
-                  Low-Space Extraction permanently destroys parts of the archive as it proceeds.
-                  Previously reclaimed source data cannot be restored. Continue?
-                </p>
-              )}
-            </div>
-            <div className="actions">
-              <button onClick={() => setShowExtractChoice(false)}>Cancel</button>
-              {pendingChoice === "low" ? (
-                <>
-                  <button
-                    className="primary"
-                    onClick={() => {
-                      setShowExtractChoice(false);
-                      void doExtract(true);
-                    }}
-                  >
-                    Start Low-Space Extraction
-                  </button>
-                  <button
-                    onClick={() => {
-                      setShowExtractChoice(false);
-                      void doExtract(false);
-                    }}
-                  >
-                    Normal Extraction
-                  </button>
-                </>
-              ) : (
-                <button
-                  className="primary"
-                  onClick={() => {
-                    setShowExtractChoice(false);
-                    void doExtract(false);
-                  }}
-                >
-                  Start Extraction
-                </button>
-              )}
-            </div>
-          </div>
-        </div>
+        <ExtractChoiceModal
+          pendingChoice={pendingChoice}
+          onClose={() => setShowExtractChoice(false)}
+          onConfirm={(lowSpace) => {
+            setShowExtractChoice(false);
+            void doExtract(lowSpace);
+          }}
+        />
       )}
 
       {showSettings && <SettingsDialog onClose={() => setShowSettings(false)} />}
-
       {showLogs && <LogsDialog onClose={() => setShowLogs(false)} />}
     </>
+  );
+}
+
+function ArchiveSetup({
+  archive,
+  destination,
+  password,
+  onArchiveChange,
+  onDestinationChange,
+  onPasswordChange,
+  onOpenArchive,
+  onOpenDestination,
+  onAnalyze,
+  analyzing,
+}: {
+  archive: string;
+  destination: string;
+  password: string;
+  onArchiveChange: (a: string) => void;
+  onDestinationChange: (d: string) => void;
+  onPasswordChange: (p: string) => void;
+  onOpenArchive: () => void;
+  onOpenDestination: () => void;
+  onAnalyze: () => void;
+  analyzing: boolean;
+}) {
+  const [hasPassword, setHasPassword] = useState(false);
+
+  return (
+    <section className="panel">
+      <h2>Source Archive and Destination</h2>
+      <div className="setup-fields">
+        <div className="field-row">
+          <label className="field-label">RAR Archive:</label>
+          <div className="path-field">
+            <input
+              type="text"
+              value={archive}
+              placeholder="Select RAR archive (.rar, .part1.rar)"
+              onChange={(e) => onArchiveChange(e.target.value)}
+            />
+            <button onClick={onOpenArchive}>Browse…</button>
+          </div>
+        </div>
+
+        <div className="field-row">
+          <label className="field-label">Destination Folder:</label>
+          <div className="path-field">
+            <input
+              type="text"
+              value={destination}
+              placeholder="Extraction destination folder"
+              onChange={(e) => onDestinationChange(e.target.value)}
+            />
+            <button onClick={onOpenDestination}>Browse…</button>
+          </div>
+        </div>
+
+        <div className="field-row">
+          <label className="field-label" />
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer", fontSize: 12.5 }}>
+              <input
+                type="checkbox"
+                checked={hasPassword}
+                onChange={(e) => setHasPassword(e.target.checked)}
+              />
+              <span>Archive is password-protected</span>
+            </label>
+            {hasPassword && (
+              <input
+                type="password"
+                value={password}
+                placeholder="Enter password (held in memory only)"
+                onChange={(e) => onPasswordChange(e.target.value)}
+                style={{ width: 320 }}
+              />
+            )}
+          </div>
+        </div>
+      </div>
+
+      <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 12 }}>
+        <button
+          className="primary"
+          onClick={onAnalyze}
+          disabled={!archive || analyzing}
+        >
+          {analyzing ? "Analyzing Archive…" : "Analyze Archive"}
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function ArchiveAnalysisPanel({
+  analysis,
+  onReanalyze,
+  analyzing,
+}: {
+  analysis: AnalyzeResult;
+  onReanalyze: () => void;
+  analyzing: boolean;
+}) {
+  const [filterText, setFilterText] = useState("");
+
+  const filteredEntries = analysis.info.entries.filter((e) =>
+    e.name.toLowerCase().includes(filterText.toLowerCase()),
+  );
+
+  return (
+    <section className="panel">
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+        <h2>Archive Summary</h2>
+        <button onClick={onReanalyze} disabled={analyzing}>
+          {analyzing ? "Re-analyzing…" : "Re-analyze"}
+        </button>
+      </div>
+      <div className="summary">
+        <span className="strong">{analysis.info.format.toUpperCase()}</span>
+        {" · "}
+        {formatBytes(analysis.info.packed_size)} packed ·{" "}
+        {formatBytes(analysis.info.unpacked_size)} unpacked ·{" "}
+        {analysis.info.solid_archive ? "Solid Archive" : "Non-solid"}
+        {analysis.info.encrypted_headers && " · Encrypted headers"}
+        {analysis.info.volumes.length > 1 && ` · ${analysis.info.volumes.length} volumes`}
+        {` · ${analysis.info.entries.length} items`}
+      </div>
+
+      <div className="search-bar">
+        <input
+          type="text"
+          value={filterText}
+          placeholder="Filter files by name…"
+          onChange={(e) => setFilterText(e.target.value)}
+        />
+        {filterText && (
+          <button onClick={() => setFilterText("")}>Clear</button>
+        )}
+        <span style={{ fontSize: 12, color: "var(--text-dim)", whiteSpace: "nowrap" }}>
+          Showing {filteredEntries.length} of {analysis.info.entries.length}
+        </span>
+      </div>
+
+      <div style={{ maxHeight: 240, overflow: "auto" }}>
+        <FilesTable entries={filteredEntries} analysis={analysis} filterText={filterText} />
+      </div>
+    </section>
+  );
+}
+
+function FilesTable({
+  entries,
+  analysis,
+  filterText,
+}: {
+  entries: ArchiveEntry[];
+  analysis: AnalyzeResult;
+  filterText: string;
+}) {
+  return (
+    <table>
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th className="num">Packed</th>
+          <th className="num">Size</th>
+          <th className="num">Ratio</th>
+          <th className="num">Unit</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        {entries.map((e) => {
+          const unit = unitForIndex(analysis, e.index);
+          let statusText = "file";
+          let statusClass = "pending";
+
+          if (e.redirection !== null) {
+            statusText = "Skipped (link policy)";
+            statusClass = "pending";
+          } else if (e.is_directory) {
+            statusText = "dir";
+            statusClass = "pending";
+          } else if (e.is_solid) {
+            statusText = "solid";
+            statusClass = "running";
+          }
+
+          return (
+            <tr key={e.index}>
+              <td>{e.name}</td>
+              <td className="num">{formatBytes(e.packed_size)}</td>
+              <td className="num">{formatBytes(e.unpacked_size)}</td>
+              <td className="num">{ratio(e.packed_size, e.unpacked_size)}</td>
+              <td className="num">{unit ?? "—"}</td>
+              <td>
+                <span className={`status ${statusClass}`}>{statusText}</span>
+              </td>
+            </tr>
+          );
+        })}
+        {entries.length === 0 && (
+          <tr>
+            <td colSpan={6} style={{ textAlign: "center", color: "var(--text-dim)", padding: 16 }}>
+              No entries matching "{filterText}"
+            </td>
+          </tr>
+        )}
+      </tbody>
+    </table>
+  );
+}
+
+function SpacePlanPanel({
+  plan,
+  running,
+  onStartNormal,
+  onStartLowSpace,
+}: {
+  plan: AnalyzeResult["plan"];
+  running: boolean;
+  onStartNormal: () => void;
+  onStartLowSpace: () => void;
+}) {
+  return (
+    <section className="panel">
+      <h2>Space Plan & Feasibility</h2>
+      <div className="plan-grid">
+        <span className="label">Free Disk Space Now</span>
+        <span className="value">{formatBytes(plan.free_now)}</span>
+        <span />
+        <span className="label">Normal Extraction Needed</span>
+        <span className="value">{formatBytes(plan.unpacked_total)}</span>
+        <span />
+        <span className="label">Progressive Peak Requirement</span>
+        <span className="value">
+          {plan.progressive_peak_requirement === 0
+            ? "Fits without reclamation"
+            : formatBytes(plan.progressive_peak_requirement)}
+        </span>
+        <span />
+        <span className="label">Safety Reserve</span>
+        <span className="value">{formatBytes(plan.reserve)}</span>
+        <span />
+        <span className="label">Largest Recovery Unit</span>
+        <span className="value">{formatBytes(plan.largest_unit_bytes)}</span>
+        <span />
+        <span className="label">Estimated Space Reclaimed</span>
+        <span className="value">{formatBytes(plan.estimated_source_reclaim)}</span>
+        <span />
+      </div>
+
+      {plan.progressive_feasible ? (
+        <div className="verdict ok">
+          <strong>
+            {plan.normal_feasible
+              ? "Normal and Low-Space extraction are feasible."
+              : "Low-Space extraction is feasible with the current space plan."}
+          </strong>
+        </div>
+      ) : (
+        <div className="verdict bad">
+          <strong>Progressive extraction is not feasible with the current space plan.</strong>
+          {plan.reason && (
+            <div style={{ marginTop: 4, color: "var(--text-dim)" }}>
+              Reason: {plan.reason}
+            </div>
+          )}
+        </div>
+      )}
+
+      <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", marginTop: 14 }}>
+        <button
+          disabled={running || !plan.normal_feasible}
+          onClick={onStartNormal}
+        >
+          Normal Extraction
+        </button>
+        <button
+          className="primary"
+          disabled={running || !plan.progressive_feasible}
+          onClick={onStartLowSpace}
+        >
+          Low-Space Extraction
+        </button>
+      </div>
+    </section>
   );
 }
 
@@ -930,20 +839,25 @@ function ProgressView({
   onDone: () => void;
   onResume: () => void;
 }) {
-  const isFinishedSuccess = progress.finished && !progress.error && !progress.paused && !progress.cancelled;
+  const isFinishedSuccess =
+    progress.finished && !progress.error && !progress.paused && !progress.cancelled;
 
   if (isFinishedSuccess) {
+    const completionCopy = progress.hadRedirections
+      ? "Extraction completed. All extractable files were verified and committed. Link/redirection entries were skipped according to the configured safety policy."
+      : "Extraction completed. All extractable files were verified and committed.";
+
     return (
       <div className="layout">
-        <div className="panel" style={{ borderTop: "3px solid var(--ok)" }}>
-          <h2 style={{ color: "var(--ok)", fontSize: 16 }}>
-            🎉 Extraction Completed Successfully!
+        <section className="panel" style={{ borderTop: "3px solid var(--ok)" }}>
+          <h2 style={{ color: "var(--ok)", fontSize: 15 }}>
+            Extraction Completed
           </h2>
-          <div className="summary" style={{ fontSize: 13.5, margin: "6px 0 16px" }}>
-            All archive items have been extracted, verified with BLAKE3 cryptographic hashes, and safely committed.
+          <div className="summary" style={{ margin: "6px 0 16px" }}>
+            {completionCopy}
           </div>
           <div className="plan-grid" style={{ marginBottom: 16 }}>
-            <span className="label">Destination Folder</span>
+            <span className="label">Destination</span>
             <span className="value mono" style={{ textAlign: "left", wordBreak: "break-all" }}>
               {destination}
             </span>
@@ -957,19 +871,19 @@ function ProgressView({
             <span className="label">Source Reclaimed</span>
             <span className="value">{formatBytes(progress.reclaimedBytes)}</span>
             <span />
-            <span className="label">Current Free Disk Space</span>
+            <span className="label">Current Free Space</span>
             <span className="value">
               {progress.freeSpace !== null ? formatBytes(progress.freeSpace) : "—"}
             </span>
             <span />
           </div>
           <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
-            <button onClick={() => openFolder(destination)}>📁 Open Output Folder</button>
+            <button onClick={() => openFolder(destination)}>Open Output Folder</button>
             <button className="primary" onClick={onDone}>
               Extract Another Archive
             </button>
           </div>
-        </div>
+        </section>
       </div>
     );
   }
@@ -977,12 +891,12 @@ function ProgressView({
   if (progress.paused) {
     return (
       <div className="layout">
-        <div className="panel" style={{ borderTop: "3px solid var(--warning)" }}>
+        <section className="panel" style={{ borderTop: "3px solid var(--warning)" }}>
           <h2 style={{ color: "var(--warning)", fontSize: 15 }}>
-            ⏸️ Extraction Paused
+            Extraction Paused
           </h2>
           <div className="summary" style={{ margin: "6px 0 16px" }}>
-            The extraction paused at a safe transaction boundary. Reclaimed source data remains intact and the job is ready to resume.
+            The current recovery unit remains recoverable. Source ranges reclaimed by completed units cannot be restored.
           </div>
           <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
             <button onClick={onDone}>Back to Home</button>
@@ -990,7 +904,7 @@ function ProgressView({
               Resume Extraction
             </button>
           </div>
-        </div>
+        </section>
       </div>
     );
   }
@@ -1007,7 +921,7 @@ function ProgressView({
 
   return (
     <div className="layout">
-      <div className="panel">
+      <section className="panel">
         <h2>Extraction in Progress</h2>
         <div className="summary">
           Job <span className="strong">{progress.jobId.slice(0, 8)}</span>
@@ -1018,7 +932,7 @@ function ProgressView({
         {progress.preTest ? (
           <>
             <div className="summary" style={{ display: "flex", justifyContent: "space-between" }}>
-              <span>🔍 Verifying archive integrity before progressive extraction…</span>
+              <span>Verifying archive integrity before progressive extraction…</span>
               <span>
                 {formatBytes(progress.preTest.current)} / {formatBytes(progress.preTest.total)} ({preTestPct.toFixed(1)}%)
               </span>
@@ -1036,7 +950,7 @@ function ProgressView({
         ) : (
           <>
             <div className="summary" style={{ display: "flex", justifyContent: "space-between" }}>
-              <span>📄 {progress.currentEntry || "Preparing files…"}</span>
+              <span>{progress.currentEntry || "Preparing files…"}</span>
               {progress.entryTotal > 0 && (
                 <span>
                   {formatBytes(progress.entryCurrent)} / {formatBytes(progress.entryTotal)} ({entryPct.toFixed(1)}%)
@@ -1080,8 +994,209 @@ function ProgressView({
           )}
         </div>
         <div className="summary" style={{ color: "var(--text-dim)", fontSize: 12, marginTop: 10 }}>
-          Pause and Stop Safely finish or safely abort at the current recovery unit and keep the
+          Pause and Stop Safely finish or safely abort at the current recovery unit and keep its
           source intact. Cancel keeps the job resumable; previously reclaimed source data cannot be restored.
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function RecoveryViewComponent({
+  archive,
+  recovery,
+  interrupted,
+  recoveryPassword,
+  onPasswordChange,
+  onSelectJob,
+  onResume,
+  onInspect,
+  onAbandon,
+  onBackToHome,
+}: {
+  archive: string;
+  recovery: RecoveryView | null;
+  interrupted: JobListEntry[];
+  recoveryPassword: string;
+  onPasswordChange: (p: string) => void;
+  onSelectJob: (j: JobListEntry) => void;
+  onResume: () => void;
+  onInspect: () => void;
+  onAbandon: () => void;
+  onBackToHome: () => void;
+}) {
+  return (
+    <div className="layout">
+      <section className="panel">
+        <h2>Interrupted Extractions</h2>
+        {recovery ? (
+          <>
+            <div className="summary">
+              Archive: <span className="strong">{recovery.archive}</span>
+              <br />
+              Destination: <span className="strong">{recovery.destination}</span>
+            </div>
+            <div className="recovery-stats">
+              <span className="label">Committed output</span>
+              <span className="value">{formatBytes(recovery.committed_output_bytes)}</span>
+              <span className="label">Source reclaimed</span>
+              <span className="value">{formatBytes(recovery.source_reclaimed_bytes)}</span>
+              <span className="label">Remaining source</span>
+              <span className="value">{formatBytes(recovery.remaining_source_bytes)}</span>
+              <span className="label">Last safe checkpoint</span>
+              <span className="value">{recovery.last_checkpoint}</span>
+            </div>
+            {recovery.units.length > 0 && (
+              <div style={{ maxHeight: 140, overflow: "auto", marginTop: 8 }}>
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Unit</th>
+                      <th>State</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {recovery.units.map((u) => (
+                      <tr key={u.seq}>
+                        <td>{u.seq}</td>
+                        <td>
+                          <span
+                            className={
+                              u.state.includes("COMMITTED") || u.state.includes("RECLAIMED")
+                                ? "status done"
+                                : "status pending"
+                            }
+                          >
+                            {u.state}
+                          </span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            {recovery.errors.length > 0 && (
+              <div style={{ marginTop: 8, fontSize: 12 }}>
+                <span className="warning-text">Recorded errors:</span>
+                {recovery.errors.map((e, i) => (
+                  <div key={i} className="mono" style={{ color: "var(--text-dim)" }}>
+                    {e}
+                  </div>
+                ))}
+              </div>
+            )}
+          </>
+        ) : (
+          <div className="summary">
+            Select an interrupted job to inspect its recovery state.
+          </div>
+        )}
+        {interrupted.length > 0 && (
+          <div style={{ marginTop: 10 }}>
+            <table>
+              <thead>
+                <tr>
+                  <th>Job</th>
+                  <th>Archive</th>
+                  <th>Destination</th>
+                </tr>
+              </thead>
+              <tbody>
+                {interrupted.map((j) => (
+                  <tr
+                    key={j.job_id}
+                    style={{ cursor: "pointer" }}
+                    onClick={() => onSelectJob(j)}
+                    title="Click to select this job"
+                  >
+                    <td className="mono">{j.job_id.slice(0, 8)}</td>
+                    <td>{j.archive}</td>
+                    <td>{j.destination}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+        <div style={{ marginTop: 12 }}>
+          <label style={{ display: "block", fontSize: 12, marginBottom: 4, color: "var(--text-dim)" }}>
+            Archive Password (if encrypted):
+          </label>
+          <input
+            type="password"
+            placeholder="Enter password to resume…"
+            value={recoveryPassword}
+            onChange={(e) => onPasswordChange(e.target.value)}
+            style={{ width: "100%", maxWidth: 360 }}
+          />
+        </div>
+        <div style={{ display: "flex", gap: 8, justifyContent: "space-between", marginTop: 12 }}>
+          <button onClick={onBackToHome}>Back to Extract</button>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button className="primary" onClick={onResume} disabled={!archive}>
+              Resume
+            </button>
+            <button onClick={onInspect} disabled={!archive}>
+              Inspect
+            </button>
+            <button className="danger" onClick={onAbandon} disabled={!archive}>
+              Abandon Job
+            </button>
+          </div>
+        </div>
+        <div className="summary" style={{ color: "var(--text-dim)", fontSize: 12, marginTop: 10 }}>
+          Previously reclaimed source data cannot be restored.
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function ExtractChoiceModal({
+  pendingChoice,
+  onClose,
+  onConfirm,
+}: {
+  pendingChoice: "normal" | "low" | null;
+  onClose: () => void;
+  onConfirm: (lowSpace: boolean) => void;
+}) {
+  return (
+    <div className="overlay">
+      <div className="dialog">
+        <h2>Confirm Extraction</h2>
+        <div className="body">
+          <p>
+            <strong>Normal Extraction</strong> preserves the original source archive on disk.
+          </p>
+          <p>
+            <strong>Low-Space Extraction</strong> progressively deallocates verified source byte ranges
+            during extraction to fit within constrained disk space.
+          </p>
+          {pendingChoice === "low" && (
+            <p className="danger-text">
+              Low-Space Extraction is irreversible for completed units. Previously reclaimed source
+              ranges cannot be restored.
+            </p>
+          )}
+        </div>
+        <div className="actions">
+          <button onClick={onClose}>Cancel</button>
+          {pendingChoice === "low" ? (
+            <>
+              <button className="primary" onClick={() => onConfirm(true)}>
+                Start Low-Space Extraction
+              </button>
+              <button onClick={() => onConfirm(false)}>
+                Normal Extraction
+              </button>
+            </>
+          ) : (
+            <button className="primary" onClick={() => onConfirm(false)}>
+              Start Extraction
+            </button>
+          )}
         </div>
       </div>
     </div>
@@ -1097,8 +1212,12 @@ function SettingsDialog({ onClose }: { onClose: () => void }) {
   if (!settings) return null;
 
   const save = async () => {
-    await setSettings(settings);
-    onClose();
+    try {
+      await setSettings(settings);
+      onClose();
+    } catch (e) {
+      alert(`Failed to save settings: ${e}`);
+    }
   };
 
   return (
@@ -1131,20 +1250,6 @@ function SettingsDialog({ onClose }: { onClose: () => void }) {
               type="checkbox"
               checked={settings.pre_test}
               onChange={(e) => setSettingsState({ ...settings, pre_test: e.target.checked })}
-            />
-            <span>Write BLAKE3 checksum manifest</span>
-            <input
-              type="checkbox"
-              checked={settings.write_manifest}
-              onChange={(e) => setSettingsState({ ...settings, write_manifest: e.target.checked })}
-            />
-            <span>Retain previous recovery unit (Safe mode)</span>
-            <input
-              type="checkbox"
-              checked={settings.retain_previous_unit}
-              onChange={(e) =>
-                setSettingsState({ ...settings, retain_previous_unit: e.target.checked })
-              }
             />
             <span>Delete source shells on completion</span>
             <input
