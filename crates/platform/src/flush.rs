@@ -1,4 +1,4 @@
-﻿//! Durable flushes. The engine treats a failed flush as a failed job — never
+//! Durable flushes. The engine treats a failed flush as a failed job — never
 //! silently continued.
 
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
@@ -40,7 +40,10 @@ pub fn flush_file(file: &std::fs::File, path: &Path) -> Result<(), PlatformError
 pub fn flush_directory(path: &Path) -> Result<(), PlatformError> {
     use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
 
-    let name: Vec<u16> = extend_path(path)?.encode_utf16().chain(std::iter::once(0)).collect();
+    let name: Vec<u16> = extend_path(path)?
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let result = unsafe {
         CreateFileW(
             PCWSTR(name.as_ptr()),
@@ -81,5 +84,3 @@ pub fn directory_flush_supported(filesystem_name: &str) -> bool {
     let n = filesystem_name.to_ascii_lowercase();
     matches!(n.as_str(), "ntfs" | "refs")
 }
-
-

@@ -1,4 +1,4 @@
-﻿//! Long-path-safe helpers.
+//! Long-path-safe helpers.
 //!
 //! Windows paths longer than 260 characters require the extended-length
 //! prefix `\\?\`. Note that `\\?\` disables dot-segment normalization, so this
@@ -20,7 +20,9 @@ pub fn extend_path(path: &Path) -> Result<String, PlatformError> {
         p
     } else {
         std::env::current_dir()
-            .map_err(|e| PlatformError::from_io(PlatformErrorKind::Io, "resolve current directory", None, &e))?
+            .map_err(|e| {
+                PlatformError::from_io(PlatformErrorKind::Io, "resolve current directory", None, &e)
+            })?
             .join(&p)
     };
 
@@ -51,8 +53,14 @@ pub fn rename_existing(src: &Path, dst: &Path) -> Result<(), PlatformError> {
         MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     };
 
-    let src_w: Vec<u16> = extend_path(src)?.encode_utf16().chain(std::iter::once(0)).collect();
-    let dst_w: Vec<u16> = extend_path(dst)?.encode_utf16().chain(std::iter::once(0)).collect();
+    let src_w: Vec<u16> = extend_path(src)?
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let dst_w: Vec<u16> = extend_path(dst)?
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let result = unsafe {
         MoveFileExW(
             windows::core::PCWSTR(src_w.as_ptr()),

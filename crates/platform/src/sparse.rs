@@ -14,14 +14,14 @@ use std::path::Path;
 
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, OPEN_ALWAYS, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, FILE_READ_DATA,
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_READ_DATA, OPEN_EXISTING,
 };
-use windows::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_SHARE_DELETE};
-use windows::Win32::System::IO::DeviceIoControl;
+use windows::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
 use windows::Win32::System::Ioctl::{
-    FILE_ALLOCATED_RANGE_BUFFER, FILE_ZERO_DATA_INFORMATION, FSCTL_QUERY_ALLOCATED_RANGES, FSCTL_SET_SPARSE,
-    FSCTL_SET_ZERO_DATA,
+    FILE_ALLOCATED_RANGE_BUFFER, FILE_ZERO_DATA_INFORMATION, FSCTL_QUERY_ALLOCATED_RANGES,
+    FSCTL_SET_SPARSE, FSCTL_SET_ZERO_DATA,
 };
+use windows::Win32::System::IO::DeviceIoControl;
 
 use crate::error::{PlatformError, PlatformErrorKind};
 use crate::fs::allocated_size;
@@ -40,6 +40,20 @@ impl ByteRange {
     /// Last byte offset (exclusive).
     pub fn end(&self) -> u64 {
         self.start.saturating_add(self.len)
+    }
+
+    /// Intersect this range with another.
+    pub fn intersect(&self, other: &ByteRange) -> Option<ByteRange> {
+        let start = self.start.max(other.start);
+        let end = self.end().min(other.end());
+        if start < end {
+            Some(ByteRange {
+                start,
+                len: end - start,
+            })
+        } else {
+            None
+        }
     }
 }
 
@@ -138,13 +152,20 @@ pub fn align_inward(range: ByteRange, cluster: u32) -> Option<ByteRange> {
     if start >= end {
         return None;
     }
-    Some(ByteRange { start, len: end - start })
+    Some(ByteRange {
+        start,
+        len: end - start,
+    })
 }
 
 /// Deallocate the given byte range of a sparse file via `FSCTL_SET_ZERO_DATA`.
 ///
 /// The bytes read back as zero afterwards. Only whole clusters are released.
-pub fn zero_range(file: &std::fs::File, path: &Path, range: ByteRange) -> Result<(), PlatformError> {
+pub fn zero_range(
+    file: &std::fs::File,
+    path: &Path,
+    range: ByteRange,
+) -> Result<(), PlatformError> {
     let buffer = FILE_ZERO_DATA_INFORMATION {
         FileOffset: range.start as i64,
         BeyondFinalZero: range.end() as i64,
@@ -265,6 +286,39 @@ pub fn query_allocated_ranges(
     Ok(all_ranges)
 }
 
+/// Subtract a set of intervals (`after`) from another set (`before`),
+/// returning the exact set of deallocated intervals.
+pub fn subtract_intervals(before: &[ByteRange], after: &[ByteRange]) -> Vec<ByteRange> {
+    let mut reclaimed = Vec::new();
+    for b in before {
+        let mut current_pieces = vec![*b];
+        for a in after {
+            let mut next_pieces = Vec::new();
+            for p in current_pieces {
+                if !ranges_overlap(&p, a) {
+                    next_pieces.push(p);
+                } else {
+                    if p.start < a.start {
+                        next_pieces.push(ByteRange {
+                            start: p.start,
+                            len: a.start - p.start,
+                        });
+                    }
+                    if a.end() < p.end() {
+                        next_pieces.push(ByteRange {
+                            start: a.end(),
+                            len: p.end() - a.end(),
+                        });
+                    }
+                }
+            }
+            current_pieces = next_pieces;
+        }
+        reclaimed.extend(current_pieces);
+    }
+    reclaimed
+}
+
 /// Reclaim a byte range of a file: mark sparse if needed, zero the aligned
 /// range, then verify actual deallocation with an allocation query.
 ///
@@ -279,36 +333,36 @@ pub fn reclaim_range(
 ) -> Result<ReclaimReport, PlatformError> {
     let cluster = crate::fs::cluster_size(path)?;
     let Some(aligned) = align_inward(range, cluster) else {
+        let before = query_allocated_ranges(file, path, range.start, range.len)?;
+        let alloc_bytes = before.iter().map(|r| r.len).sum();
         return Ok(ReclaimReport {
             requested: range,
             reclaimed: vec![],
-            remaining: vec![range],
-            allocated_before: 0,
-            allocated_after: 0,
+            remaining: before,
+            allocated_before: alloc_bytes,
+            allocated_after: alloc_bytes,
         });
     };
 
     let before = query_allocated_ranges(file, path, aligned.start, aligned.len)?;
+    let allocated_before: u64 = before.iter().map(|r| r.len).sum();
 
     if !before.is_empty() {
         zero_range(file, path, aligned)?;
     }
 
     let after = query_allocated_ranges(file, path, aligned.start, aligned.len)?;
+    let allocated_after: u64 = after.iter().map(|r| r.len).sum();
 
-    let reclaimed: Vec<ByteRange> = before
-        .iter()
-        .filter(|b| !after.iter().any(|a| ranges_overlap(b, a)))
-        .copied()
-        .collect();
+    let reclaimed = subtract_intervals(&before, &after);
     let remaining = after;
 
     Ok(ReclaimReport {
         requested: aligned,
         reclaimed,
         remaining,
-        allocated_before: 0,
-        allocated_after: 0,
+        allocated_before,
+        allocated_after,
     })
 }
 
@@ -326,7 +380,10 @@ pub fn open_for_query(path: &Path) -> Result<std::fs::File, PlatformError> {
     use std::os::windows::io::FromRawHandle;
     use windows::Win32::Foundation::GENERIC_READ;
 
-    let name: Vec<u16> = extend_path(path)?.encode_utf16().chain(std::iter::once(0)).collect();
+    let name: Vec<u16> = extend_path(path)?
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let result = unsafe {
         CreateFileW(
             windows::core::PCWSTR(name.as_ptr()),
@@ -350,18 +407,22 @@ pub fn open_for_query(path: &Path) -> Result<std::fs::File, PlatformError> {
 }
 
 /// Open a file for read/write access to the archive (needed for reclamation).
+/// Uses OPEN_EXISTING so a missing source file is never recreated accidentally.
 pub fn open_for_reclaim(path: &Path) -> Result<std::fs::File, PlatformError> {
     use std::os::windows::io::FromRawHandle;
     use windows::Win32::Foundation::GENERIC_READ;
 
-    let name: Vec<u16> = extend_path(path)?.encode_utf16().chain(std::iter::once(0)).collect();
+    let name: Vec<u16> = extend_path(path)?
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let result = unsafe {
         CreateFileW(
             windows::core::PCWSTR(name.as_ptr()),
             GENERIC_READ.0 | windows::Win32::Foundation::GENERIC_WRITE.0,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             None,
-            OPEN_ALWAYS,
+            OPEN_EXISTING,
             FILE_ATTRIBUTE_NORMAL,
             None,
         )
@@ -381,6 +442,21 @@ pub fn open_for_reclaim(path: &Path) -> Result<std::fs::File, PlatformError> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn test_open_for_reclaim_fails_closed_when_file_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_path = dir.path().join("non_existent_archive.rar");
+        let result = open_for_reclaim(&missing_path);
+        assert!(
+            result.is_err(),
+            "open_for_reclaim must fail when file does not exist"
+        );
+        assert!(
+            !missing_path.exists(),
+            "open_for_reclaim must NOT create a 0-byte file"
+        );
+    }
 
     #[test]
     fn test_many_sparse_ranges_query_succeeds() {
@@ -414,5 +490,56 @@ mod tests {
 
         let alloc_size = crate::fs::allocated_size_from_handle(&file, &file_path).unwrap();
         assert!(alloc_size > 0, "allocated size should be non-zero");
+    }
+
+    #[test]
+    fn test_subtract_intervals_exact() {
+        // Full deallocation
+        let before = vec![ByteRange {
+            start: 0,
+            len: 1000,
+        }];
+        let after = vec![];
+        let diff = subtract_intervals(&before, &after);
+        assert_eq!(
+            diff,
+            vec![ByteRange {
+                start: 0,
+                len: 1000
+            }]
+        );
+
+        // Partial middle deallocation
+        let before = vec![ByteRange {
+            start: 0,
+            len: 1000,
+        }];
+        let after = vec![
+            ByteRange { start: 0, len: 200 },
+            ByteRange {
+                start: 800,
+                len: 200,
+            },
+        ];
+        let diff = subtract_intervals(&before, &after);
+        assert_eq!(
+            diff,
+            vec![ByteRange {
+                start: 200,
+                len: 600
+            }]
+        );
+
+        // No deallocation
+        let before = vec![ByteRange {
+            start: 100,
+            len: 500,
+        }];
+        let after = vec![ByteRange {
+            start: 100,
+            len: 500,
+        }];
+        let diff = subtract_intervals(&before, &after);
+        assert!(diff.is_empty());
     }
 }

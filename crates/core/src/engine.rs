@@ -1,4 +1,4 @@
-﻿//! The transactional extraction engine.
+//! The transactional extraction engine.
 //!
 //! Guarantees (see SAFETY_MODEL.md):
 //! - source bytes are reclaimed only after their unit is completely decoded,
@@ -74,10 +74,15 @@ impl JobHandle {
 /// Result of running a job.
 #[derive(Debug)]
 pub enum JobOutcome {
-    Completed { committed_bytes: u64, reclaimed_bytes: u64 },
+    Completed {
+        committed_bytes: u64,
+        reclaimed_bytes: u64,
+    },
     Paused,
     Cancelled,
-    Failed { failure: crate::error::FailureInfo },
+    Failed {
+        failure: crate::error::FailureInfo,
+    },
 }
 
 /// Observe free space on the volume containing `dir`.
@@ -92,7 +97,7 @@ pub fn observed_free_space(dir: &Path) -> Result<u64, CoreError> {
             return Ok(bytes);
         }
     }
-free_space(dir).map_err(CoreError::Platform)
+    free_space(dir).map_err(CoreError::Platform)
 }
 
 /// The partial-name suffix for one extraction attempt.
@@ -123,7 +128,7 @@ impl Engine {
             .unwrap_or_else(|| PathBuf::from(".reclaimarc").join(job_id))
     }
 
-    /// Analyze an archive for a destination: full inspection + space plan.
+    /// Analyze an archive for a destination: full inspection + space plan with real volume measurements.
     pub fn analyze(
         &self,
         archive: &Path,
@@ -134,7 +139,28 @@ impl Engine {
         let info = backend.inspect(&OpenOptions { password })?;
         let free = observed_free_space(destination)?;
         let total = total_space(destination).map_err(CoreError::Platform)?;
-        let plan = crate::planner::plan(&info, free, total, &self.config)?;
+        let cluster = reclaimarc_platform::fs::cluster_size(destination).ok();
+        let mut allocated_by_vol = std::collections::HashMap::new();
+        for v in &info.volumes {
+            if let Ok(handle) = reclaimarc_platform::sparse::open_for_query(&v.path) {
+                if let Ok(ranges) = reclaimarc_platform::sparse::query_allocated_ranges(
+                    &handle,
+                    &v.path,
+                    0,
+                    v.logical_size,
+                ) {
+                    allocated_by_vol.insert(v.index, ranges);
+                }
+            }
+        }
+        let plan = crate::planner::plan_with_measurements(
+            &info,
+            free,
+            total,
+            cluster,
+            Some(&allocated_by_vol),
+            &self.config,
+        )?;
         Ok((info, plan))
     }
 
@@ -147,10 +173,12 @@ impl Engine {
         mode: ExtractionMode,
         password: Option<String>,
         tx: Sender<Event>,
-    ) -> Result<(JobHandle, JobJob), CoreError> {
+    ) -> Result<(JobHandle, ExtractionJob), CoreError> {
         let job_id = uuid::Uuid::new_v4().to_string();
-let mut backend = reclaimarc_archive::backend_for(archive)?;
-        let info = backend.inspect(&OpenOptions { password: password.clone() })?;
+        let mut backend = reclaimarc_archive::backend_for(archive)?;
+        let info = backend.inspect(&OpenOptions {
+            password: password.clone(),
+        })?;
 
         // Destination must exist before any probe runs against it.
         if !destination.exists() {
@@ -168,7 +196,28 @@ let mut backend = reclaimarc_archive::backend_for(archive)?;
 
         let free = observed_free_space(destination)?;
         let total = total_space(destination).map_err(CoreError::Platform)?;
-        let plan = crate::planner::plan(&info, free, total, &self.config)?;
+        let cluster = reclaimarc_platform::fs::cluster_size(destination).ok();
+        let mut allocated_by_vol = std::collections::HashMap::new();
+        for v in &info.volumes {
+            if let Ok(handle) = reclaimarc_platform::sparse::open_for_query(&v.path) {
+                if let Ok(ranges) = reclaimarc_platform::sparse::query_allocated_ranges(
+                    &handle,
+                    &v.path,
+                    0,
+                    v.logical_size,
+                ) {
+                    allocated_by_vol.insert(v.index, ranges);
+                }
+            }
+        }
+        let plan = crate::planner::plan_with_measurements(
+            &info,
+            free,
+            total,
+            cluster,
+            Some(&allocated_by_vol),
+            &self.config,
+        )?;
 
         match mode {
             ExtractionMode::Normal => {
@@ -182,11 +231,9 @@ let mut backend = reclaimarc_archive::backend_for(archive)?;
             }
             ExtractionMode::LowSpace => {
                 if !plan.progressive_feasible {
-                    return Err(CoreError::Infeasible(
-                        plan.reason.clone().unwrap_or_else(|| {
-                            "Progressive extraction is not possible on this volume.".into()
-                        }),
-                    ));
+                    return Err(CoreError::Infeasible(plan.reason.clone().unwrap_or_else(
+                        || "Progressive extraction is not possible on this volume.".into(),
+                    )));
                 }
                 let same = same_storage_pool(archive, destination).map_err(CoreError::Platform)?;
                 if !same {
@@ -204,14 +251,15 @@ let mut backend = reclaimarc_archive::backend_for(archive)?;
             }
         }
 
-// Validate every entry name before anything is written.
+        // Validate every entry name before anything is written.
         let (safe_entries, name_map) = self.validate_entries(&info)?;
 
         let journal_dir = Self::journal_dir(archive, &job_id);
         let journal_path = journal_dir.join("job.db");
         let now = reclaimarc_journal::now_iso();
-let settings_json = {
-            let mut v = serde_json::to_value(&self.config).unwrap_or_else(|_| serde_json::json!({}));
+        let settings_json = {
+            let mut v =
+                serde_json::to_value(&self.config).unwrap_or_else(|_| serde_json::json!({}));
             v["mode"] = serde_json::json!(match mode {
                 ExtractionMode::Normal => "normal",
                 ExtractionMode::LowSpace => "lowspace",
@@ -232,13 +280,17 @@ let settings_json = {
         };
         let mut journal = JobJournal::create(&journal_path, &meta).map_err(CoreError::Journal)?;
 
-// Volumes with durable identity snapshots.
+        let (struct_digests, range_digests) =
+            compute_source_manifest(&info.volumes, &info.recovery_units)?;
+
+        // Volumes with durable identity snapshots and structural digests.
         let mut volumes = Vec::new();
         for (i, v) in info.volumes.iter().enumerate() {
             let ident = file_identity(&v.path).map_err(CoreError::Platform)?;
-            let handle =
-                reclaimarc_platform::sparse::open_for_query(&v.path).map_err(CoreError::Platform)?;
-            let allocated = allocated_size_from_handle(&handle, &v.path).map_err(CoreError::Platform)?;
+            let handle = reclaimarc_platform::sparse::open_for_query(&v.path)
+                .map_err(CoreError::Platform)?;
+            let allocated =
+                allocated_size_from_handle(&handle, &v.path).map_err(CoreError::Platform)?;
             volumes.push(VolumeRecord {
                 path: v.path.clone(),
                 identity: Some(FileIdentity {
@@ -250,6 +302,7 @@ let settings_json = {
                 allocated_before: allocated,
                 logical_size: v.logical_size,
                 is_first: i == 0,
+                structural_digest: struct_digests.get(i).cloned(),
             });
         }
         journal.add_volumes(&volumes).map_err(CoreError::Journal)?;
@@ -269,7 +322,7 @@ let settings_json = {
             .collect();
         journal.add_units(&units).map_err(CoreError::Journal)?;
 
-// Entries with validated output paths, mapped to their recovery unit.
+        // Entries with validated output paths, mapped to their recovery unit.
         let entries: Vec<EntryRecord> = info
             .entries
             .iter()
@@ -283,6 +336,7 @@ let settings_json = {
                     .find(|u| e.index >= u.first_entry && e.index <= u.last_entry)
                     .map(|u| u.seq)
                     .unwrap_or(0);
+                let existed_before_job = final_path.exists();
                 EntryRecord {
                     index_in_archive: e.index,
                     name: e.name.clone(),
@@ -299,28 +353,41 @@ let settings_json = {
                     partial_path: Some(partial),
                     blake3: None,
                     status: EntryStatus::Pending,
+                    actual_committed_path: None,
+                    existed_before_job,
+                    expected_digest: None,
+                    is_redirection: e.redirection.is_some(),
+                    redirection_kind: e.redirection.as_ref().map(|r| format!("{:?}", r.kind)),
                 }
             })
             .collect();
         journal.add_entries(&entries).map_err(CoreError::Journal)?;
 
-        // Packed ranges.
+        // Packed ranges with cryptographic BLAKE3 hashes.
         let mut ranges = Vec::new();
         for u in &info.recovery_units {
             for r in &u.packed_ranges {
+                let digest = range_digests
+                    .get(&(r.volume_index, r.start, r.len))
+                    .cloned();
                 ranges.push(PackedRangeRecord {
                     volume_index: r.volume_index,
                     start: r.start,
                     len: r.len,
                     state: RangeState::Active,
                     recovery_unit: Some(u.seq),
+                    physically_released_bytes: 0,
+                    blake3_digest: digest,
                 });
             }
         }
-        journal.add_packed_ranges(&ranges).map_err(CoreError::Journal)?;
+        journal
+            .add_packed_ranges(&ranges)
+            .map_err(CoreError::Journal)?;
 
         // Registry mirror in application data.
-        let mut registry = Registry::open(&Registry::default_app_data_dir()).map_err(CoreError::Journal)?;
+        let mut registry =
+            Registry::open(&Registry::default_app_data_dir()).map_err(CoreError::Journal)?;
         registry
             .upsert(&RegistryEntry {
                 job_id: job_id.clone(),
@@ -347,7 +414,7 @@ let settings_json = {
                 pause: Arc::new(AtomicBool::new(false)),
                 cancel: Arc::new(AtomicBool::new(false)),
             },
-            JobJob {
+            ExtractionJob {
                 job_id,
                 archive: archive.to_path_buf(),
                 destination: destination.to_path_buf(),
@@ -362,8 +429,86 @@ let settings_json = {
         ))
     }
 
+    /// Run a job to completion (or pause/cancel/failure).
+    pub fn run_job(
+        &mut self,
+        job: &mut ExtractionJob,
+        handle: &JobHandle,
+    ) -> Result<JobOutcome, CoreError> {
+        job.run(self.config.clone(), &handle.pause, &handle.cancel)
+    }
+
+    /// Resume an interrupted job from its journal.
+    ///
+    /// Runs the full recovery preparation (identity validation, partial
+    /// reconciliation, reclaim reconciliation) and returns a runnable job.
+    pub fn resume_job(
+        &self,
+        journal_path: &Path,
+        password: Option<String>,
+        tx: Sender<Event>,
+    ) -> Result<(JobHandle, ExtractionJob), CoreError> {
+        let journal = crate::recovery::prepare_resume(journal_path, None)?;
+        let meta = journal.job_meta().map_err(CoreError::Journal)?;
+        let mut backend = reclaimarc_archive::backend_for(&meta.archive_path)?;
+        let info = backend
+            .inspect(&OpenOptions {
+                password: password.clone(),
+            })
+            .map_err(|e| {
+                CoreError::failed(
+                    "re-inspect archive for resume",
+                    Some(meta.archive_path.clone()),
+                    None,
+                    "recovery",
+                    format!("cannot re-inspect the archive: {e}"),
+                    "If the archive was moved or renamed, the job cannot resume.",
+                )
+            })?;
+        let (_, name_map) = self.validate_entries(&info)?;
+        let mode = serde_json::from_str::<serde_json::Value>(&meta.settings_json)
+            .ok()
+            .and_then(|v| {
+                v.get("mode")
+                    .and_then(|m| m.as_str())
+                    .and_then(|m| match m {
+                        "normal" => Some(ExtractionMode::Normal),
+                        "lowspace" => Some(ExtractionMode::LowSpace),
+                        _ => None,
+                    })
+            })
+            .unwrap_or(ExtractionMode::Normal);
+
+        let job_id = meta.job_id.clone();
+        let _ = tx.send(Event::JobStarted {
+            job_id: job_id.clone(),
+        });
+        Ok((
+            JobHandle {
+                job_id: job_id.clone(),
+                pause: Arc::new(AtomicBool::new(false)),
+                cancel: Arc::new(AtomicBool::new(false)),
+            },
+            ExtractionJob {
+                job_id,
+                archive: meta.archive_path.clone(),
+                destination: meta.destination.clone(),
+                journal,
+                info,
+                backend,
+                name_map,
+                mode,
+                password,
+                tx,
+            },
+        ))
+    }
+
     /// Validate all entry names; returns safe entries and the name map.
-    fn validate_entries(&self, info: &ArchiveInfo) -> Result<(Vec<SafeEntry>, HashMap<u64, String>), CoreError> {
+    fn validate_entries(
+        &self,
+        info: &ArchiveInfo,
+    ) -> Result<(Vec<SafeEntry>, HashMap<u64, String>), CoreError> {
         let mut safe_entries = Vec::new();
         let mut name_map = HashMap::new();
         for e in &info.entries {
@@ -390,68 +535,6 @@ let settings_json = {
         }
         Ok((safe_entries, name_map))
     }
-
-/// Run a job to completion (or pause/cancel/failure).
-    pub fn run_job(&mut self, job: &mut JobJob, handle: &JobHandle) -> Result<JobOutcome, CoreError> {
-        job.run(self.config.clone(), &handle.pause, &handle.cancel)
-    }
-
-    /// Resume an interrupted job from its journal.
-    ///
-    /// Runs the full recovery preparation (identity validation, partial
-    /// reconciliation, reclaim reconciliation) and returns a runnable job.
-    pub fn resume_job(&self, journal_path: &Path, tx: Sender<Event>) -> Result<(JobHandle, JobJob), CoreError> {
-        let journal = crate::recovery::prepare_resume(journal_path, None)?;
-        let meta = journal.job_meta().map_err(CoreError::Journal)?;
-        let mut backend = reclaimarc_archive::backend_for(&meta.archive_path)?;
-        let info = backend
-            .inspect(&OpenOptions {
-                password: None,
-            })
-            .map_err(|e| {
-                CoreError::failed(
-                    "re-inspect archive for resume",
-                    Some(meta.archive_path.clone()),
-                    None,
-                    "recovery",
-                    format!("cannot re-inspect the archive: {e}"),
-                    "If the archive was moved or renamed, the job cannot resume.",
-                )
-            })?;
-        let (_, name_map) = self.validate_entries(&info)?;
-        let mode = serde_json::from_str::<serde_json::Value>(&meta.settings_json)
-            .ok()
-            .and_then(|v| v.get("mode").and_then(|m| m.as_str()).and_then(|m| match m {
-                "normal" => Some(ExtractionMode::Normal),
-                "lowspace" => Some(ExtractionMode::LowSpace),
-                _ => None,
-            }))
-            .unwrap_or(ExtractionMode::Normal);
-
-        let job_id = meta.job_id.clone();
-        let _ = tx.send(Event::JobStarted {
-            job_id: job_id.clone(),
-        });
-        Ok((
-            JobHandle {
-                job_id: job_id.clone(),
-                pause: Arc::new(AtomicBool::new(false)),
-                cancel: Arc::new(AtomicBool::new(false)),
-            },
-            JobJob {
-                job_id,
-                archive: meta.archive_path.clone(),
-                destination: meta.destination.clone(),
-                journal,
-                info,
-                backend,
-                name_map,
-                mode,
-                password: None,
-                tx,
-            },
-        ))
-    }
 }
 
 impl CoreError {
@@ -468,7 +551,7 @@ impl CoreError {
 }
 
 /// An active job: journal + archive info + control state.
-pub struct JobJob {
+pub struct ExtractionJob {
     pub job_id: String,
     pub archive: PathBuf,
     pub destination: PathBuf,
@@ -481,9 +564,9 @@ pub struct JobJob {
     pub tx: Sender<Event>,
 }
 
-impl std::fmt::Debug for JobJob {
+impl std::fmt::Debug for ExtractionJob {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("JobJob")
+        f.debug_struct("ExtractionJob")
             .field("job_id", &self.job_id)
             .field("archive", &self.archive)
             .field("destination", &self.destination)
@@ -492,7 +575,7 @@ impl std::fmt::Debug for JobJob {
     }
 }
 
-impl JobJob {
+impl ExtractionJob {
     /// Run the job. Blocking; call from a worker thread.
     pub fn run(
         &mut self,
@@ -555,7 +638,10 @@ impl JobJob {
             .map(|entries| {
                 entries
                     .iter()
-                    .filter(|e| e.status == reclaimarc_journal::models::EntryStatus::Committed && !e.is_directory)
+                    .filter(|e| {
+                        e.status == reclaimarc_journal::models::EntryStatus::Committed
+                            && !e.is_directory
+                    })
                     .map(|e| e.unpacked_size)
                     .sum::<u64>()
             })
@@ -601,7 +687,11 @@ impl JobJob {
         let unit_count = units.len();
         // Fast path: when every recovery unit is a single file, extract with
         // one decoder pass (avoids O(n²) per-unit re-walks of large archives).
-        let fast_path = self.info.recovery_units.iter().all(|u| u.first_entry == u.last_entry);
+        let fast_path = self
+            .info
+            .recovery_units
+            .iter()
+            .all(|u| u.first_entry == u.last_entry);
 
         // Per-attempt partial suffix: unique per run. The journal's entry
         // partial paths must match exactly what the decoder writes.
@@ -669,10 +759,28 @@ impl JobJob {
         let volumes = self.journal.volumes().map_err(CoreError::Journal)?;
         if destructive {
             for (idx, vol) in volumes.iter().enumerate() {
-                if let Ok(f) = open_for_reclaim(&vol.path) {
-                    let _ = set_sparse(&f, &vol.path);
-                    volume_handles.insert(idx as u64, f);
+                let f = open_for_reclaim(&vol.path).map_err(CoreError::Platform)?;
+                let ident = file_identity(&vol.path).map_err(CoreError::Platform)?;
+                if let Some(expected_id) = &vol.identity {
+                    if ident.volume_serial != expected_id.volume_serial
+                        || ident.file_id != expected_id.file_id
+                        || ident.file_size != expected_id.file_size
+                    {
+                        return Err(CoreError::failed(
+                            "source volume identity verification",
+                            Some(vol.path.clone()),
+                            None,
+                            "setup",
+                            format!(
+                                "Source volume '{}' identity changed before extraction",
+                                vol.path.display()
+                            ),
+                            "Aborting destructive extraction immediately to prevent data loss.",
+                        ));
+                    }
                 }
+                set_sparse(&f, &vol.path).map_err(CoreError::Platform)?;
+                volume_handles.insert(idx as u64, f);
             }
         }
 
@@ -703,7 +811,7 @@ impl JobJob {
 
             // Safety gate: enough capacity for output + scratch + reserve.
             validate_capacity_before_unit(&self.destination, unit, scratch, reserve)?;
-            if seq % 32 == 0 || seq + 1 == unit_count as u64 {
+            if seq.is_multiple_of(32) || seq + 1 == unit_count as u64 {
                 if let Ok(free) = observed_free_space(&self.destination) {
                     let _ = tx.send(Event::FreeSpace { bytes: free });
                 }
@@ -715,102 +823,176 @@ impl JobJob {
                     .set_unit_state(seq, UnitState::Extracting)
                     .map_err(CoreError::Journal)?;
 
-            let opts = ExtractOptions {
-                dest_dir: self.destination.clone(),
-                job_id: self.job_id.clone(),
-                partial_suffix: suffix.clone(),
-                password: self.password.clone(),
-                cancel: None,
-                name_map: self.name_map.clone(),
-            };
-            let mut progress_cb = |e: ProgressEvent| {
-                let _ = tx.send(match e {
-                    ProgressEvent::EntryProgress { entry_index, current, total } => {
-                        Event::EntryProgress { index: entry_index, current, total }
-                    }
-                });
-                // Pause = safe abort at the next file boundary.
-                !cancel_flag.load(Ordering::SeqCst) && !pause_flag.load(Ordering::SeqCst)
-            };
+                let opts = ExtractOptions {
+                    dest_dir: self.destination.clone(),
+                    job_id: self.job_id.clone(),
+                    partial_suffix: suffix.clone(),
+                    password: self.password.clone(),
+                    cancel: None,
+                    name_map: self.name_map.clone(),
+                };
+                let mut progress_cb = |e: ProgressEvent| {
+                    let _ = tx.send(match e {
+                        ProgressEvent::EntryProgress {
+                            entry_index,
+                            current,
+                            total,
+                        } => Event::EntryProgress {
+                            index: entry_index,
+                            current,
+                            total,
+                        },
+                    });
+                    // Pause = safe abort at the next file boundary.
+                    !cancel_flag.load(Ordering::SeqCst) && !pause_flag.load(Ordering::SeqCst)
+                };
 
-            if fast_path {
-                // The unit holds a single entry. Directories are created by
-                // the commit step; the streaming pass skips them for us.
-                let single = unit.first_entry;
-                let entry = self
-                    .info
-                    .entries
-                    .iter()
-                    .find(|e| e.index == single)
-                    .ok_or_else(|| CoreError::Precondition(format!("entry {single} not found")))?;
-                if !entry.is_directory {
-                    match self.backend.extract_next(&opts, Some(&mut progress_cb)) {
-                        Err(reclaimarc_archive::ArchiveError::Cancelled)
-                            if pause_flag.load(Ordering::SeqCst) =>
-                        {
-                            self.journal
-                                .set_job_progress(seq, JobState::Paused)
-                                .map_err(CoreError::Journal)?;
-                            let _ = tx.send(Event::JobPaused { job_id: self.job_id.clone() });
-                            return Ok(JobOutcome::Paused);
-                        }
-                        Err(reclaimarc_archive::ArchiveError::Cancelled) => {
-                            let _ = tx.send(Event::JobCancelled { job_id: self.job_id.clone() });
-                            return Ok(JobOutcome::Cancelled);
-                        }
-                        Err(other) => return Err(CoreError::Archive(other)),
-                        Ok(None) => {
-                            return Err(CoreError::Precondition(format!(
-                                "streaming pass exhausted before unit {seq}"
-                            )));
-                        }
-                        Ok(Some(_)) => {}
-                    }
-                }
-            } else {
-                let extract = self.backend.extract_unit(seq, &opts, Some(&mut progress_cb));
-                if let Err(e) = extract {
-                    return match e {
-                        reclaimarc_archive::ArchiveError::Cancelled
-                            if pause_flag.load(Ordering::SeqCst) =>
-                        {
-                            self.journal
-                                .set_job_progress(seq, JobState::Paused)
-                                .map_err(CoreError::Journal)?;
-                            let _ = tx.send(Event::JobPaused { job_id: self.job_id.clone() });
-                            Ok(JobOutcome::Paused)
-                        }
-                        reclaimarc_archive::ArchiveError::Cancelled => {
-                            let _ = tx.send(Event::JobCancelled { job_id: self.job_id.clone() });
-                            Ok(JobOutcome::Cancelled)
-                        }
-                        other => Err(CoreError::Archive(other)),
-                    };
-                }
-            }
-            fault::fire(CrashPoint::AfterPartialWrite, &self.job_id);
+                let entries = self
+                    .journal
+                    .entries_for_unit(seq)
+                    .map_err(CoreError::Journal)?;
 
-            // ---- OUTPUT_WRITTEN → OUTPUT_DURABLE (one durable transaction) ----
-            // Verify each partial (size + BLAKE3), journal the verified
-            // hashes, then flush every partial durably. The intermediate
-            // states are journaled inside a single transaction; crash
-            // recovery treats any non-committed unit identically.
-            let entries = self.journal.entries_for_unit(seq).map_err(CoreError::Journal)?;
-            let mut written_bytes: u64 = 0;
-            if !reclaim_only {
-                let mut verified: Vec<(u64, String)> = Vec::new();
+                // Perform ancestry and reparse validation BEFORE allowing the decoder to write partial outputs
                 for entry in &entries {
-                    if entry.is_directory {
-                        continue;
+                    let entry_info = self
+                        .info
+                        .entries
+                        .iter()
+                        .find(|e| e.index == entry.index_in_archive)
+                        .ok_or_else(|| {
+                            CoreError::Precondition(format!(
+                                "entry {} not found in archive info",
+                                entry.index_in_archive
+                            ))
+                        })?;
+                    if !entry.is_directory && entry_info.redirection.is_none() {
+                        if let Some(final_path) = &entry.final_path {
+                            crate::paths::ensure_no_reparse_ancestors(
+                                final_path,
+                                &self.destination,
+                            )?;
+                        }
+                    } else if entry_info.redirection.is_some() {
+                        self.journal
+                            .set_entry_status(entry.index_in_archive, EntryStatus::Skipped)
+                            .map_err(CoreError::Journal)?;
                     }
-                    let partial = entry.partial_path.clone().ok_or_else(|| {
-                        CoreError::Precondition(format!(
-                            "entry {} has no partial path",
-                            entry.index_in_archive
-                        ))
-                    })?;
-                    let blake3 =
-                        verify_file(&partial, entry.unpacked_size, config.io_buffer_size).map_err(
+                }
+
+                // Pre-unit cryptographic verification: verify BLAKE3 of all active source packed ranges for this unit
+                let unit_ranges = self
+                    .journal
+                    .packed_ranges_for_unit(seq)
+                    .map_err(CoreError::Journal)?;
+                for r in &unit_ranges {
+                    if r.state == RangeState::Active {
+                        if let Some(expected_blake3) = &r.blake3_digest {
+                            let vol = volumes.get(r.volume_index as usize).ok_or_else(|| {
+                                CoreError::Precondition(format!(
+                                    "volume {} not found",
+                                    r.volume_index
+                                ))
+                            })?;
+                            verify_range_digest(&vol.path, r.start, r.len, expected_blake3)?;
+                        }
+                    }
+                }
+
+                if fast_path {
+                    // The unit holds a single entry.
+                    let single = unit.first_entry;
+                    let entry_info = self
+                        .info
+                        .entries
+                        .iter()
+                        .find(|e| e.index == single)
+                        .ok_or_else(|| {
+                            CoreError::Precondition(format!("entry {single} not found"))
+                        })?;
+                    if !entry_info.is_directory && entry_info.redirection.is_none() {
+                        match self.backend.extract_next(&opts, Some(&mut progress_cb)) {
+                            Err(reclaimarc_archive::ArchiveError::Cancelled)
+                                if pause_flag.load(Ordering::SeqCst) =>
+                            {
+                                self.journal
+                                    .set_job_progress(seq, JobState::Paused)
+                                    .map_err(CoreError::Journal)?;
+                                let _ = tx.send(Event::JobPaused {
+                                    job_id: self.job_id.clone(),
+                                });
+                                return Ok(JobOutcome::Paused);
+                            }
+                            Err(reclaimarc_archive::ArchiveError::Cancelled) => {
+                                let _ = tx.send(Event::JobCancelled {
+                                    job_id: self.job_id.clone(),
+                                });
+                                return Ok(JobOutcome::Cancelled);
+                            }
+                            Err(other) => return Err(CoreError::Archive(other)),
+                            Ok(None) => {
+                                return Err(CoreError::Precondition(format!(
+                                    "streaming pass exhausted before unit {seq}"
+                                )));
+                            }
+                            Ok(Some(_)) => {}
+                        }
+                    } else {
+                        // Directory or redirection: advance backend decoder by 1 entry
+                        let _ = self.backend.extract_next(&opts, Some(&mut progress_cb))?;
+                    }
+                } else {
+                    let extract = self
+                        .backend
+                        .extract_unit(seq, &opts, Some(&mut progress_cb));
+                    if let Err(e) = extract {
+                        return match e {
+                            reclaimarc_archive::ArchiveError::Cancelled
+                                if pause_flag.load(Ordering::SeqCst) =>
+                            {
+                                self.journal
+                                    .set_job_progress(seq, JobState::Paused)
+                                    .map_err(CoreError::Journal)?;
+                                let _ = tx.send(Event::JobPaused {
+                                    job_id: self.job_id.clone(),
+                                });
+                                Ok(JobOutcome::Paused)
+                            }
+                            reclaimarc_archive::ArchiveError::Cancelled => {
+                                let _ = tx.send(Event::JobCancelled {
+                                    job_id: self.job_id.clone(),
+                                });
+                                Ok(JobOutcome::Cancelled)
+                            }
+                            other => Err(CoreError::Archive(other)),
+                        };
+                    }
+                }
+                fault::fire(CrashPoint::AfterPartialWrite, &self.job_id);
+
+                // ---- OUTPUT_WRITTEN → OUTPUT_DURABLE (one durable transaction) ----
+                // Verify each partial (size + BLAKE3), journal the verified
+                // hashes, then flush every partial durably. The intermediate
+                // states are journaled inside a single transaction; crash
+                // recovery treats any non-committed unit identically.
+                let entries = self
+                    .journal
+                    .entries_for_unit(seq)
+                    .map_err(CoreError::Journal)?;
+                let mut written_bytes: u64 = 0;
+                if !reclaim_only {
+                    let mut verified: Vec<(u64, String)> = Vec::new();
+                    for entry in &entries {
+                        if entry.is_directory || entry.status == EntryStatus::Skipped {
+                            continue;
+                        }
+                        let partial = entry.partial_path.clone().ok_or_else(|| {
+                            CoreError::Precondition(format!(
+                                "entry {} has no partial path",
+                                entry.index_in_archive
+                            ))
+                        })?;
+                        let blake3 =
+                        verify_file(&partial, Some(entry.unpacked_size), config.io_buffer_size).map_err(
                             |e| {
                                 CoreError::failed(
                                     "verify partial output",
@@ -822,71 +1004,86 @@ impl JobJob {
                                 )
                             },
                         )?;
-                    let _ = tx.send(Event::EntryVerified {
-                        index: entry.index_in_archive,
-                        blake3: blake3.clone(),
-                    });
-                    written_bytes = written_bytes.saturating_add(entry.unpacked_size);
-                    verified.push((entry.index_in_archive, blake3));
+                        let _ = tx.send(Event::EntryVerified {
+                            index: entry.index_in_archive,
+                            blake3: blake3.clone(),
+                        });
+                        written_bytes = written_bytes.saturating_add(entry.unpacked_size);
+                        verified.push((entry.index_in_archive, blake3));
+                    }
+                    // Flush before journaling DURABLE so the bytes are on disk
+                    // when the journal says so.
+                    for entry in &entries {
+                        if entry.is_directory || entry.status == EntryStatus::Skipped {
+                            continue;
+                        }
+                        let partial = entry.partial_path.clone().unwrap();
+                        // FlushFileBuffers requires a write-capable handle.
+                        let file = std::fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .open(&partial)
+                            .map_err(|e| {
+                                CoreError::from_io_source("open partial for flush", &partial, e)
+                            })?;
+                        flush::flush_file(&file, &partial).map_err(CoreError::Platform)?;
+                    }
+                    self.journal
+                        .mark_unit_verified_durable(seq, &verified)
+                        .map_err(CoreError::Journal)?;
+                    fault::fire(CrashPoint::AfterOutputFlush, &self.job_id);
                 }
-                // Flush before journaling DURABLE so the bytes are on disk
-                // when the journal says so.
+
+                // ---- atomic rename to final name ----
+                let entries = self
+                    .journal
+                    .entries_for_unit(seq)
+                    .map_err(CoreError::Journal)?;
                 for entry in &entries {
-                    if entry.is_directory {
+                    if entry.is_directory || entry.status == EntryStatus::Skipped {
                         continue;
                     }
                     let partial = entry.partial_path.clone().unwrap();
-                    // FlushFileBuffers requires a write-capable handle.
-                    let file = std::fs::OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .open(&partial)
-                        .map_err(|e| {
-                            CoreError::from_io_source("open partial for flush", &partial, e)
-                        })?;
-                    flush::flush_file(&file, &partial).map_err(CoreError::Platform)?;
-                }
-                self.journal
-                    .mark_unit_verified_durable(seq, &verified)
-                    .map_err(CoreError::Journal)?;
-                fault::fire(CrashPoint::AfterOutputFlush, &self.job_id);
-            }
-
-            // ---- atomic rename to final name ----
-            for entry in &entries {
-                if entry.is_directory {
-                    continue;
-                }
-                let partial = entry.partial_path.clone().unwrap();
-                let final_path = entry.final_path.clone().unwrap();
-                rename_into_place(&partial, &final_path, config.conflict_policy)?;
-                self.journal
-                    .set_entry_committed(
-                        entry.index_in_archive,
+                    let final_path = entry.final_path.clone().unwrap();
+                    let blake3_hex = entry.blake3.as_deref().unwrap_or("");
+                    let outcome = rename_into_place(
+                        &self.destination,
+                        &partial,
                         &final_path,
-                        entry.blake3.as_deref().unwrap_or(""),
-                    )
-                    .map_err(CoreError::Journal)?;
-                committed_bytes = committed_bytes.saturating_add(entry.unpacked_size);
-                let _ = tx.send(Event::EntryCommitted {
-                    index: entry.index_in_archive,
-                    path: final_path,
-                });
-            }
-            // Create directories that were only entries.
-            create_directory_entries(&self.destination, &entries)?;
-            // Flush the destination directory periodically so renames are durable without MFT bottlenecks.
-            if seq % 64 == 0 || seq + 1 == unit_count as u64 {
-                let _ = flush::flush_directory(&self.destination);
-            }
-            fault::fire(CrashPoint::AfterRename, &self.job_id);
+                        entry.unpacked_size,
+                        blake3_hex,
+                        config.conflict_policy,
+                        destructive,
+                    )?;
+                    let committed_path = match outcome {
+                        CommitOutcome::Committed(p) | CommitOutcome::ReusedExisting(p) => p,
+                    };
+                    self.journal
+                        .set_entry_committed(entry.index_in_archive, &committed_path, blake3_hex)
+                        .map_err(CoreError::Journal)?;
+                    committed_bytes = committed_bytes.saturating_add(entry.unpacked_size);
+                    let _ = tx.send(Event::EntryCommitted {
+                        index: entry.index_in_archive,
+                        path: committed_path,
+                    });
+                }
+                // Create directories that were only entries.
+                create_directory_entries(&self.destination, &entries)?;
+                // Flush the destination directory periodically so renames are durable without MFT bottlenecks.
+                if seq.is_multiple_of(64) || seq + 1 == unit_count as u64 {
+                    let _ = flush::flush_directory(&self.destination);
+                }
+                fault::fire(CrashPoint::AfterRename, &self.job_id);
 
-            // ---- COMMITTED (durable) ----
-            self.journal
-                .set_unit_state(seq, UnitState::Committed)
-                .map_err(CoreError::Journal)?;
-            let _ = tx.send(Event::UnitCommitted { seq, bytes: written_bytes });
-            fault::fire(CrashPoint::AfterJournalCommit, &self.job_id);
+                // ---- COMMITTED (durable) ----
+                self.journal
+                    .transition_unit_state(seq, UnitState::OutputDurable, UnitState::Committed)
+                    .map_err(CoreError::Journal)?;
+                let _ = tx.send(Event::UnitCommitted {
+                    seq,
+                    bytes: written_bytes,
+                });
+                fault::fire(CrashPoint::AfterJournalCommit, &self.job_id);
             } // end !reclaim_only
 
             // ---- reclaim source ranges (destructive mode) ----
@@ -902,9 +1099,16 @@ impl JobJob {
                             .mark_range_reclaim_intent(r.volume_index, r.start, r.len)
                             .map_err(CoreError::Journal)?;
                     }
-                    self.journal
-                        .set_unit_state(seq, UnitState::ReclaimIntent)
-                        .map_err(CoreError::Journal)?;
+                    let current_u = self.journal.unit(seq).map_err(CoreError::Journal)?;
+                    if current_u.state == UnitState::Committed {
+                        self.journal
+                            .transition_unit_state(
+                                seq,
+                                UnitState::Committed,
+                                UnitState::ReclaimIntent,
+                            )
+                            .map_err(CoreError::Journal)?;
+                    }
                     fault::fire(CrashPoint::BeforeHolePunch, &self.job_id);
 
                     let mut reclaimed_for_unit: u64 = 0;
@@ -913,25 +1117,66 @@ impl JobJob {
                         by_volume
                             .entry(r.volume_index)
                             .or_default()
-                            .push(ByteRange { start: r.start, len: r.len });
+                            .push(ByteRange {
+                                start: r.start,
+                                len: r.len,
+                            });
                     }
                     for (v_idx, ranges) in by_volume {
-                        let vol = volumes
-                            .get(v_idx as usize)
-                            .ok_or_else(|| {
-                                CoreError::Precondition(format!("volume {v_idx} not found"))
-                            })?;
+                        let vol = volumes.get(v_idx as usize).ok_or_else(|| {
+                            CoreError::Precondition(format!("volume {v_idx} not found"))
+                        })?;
+                        let ident = file_identity(&vol.path).map_err(CoreError::Platform)?;
+                        if let Some(expected_id) = &vol.identity {
+                            if ident.volume_serial != expected_id.volume_serial
+                                || ident.file_id != expected_id.file_id
+                                || ident.file_size != expected_id.file_size
+                            {
+                                return Err(CoreError::failed(
+                                    "reclaim source verification",
+                                    Some(vol.path.clone()),
+                                    None,
+                                    "reclaim",
+                                    format!("Source volume '{}' identity changed before reclamation", vol.path.display()),
+                                    "Aborting destructive extraction immediately to prevent data corruption.",
+                                ));
+                            }
+                        }
                         let file = match volume_handles.get(&v_idx) {
                             Some(f) => f,
                             None => {
                                 let f = open_for_reclaim(&vol.path).map_err(CoreError::Platform)?;
-                                let _ = set_sparse(&f, &vol.path);
+                                set_sparse(&f, &vol.path).map_err(CoreError::Platform)?;
                                 volume_handles.entry(v_idx).or_insert(f)
                             }
                         };
                         for range in ranges {
-                            let report =
-                                reclaim_range(file, &vol.path, range).map_err(CoreError::Platform)?;
+                            // Verify intact packed range digest immediately before initial physical reclamation
+                            if !reclaim_only {
+                                if let Some(packed_record) = self
+                                    .journal
+                                    .packed_ranges_for_unit(seq)
+                                    .map_err(CoreError::Journal)?
+                                    .into_iter()
+                                    .find(|pr| {
+                                        pr.volume_index == v_idx
+                                            && pr.start == range.start
+                                            && pr.len == range.len
+                                    })
+                                {
+                                    if let Some(expected_blake3) = &packed_record.blake3_digest {
+                                        verify_range_digest(
+                                            &vol.path,
+                                            range.start,
+                                            range.len,
+                                            expected_blake3,
+                                        )?;
+                                    }
+                                }
+                            }
+
+                            let report = reclaim_range(file, &vol.path, range)
+                                .map_err(CoreError::Platform)?;
                             let released = report.released_bytes();
                             reclaimed_for_unit = reclaimed_for_unit.saturating_add(released);
                             reclaimed_bytes = reclaimed_bytes.saturating_add(released);
@@ -939,22 +1184,69 @@ impl JobJob {
                                 volume_index: v_idx,
                                 bytes: released,
                             });
+                            fault::fire(CrashPoint::AfterPhysicalHolePunch, &self.job_id);
+                            let outcome_state = if report.remaining.is_empty() {
+                                RangeState::Reclaimed
+                            } else if released > 0 {
+                                RangeState::Partial
+                            } else {
+                                RangeState::Active
+                            };
                             self.journal
-                                .mark_range_reclaimed(v_idx, range.start, range.len)
+                                .mark_range_outcome(
+                                    v_idx,
+                                    range.start,
+                                    range.len,
+                                    outcome_state,
+                                    released,
+                                )
                                 .map_err(CoreError::Journal)?;
                         }
                         fault::fire(CrashPoint::DuringHolePunch, &self.job_id);
                     }
                     fault::fire(CrashPoint::BeforeReclaimedCommit, &self.job_id);
-                    self.journal
-                        .set_unit_state(seq, UnitState::Reclaimed)
+                    let updated_ranges = self
+                        .journal
+                        .packed_ranges_for_unit(seq)
                         .map_err(CoreError::Journal)?;
-                    let _ = tx.send(Event::UnitReclaimed { seq, bytes: reclaimed_for_unit });
+                    if updated_ranges
+                        .iter()
+                        .all(|r| r.state == RangeState::Reclaimed)
+                    {
+                        self.journal
+                            .transition_unit_state(
+                                seq,
+                                UnitState::ReclaimIntent,
+                                UnitState::Reclaimed,
+                            )
+                            .map_err(CoreError::Journal)?;
+                    }
+                    let _ = tx.send(Event::UnitReclaimed {
+                        seq,
+                        bytes: reclaimed_for_unit,
+                    });
                 } else {
-                    // Unit has no reclaimable source; still mark reclaimed.
-                    self.journal
-                        .set_unit_state(seq, UnitState::Reclaimed)
-                        .map_err(CoreError::Journal)?;
+                    // Unit has no reclaimable source; transition through intent to reclaimed.
+                    let current_u = self.journal.unit(seq).map_err(CoreError::Journal)?;
+                    if current_u.state == UnitState::Committed {
+                        self.journal
+                            .transition_unit_state(
+                                seq,
+                                UnitState::Committed,
+                                UnitState::ReclaimIntent,
+                            )
+                            .map_err(CoreError::Journal)?;
+                    }
+                    let current_u = self.journal.unit(seq).map_err(CoreError::Journal)?;
+                    if current_u.state == UnitState::ReclaimIntent {
+                        self.journal
+                            .transition_unit_state(
+                                seq,
+                                UnitState::ReclaimIntent,
+                                UnitState::Reclaimed,
+                            )
+                            .map_err(CoreError::Journal)?;
+                    }
                 }
             }
 
@@ -972,7 +1264,9 @@ impl JobJob {
                     self.journal
                         .set_job_progress(seq + 1, JobState::Paused)
                         .map_err(CoreError::Journal)?;
-                    let _ = tx.send(Event::JobPaused { job_id: self.job_id.clone() });
+                    let _ = tx.send(Event::JobPaused {
+                        job_id: self.job_id.clone(),
+                    });
                     return Ok(JobOutcome::Paused);
                 }
             }
@@ -986,11 +1280,15 @@ impl JobJob {
                 self.journal
                     .set_job_progress(seq + 1, JobState::Paused)
                     .map_err(CoreError::Journal)?;
-                let _ = tx.send(Event::JobPaused { job_id: self.job_id.clone() });
+                let _ = tx.send(Event::JobPaused {
+                    job_id: self.job_id.clone(),
+                });
                 return Ok(JobOutcome::Paused);
             }
             if cancel_flag.load(Ordering::SeqCst) {
-                let _ = tx.send(Event::JobCancelled { job_id: self.job_id.clone() });
+                let _ = tx.send(Event::JobCancelled {
+                    job_id: self.job_id.clone(),
+                });
                 return Ok(JobOutcome::Cancelled);
             }
             seq += 1;
@@ -1020,9 +1318,12 @@ impl JobJob {
 
     /// Verify a partial output file's size and BLAKE3 (exposed for tests).
     pub fn verify(&mut self, entry_index: u64) -> Result<String, CoreError> {
-        let entry = self.journal.entry(entry_index).map_err(CoreError::Journal)?;
+        let entry = self
+            .journal
+            .entry(entry_index)
+            .map_err(CoreError::Journal)?;
         let partial = entry.partial_path.clone().unwrap();
-        verify_file(&partial, entry.unpacked_size, 1 << 20).map_err(|e| {
+        verify_file(&partial, Some(entry.unpacked_size), 1 << 20).map_err(|e| {
             CoreError::failed(
                 "verify partial output",
                 Some(partial.clone()),
@@ -1054,15 +1355,19 @@ fn compute_archive_fingerprint(info: &ArchiveInfo) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-/// Verify a file against a stored BLAKE3 digest (used during recovery to
-/// adopt renamed-but-uncommitted outputs).
-pub fn verify_against(path: &Path, expected_blake3: &str) -> Result<bool, CoreError> {
-    let actual = verify_file(path, u64::MAX, 1 << 20).map_err(|e| {
+/// Verify a file against a stored BLAKE3 digest and optional expected size.
+/// Used during recovery to adopt renamed-but-uncommitted outputs, and for Low-Space skip verification.
+pub fn verify_against(
+    path: &Path,
+    expected_size: Option<u64>,
+    expected_blake3: &str,
+) -> Result<bool, CoreError> {
+    let actual = verify_file(path, expected_size, 1 << 20).map_err(|e| {
         CoreError::failed(
-            "verify output during recovery",
+            "verify output",
             Some(path.to_path_buf()),
             e.raw_os_error().map(|v| v as u32),
-            "recovery",
+            "verification",
             format!("verification of '{}' failed: {e}", path.display()),
             "The output is discarded and the unit is re-extracted.",
         )
@@ -1070,8 +1375,12 @@ pub fn verify_against(path: &Path, expected_blake3: &str) -> Result<bool, CoreEr
     Ok(actual == expected_blake3)
 }
 
-/// Verify a file: exact size + BLAKE3 digest.
-fn verify_file(path: &Path, expected_size: u64, buffer_size: usize) -> std::io::Result<String> {
+/// Verify a file: exact size (if specified) + BLAKE3 digest.
+pub fn verify_file(
+    path: &Path,
+    expected_size: Option<u64>,
+    buffer_size: usize,
+) -> std::io::Result<String> {
     use std::io::Read;
     let mut file = std::fs::File::open(path)?;
     let mut hasher = blake3::Hasher::new();
@@ -1085,22 +1394,45 @@ fn verify_file(path: &Path, expected_size: u64, buffer_size: usize) -> std::io::
         total = total.saturating_add(n as u64);
         hasher.update(&buf[..n]);
     }
-    if total != expected_size {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            format!("size mismatch: expected {expected_size}, got {total}"),
-        ));
+    if let Some(expected) = expected_size {
+        if total != expected {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("size mismatch: expected {expected}, got {total}"),
+            ));
+        }
     }
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-/// Atomically rename a partial file into its final place, honoring the
-/// conflict policy. Uses MoveFileExW with WRITE_THROUGH.
+/// Authoritative outcome of committing an entry into the destination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitOutcome {
+    /// Newly written and atomically moved into place.
+    Committed(PathBuf),
+    /// Reused pre-existing destination file after proving exact size + BLAKE3 hash equivalence.
+    ReusedExisting(PathBuf),
+}
+
+/// Atomically rename a partial file into its final place, honoring the conflict policy.
+///
+/// Invariants enforced:
+/// - Overwrite: journals the exact committed destination.
+/// - RenameNew: returns and journals the actual unique generated path.
+/// - Skip: in Low-Space mode, satisfies an entry ONLY IF the existing destination is
+///   independently proven byte-equivalent to the verified extraction (exact size + BLAKE3).
+///   Otherwise returns an error without destroying source bytes.
+/// - Ask: fails closed with an explicit decision-required error before commitment.
 fn rename_into_place(
+    dest_root: &Path,
     partial: &Path,
     final_path: &Path,
+    expected_size: u64,
+    expected_blake3: &str,
     policy: ConflictPolicy,
-) -> Result<(), CoreError> {
+    is_low_space: bool,
+) -> Result<CommitOutcome, CoreError> {
+    crate::paths::ensure_no_reparse_ancestors(final_path, dest_root)?;
     match policy {
         ConflictPolicy::Overwrite => {
             longpath::rename_existing(partial, final_path).map_err(|e| {
@@ -1117,22 +1449,20 @@ fn rename_into_place(
                     ),
                     "The unit remains resumable; the partial is re-extracted on resume.",
                 )
-            })
-        }
-ConflictPolicy::Skip | ConflictPolicy::Ask => {
-            if final_path.exists() {
-                // Skip: remove the partial, keep the existing file.
-                if let Err(e) = std::fs::remove_file(partial) {
-                    tracing::warn!(path = %partial.display(), "could not remove skipped partial: {e}");
-                }
-                Ok(())
-            } else {
-                rename_into_place(partial, final_path, ConflictPolicy::Overwrite)
-            }
+            })?;
+            Ok(CommitOutcome::Committed(final_path.to_path_buf()))
         }
         ConflictPolicy::RenameNew => {
             if !final_path.exists() {
-                return rename_into_place(partial, final_path, ConflictPolicy::Overwrite);
+                return rename_into_place(
+                    dest_root,
+                    partial,
+                    final_path,
+                    expected_size,
+                    expected_blake3,
+                    ConflictPolicy::Overwrite,
+                    is_low_space,
+                );
             }
             let stem = final_path
                 .file_stem()
@@ -1149,9 +1479,70 @@ ConflictPolicy::Skip | ConflictPolicy::Ask => {
                     None => format!("{stem} ({n})"),
                 });
                 if !candidate.exists() {
-                    return rename_into_place(partial, &candidate, ConflictPolicy::Overwrite);
+                    return rename_into_place(
+                        dest_root,
+                        partial,
+                        &candidate,
+                        expected_size,
+                        expected_blake3,
+                        ConflictPolicy::Overwrite,
+                        is_low_space,
+                    );
                 }
                 n += 1;
+            }
+        }
+        ConflictPolicy::Skip => {
+            if final_path.exists() {
+                if is_low_space {
+                    // Low-Space mode: Skip is permitted ONLY IF the existing file is
+                    // byte-identical to the verified extraction (exact size + BLAKE3).
+                    match verify_against(final_path, Some(expected_size), expected_blake3) {
+                        Ok(true) => {
+                            // Proven byte-identical. Delete the partial and reuse existing.
+                            let _ = std::fs::remove_file(partial);
+                            Ok(CommitOutcome::ReusedExisting(final_path.to_path_buf()))
+                        }
+                        _ => {
+                            Err(CoreError::Precondition(format!(
+                                "Existing destination file '{}' differs from archive entry; refusing to destroy source in Low-Space mode",
+                                final_path.display()
+                            )))
+                        }
+                    }
+                } else {
+                    // Normal mode: safe to skip (source will be preserved).
+                    let _ = std::fs::remove_file(partial);
+                    Ok(CommitOutcome::ReusedExisting(final_path.to_path_buf()))
+                }
+            } else {
+                rename_into_place(
+                    dest_root,
+                    partial,
+                    final_path,
+                    expected_size,
+                    expected_blake3,
+                    ConflictPolicy::Overwrite,
+                    is_low_space,
+                )
+            }
+        }
+        ConflictPolicy::Ask => {
+            if final_path.exists() {
+                Err(CoreError::Precondition(format!(
+                    "Destination file '{}' already exists: interactive conflict decision required before commitment",
+                    final_path.display()
+                )))
+            } else {
+                rename_into_place(
+                    dest_root,
+                    partial,
+                    final_path,
+                    expected_size,
+                    expected_blake3,
+                    ConflictPolicy::Overwrite,
+                    is_low_space,
+                )
             }
         }
     }
@@ -1164,6 +1555,7 @@ fn create_directory_entries(dest: &Path, entries: &[EntryRecord]) -> Result<(), 
             continue;
         }
         let final_path = e.final_path.clone().unwrap();
+        crate::paths::ensure_no_reparse_ancestors(&final_path, dest)?;
         if !final_path.exists() {
             std::fs::create_dir_all(&final_path).map_err(|err| {
                 CoreError::failed(
@@ -1177,22 +1569,22 @@ fn create_directory_entries(dest: &Path, entries: &[EntryRecord]) -> Result<(), 
             })?;
         }
     }
-    let _ = dest;
     Ok(())
 }
 
 /// Delete archive shells after a successful destructive extraction.
 ///
-/// ULTRA-STRICT VERIFICATION:
+/// Final source-shell deletion preconditions:
 /// The source archive is ONLY deleted if:
 /// 1. Every single unit in the journal is in `Reclaimed` or `Committed` state.
 /// 2. Zero errors are recorded in the journal.
-/// 3. Every single entry in the journal is in `Committed` status.
-/// 4. Every single committed file physically exists on disk and its on-disk size
-///    exactly matches `unpacked_size`.
+/// 3. Every single entry in the journal is either:
+///    - `Committed` (physically exists on disk and its size matches `unpacked_size`);
+///    - OR `Skipped` if and only if it is an authorized redirection policy skip (`is_redirection == true`),
+///      and no rogue file or link was created on disk.
 ///
-/// If even a single file is missing, size-mismatched, or unreadable, this function
-/// returns an error and REFUSES to delete the source archive.
+/// If even a single file is missing, size-mismatched, unreadable, or in an unexpected skip state,
+/// this function returns an error and refuses to delete the source archive.
 fn delete_archive_shells(journal: &JobJournal) -> Result<(), CoreError> {
     let units = journal.units().map_err(CoreError::Journal)?;
     if units.is_empty() {
@@ -1228,7 +1620,7 @@ fn delete_archive_shells(journal: &JobJournal) -> Result<(), CoreError> {
         ));
     }
 
-    // 3. Verify every entry is committed and exists on disk with exact size.
+    // 3. Verify entry dispositions and physical filesystem state.
     let entries = journal.entries().map_err(CoreError::Journal)?;
     if entries.is_empty() {
         return Err(CoreError::Precondition(
@@ -1237,68 +1629,112 @@ fn delete_archive_shells(journal: &JobJournal) -> Result<(), CoreError> {
     }
 
     for e in &entries {
-        if e.status != EntryStatus::Committed {
-            return Err(CoreError::failed(
-                "verify entries before shell deletion",
-                e.final_path.clone(),
-                None,
-                "COMPLETED",
-                format!("entry {} is not committed (status: {:?})", e.index_in_archive, e.status),
-                "Source archive will NOT be deleted.",
-            ));
-        }
+        match e.status {
+            EntryStatus::Committed => {
+                let Some(final_path) = &e.final_path else {
+                    return Err(CoreError::failed(
+                        "verify entry paths before shell deletion",
+                        None,
+                        None,
+                        "COMPLETED",
+                        format!("entry {} has no final path", e.index_in_archive),
+                        "Source archive will NOT be deleted.",
+                    ));
+                };
 
-        let Some(final_path) = &e.final_path else {
-            return Err(CoreError::failed(
-                "verify entry paths before shell deletion",
-                None,
-                None,
-                "COMPLETED",
-                format!("entry {} has no final path", e.index_in_archive),
-                "Source archive will NOT be deleted.",
-            ));
-        };
+                if !e.is_directory {
+                    let meta = std::fs::metadata(final_path).map_err(|err| {
+                        CoreError::failed(
+                            "verify physical file before shell deletion",
+                            Some(final_path.clone()),
+                            err.raw_os_error().map(|c| c as u32),
+                            "COMPLETED",
+                            format!(
+                                "output file '{}' cannot be read on disk: {err}",
+                                final_path.display()
+                            ),
+                            "Source archive will NOT be deleted.",
+                        )
+                    })?;
 
-        if !e.is_directory {
-            let meta = std::fs::metadata(final_path).map_err(|err| {
-                CoreError::failed(
-                    "verify physical file before shell deletion",
-                    Some(final_path.clone()),
-                    err.raw_os_error().map(|c| c as u32),
-                    "COMPLETED",
-                    format!("output file '{}' cannot be read on disk: {err}", final_path.display()),
-                    "Source archive will NOT be deleted.",
-                )
-            })?;
-
-            if meta.len() != e.unpacked_size {
+                    if meta.len() != e.unpacked_size {
+                        return Err(CoreError::failed(
+                            "verify physical file size before shell deletion",
+                            Some(final_path.clone()),
+                            None,
+                            "COMPLETED",
+                            format!(
+                                "output file '{}' size mismatch: expected {} bytes on disk, found {} bytes",
+                                final_path.display(),
+                                e.unpacked_size,
+                                meta.len()
+                            ),
+                            "Source archive will NOT be deleted.",
+                        ));
+                    }
+                } else if !final_path.is_dir() {
+                    return Err(CoreError::failed(
+                        "verify physical directory before shell deletion",
+                        Some(final_path.clone()),
+                        None,
+                        "COMPLETED",
+                        format!(
+                            "output directory '{}' does not exist on disk",
+                            final_path.display()
+                        ),
+                        "Source archive will NOT be deleted.",
+                    ));
+                }
+            }
+            EntryStatus::Skipped => {
+                // Authorized policy skip: must be a known redirection/link entry
+                if !e.is_redirection {
+                    return Err(CoreError::failed(
+                        "verify entry disposition before shell deletion",
+                        e.final_path.clone(),
+                        None,
+                        "COMPLETED",
+                        format!(
+                            "entry {} was skipped without an authorized redirection policy disposition",
+                            e.index_in_archive
+                        ),
+                        "Source archive will NOT be deleted.",
+                    ));
+                }
+                // Verify no rogue file or symlink was created on disk for the skipped link
+                if let Some(final_path) = &e.final_path {
+                    if final_path.exists() || final_path.is_symlink() {
+                        return Err(CoreError::failed(
+                            "verify skipped redirection on disk before shell deletion",
+                            Some(final_path.clone()),
+                            None,
+                            "COMPLETED",
+                            format!(
+                                "skipped redirection '{}' unexpectedly exists on disk",
+                                final_path.display()
+                            ),
+                            "Source archive will NOT be deleted.",
+                        ));
+                    }
+                }
+            }
+            other => {
                 return Err(CoreError::failed(
-                    "verify physical file size before shell deletion",
-                    Some(final_path.clone()),
+                    "verify entries before shell deletion",
+                    e.final_path.clone(),
                     None,
                     "COMPLETED",
                     format!(
-                        "output file '{}' size mismatch: expected {} bytes on disk, found {} bytes",
-                        final_path.display(),
-                        e.unpacked_size,
-                        meta.len()
+                        "entry {} is in uncommitted/incomplete status '{:?}'",
+                        e.index_in_archive, other
                     ),
                     "Source archive will NOT be deleted.",
                 ));
             }
-        } else if !final_path.is_dir() {
-            return Err(CoreError::failed(
-                "verify physical directory before shell deletion",
-                Some(final_path.clone()),
-                None,
-                "COMPLETED",
-                format!("output directory '{}' does not exist on disk", final_path.display()),
-                "Source archive will NOT be deleted.",
-            ));
         }
     }
 
-    // 4. All checks passed with 100% verification — delete the volume files.
+    // 4. All checks passed with verified completion — delete the volume files.
     let volumes = journal.volumes().map_err(CoreError::Journal)?;
     for v in volumes {
         if v.path.exists() {
@@ -1315,4 +1751,271 @@ fn delete_archive_shells(journal: &JobJournal) -> Result<(), CoreError> {
         }
     }
     Ok(())
+}
+
+/// Verification helpers for Source Content Manifest
+pub fn verify_range_digest(
+    path: &Path,
+    start: u64,
+    len: u64,
+    expected_blake3: &str,
+) -> Result<(), CoreError> {
+    if len == 0 {
+        return Ok(());
+    }
+    let mut file = std::fs::File::open(path).map_err(|e| {
+        CoreError::failed(
+            "open source file for digest verification",
+            Some(path.to_path_buf()),
+            None,
+            "verification",
+            format!("cannot open '{}': {e}", path.display()),
+            "Ensure the source file exists and is accessible.",
+        )
+    })?;
+    use std::io::{Read, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(start)).map_err(|e| {
+        CoreError::failed(
+            "seek source file for digest verification",
+            Some(path.to_path_buf()),
+            None,
+            "verification",
+            format!("cannot seek to offset {start} in '{}': {e}", path.display()),
+            "Ensure the source file is not truncated.",
+        )
+    })?;
+
+    let mut hasher = blake3::Hasher::new();
+    let mut remaining = len;
+    let mut buf = vec![0u8; 64 * 1024];
+    while remaining > 0 {
+        let to_read = (remaining as usize).min(buf.len());
+        let n = file.read(&mut buf[..to_read]).map_err(|e| {
+            CoreError::failed(
+                "read source file for digest verification",
+                Some(path.to_path_buf()),
+                None,
+                "verification",
+                format!("read error in '{}': {e}", path.display()),
+                "Ensure source storage is healthy.",
+            )
+        })?;
+        if n == 0 {
+            return Err(CoreError::failed(
+                "read source file for digest verification",
+                Some(path.to_path_buf()),
+                None,
+                "verification",
+                format!(
+                    "unexpected EOF reading source range [{}..{}] in '{}'",
+                    start,
+                    start + len,
+                    path.display()
+                ),
+                "Source file is smaller than expected.",
+            ));
+        }
+        hasher.update(&buf[..n]);
+        remaining = remaining.saturating_sub(n as u64);
+    }
+
+    let actual = hasher.finalize().to_hex().to_string();
+    if actual != expected_blake3 {
+        return Err(CoreError::failed(
+            "verify packed range BLAKE3 digest",
+            Some(path.to_path_buf()),
+            None,
+            "verification",
+            format!(
+                "source packed range [{}..{}] in '{}' has been modified or corrupted (expected BLAKE3 {}, computed {})",
+                start,
+                start + len,
+                path.display(),
+                expected_blake3,
+                actual
+            ),
+            "The archive source data was changed. Aborting extraction to prevent data loss.",
+        ));
+    }
+    Ok(())
+}
+
+pub fn compute_volume_structural_digest(
+    path: &Path,
+    vol_len: u64,
+    ranges: &[(u64, u64)],
+) -> Result<String, CoreError> {
+    let mut file = std::fs::File::open(path).map_err(|e| {
+        CoreError::failed(
+            "open volume for structural digest",
+            Some(path.to_path_buf()),
+            None,
+            "manifest",
+            format!("cannot open volume '{}': {e}", path.display()),
+            "Ensure the source volume is accessible.",
+        )
+    })?;
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut hasher = blake3::Hasher::new();
+    let mut current_offset: u64 = 0;
+    let mut buf = vec![0u8; 64 * 1024];
+
+    for &(r_start, r_len) in ranges {
+        if r_start > current_offset {
+            let seg_start = current_offset;
+            let seg_len = r_start - current_offset;
+            hasher.update(&seg_start.to_le_bytes());
+            hasher.update(&seg_len.to_le_bytes());
+
+            file.seek(SeekFrom::Start(seg_start)).map_err(|e| {
+                CoreError::failed(
+                    "seek volume for structural digest",
+                    Some(path.to_path_buf()),
+                    None,
+                    "manifest",
+                    format!("seek error in '{}': {e}", path.display()),
+                    "Ensure volume is not truncated.",
+                )
+            })?;
+            let mut rem = seg_len;
+            while rem > 0 {
+                let to_read = (rem as usize).min(buf.len());
+                let n = file.read(&mut buf[..to_read]).map_err(|e| {
+                    CoreError::failed(
+                        "read structural data from volume",
+                        Some(path.to_path_buf()),
+                        None,
+                        "manifest",
+                        format!("read error in '{}': {e}", path.display()),
+                        "Ensure storage is healthy.",
+                    )
+                })?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+                rem = rem.saturating_sub(n as u64);
+            }
+        }
+        current_offset = r_start.saturating_add(r_len);
+    }
+
+    if current_offset < vol_len {
+        let seg_start = current_offset;
+        let seg_len = vol_len - current_offset;
+        hasher.update(&seg_start.to_le_bytes());
+        hasher.update(&seg_len.to_le_bytes());
+
+        file.seek(SeekFrom::Start(seg_start)).map_err(|e| {
+            CoreError::failed(
+                "seek volume tail for structural digest",
+                Some(path.to_path_buf()),
+                None,
+                "manifest",
+                format!("seek error in '{}': {e}", path.display()),
+                "Ensure volume is not truncated.",
+            )
+        })?;
+        let mut rem = seg_len;
+        while rem > 0 {
+            let to_read = (rem as usize).min(buf.len());
+            let n = file.read(&mut buf[..to_read]).map_err(|e| {
+                CoreError::failed(
+                    "read structural tail from volume",
+                    Some(path.to_path_buf()),
+                    None,
+                    "manifest",
+                    format!("read error in '{}': {e}", path.display()),
+                    "Ensure storage is healthy.",
+                )
+            })?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            rem = rem.saturating_sub(n as u64);
+        }
+    }
+
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+pub type SourceManifest = (Vec<String>, HashMap<(u64, u64, u64), String>);
+
+pub fn compute_source_manifest(
+    volumes: &[reclaimarc_archive::model::VolumeInfo],
+    units: &[reclaimarc_archive::model::RecoveryUnit],
+) -> Result<SourceManifest, CoreError> {
+    let mut struct_digests = Vec::new();
+    let mut range_digests = HashMap::new();
+
+    for (v_idx, vol) in volumes.iter().enumerate() {
+        let mut vol_ranges: Vec<(u64, u64)> = Vec::new();
+        for u in units {
+            for r in &u.packed_ranges {
+                if r.volume_index as usize == v_idx {
+                    vol_ranges.push((r.start, r.len));
+                }
+            }
+        }
+        vol_ranges.sort_by_key(|&(start, _)| start);
+
+        let struct_hash =
+            compute_volume_structural_digest(&vol.path, vol.logical_size, &vol_ranges)?;
+        struct_digests.push(struct_hash);
+
+        // Compute BLAKE3 for each packed range
+        let mut file = std::fs::File::open(&vol.path).map_err(|e| {
+            CoreError::failed(
+                "open volume for range manifest",
+                Some(vol.path.clone()),
+                None,
+                "manifest",
+                format!("cannot open '{}': {e}", vol.path.display()),
+                "Ensure volume is accessible.",
+            )
+        })?;
+        use std::io::{Read, Seek, SeekFrom};
+        let mut buf = vec![0u8; 64 * 1024];
+
+        for &(r_start, r_len) in &vol_ranges {
+            file.seek(SeekFrom::Start(r_start)).map_err(|e| {
+                CoreError::failed(
+                    "seek volume for range manifest",
+                    Some(vol.path.clone()),
+                    None,
+                    "manifest",
+                    format!("seek error in '{}': {e}", vol.path.display()),
+                    "Ensure volume is accessible.",
+                )
+            })?;
+            let mut hasher = blake3::Hasher::new();
+            let mut rem = r_len;
+            while rem > 0 {
+                let to_read = (rem as usize).min(buf.len());
+                let n = file.read(&mut buf[..to_read]).map_err(|e| {
+                    CoreError::failed(
+                        "read range from volume",
+                        Some(vol.path.clone()),
+                        None,
+                        "manifest",
+                        format!("read error in '{}': {e}", vol.path.display()),
+                        "Ensure volume is healthy.",
+                    )
+                })?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+                rem = rem.saturating_sub(n as u64);
+            }
+            range_digests.insert(
+                (v_idx as u64, r_start, r_len),
+                hasher.finalize().to_hex().to_string(),
+            );
+        }
+    }
+
+    Ok((struct_digests, range_digests))
 }

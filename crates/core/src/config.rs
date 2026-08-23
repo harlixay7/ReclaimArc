@@ -26,6 +26,7 @@ impl SafetyMode {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<SafetyMode> {
         match s {
             "safe" => Some(SafetyMode::Safe),
@@ -65,7 +66,7 @@ impl ConflictPolicy {
 pub enum SymlinkPolicy {
     /// Skip link entries entirely (default, conservative).
     Skip,
-    /// Recreate links only if the target stays inside the destination.
+    /// Reserved for future policy extensions.
     SafeLinks,
 }
 
@@ -77,9 +78,11 @@ pub struct EngineConfig {
     pub symlink_policy: SymlinkPolicy,
     /// Run the full archive integrity test before destructive extraction.
     pub pre_test: bool,
-    /// Write a checksum manifest (BLAKE3) next to the output.
+    /// Reserved for future manifest output.
+    #[serde(default)]
     pub write_manifest: bool,
-    /// Retain one previous completed unit's source bytes (SAFE mode).
+    /// Reserved for conservative mode buffering.
+    #[serde(default = "default_true")]
     pub retain_previous_unit: bool,
     /// Custom reserve override (bytes). `None` = automatic.
     pub custom_reserve: Option<u64>,
@@ -89,6 +92,10 @@ pub struct EngineConfig {
     pub io_buffer_size: usize,
     /// Logging level for structured logs.
     pub log_level: String,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for EngineConfig {
@@ -115,7 +122,7 @@ pub const RESERVE_PERCENT_OF_FILESYSTEM: f64 = 0.01;
 /// Journal/transaction overhead allowance.
 pub const JOURNAL_REQUIREMENT: u64 = 64 * 1024 * 1024;
 
-/// Compute the emergency reserve per the master plan:
+/// Compute the emergency reserve:
 /// max(fixed minimum, percentage of filesystem, journal requirement).
 pub fn emergency_reserve(_free_space: u64, total_space: u64, config: &EngineConfig) -> u64 {
     if let Some(custom) = config.custom_reserve {

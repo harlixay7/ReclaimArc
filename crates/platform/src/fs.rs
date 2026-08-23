@@ -1,4 +1,4 @@
-﻿//! Filesystem facts: identity, allocated size, free space, storage-pool checks.
+//! Filesystem facts: identity, allocated size, free space, storage-pool checks.
 
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, GetDiskFreeSpaceExW, GetDiskFreeSpaceW, GetFileInformationByHandle, GetVolumeInformationW,
-    BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_SHARE_DELETE,
-    OPEN_EXISTING, FILE_READ_ATTRIBUTES,
+    CreateFileW, GetDiskFreeSpaceExW, GetDiskFreeSpaceW, GetFileInformationByHandle,
+    GetVolumeInformationW, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 
 use crate::error::{PlatformError, PlatformErrorKind};
@@ -33,7 +33,10 @@ pub struct FileIdentity {
 /// The engine uses this to snapshot identities and to hold a handle that
 /// detects external modification.
 pub fn open_for_identity(path: &Path) -> Result<std::fs::File, PlatformError> {
-    let name: Vec<u16> = extend_path(path)?.encode_utf16().chain(std::iter::once(0)).collect();
+    let name: Vec<u16> = extend_path(path)?
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let result = unsafe {
         CreateFileW(
             PCWSTR(name.as_ptr()),
@@ -49,7 +52,12 @@ pub fn open_for_identity(path: &Path) -> Result<std::fs::File, PlatformError> {
         Ok(h) => Ok(unsafe { std::fs::File::from_raw_handle(h.0) }),
         Err(e) => {
             let code = e.code().0 as u32;
-            Err(PlatformError::from_os(PlatformErrorKind::NotFound, "open file", Some(path), code))
+            Err(PlatformError::from_os(
+                PlatformErrorKind::NotFound,
+                "open file",
+                Some(path),
+                code,
+            ))
         }
     }
 }
@@ -61,9 +69,13 @@ pub fn file_identity(path: &Path) -> Result<FileIdentity, PlatformError> {
 }
 
 /// Identity from an already-open handle.
-pub fn file_identity_from_handle(file: &std::fs::File, path: &Path) -> Result<FileIdentity, PlatformError> {
+pub fn file_identity_from_handle(
+    file: &std::fs::File,
+    path: &Path,
+) -> Result<FileIdentity, PlatformError> {
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
-    let ok = unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle() as *mut _), &mut info) };
+    let ok =
+        unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle() as *mut _), &mut info) };
     if let Err(e) = ok {
         return Err(PlatformError::from_os(
             PlatformErrorKind::Win32,
@@ -74,7 +86,8 @@ pub fn file_identity_from_handle(file: &std::fs::File, path: &Path) -> Result<Fi
     }
     let file_id = ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64;
     let size = ((info.nFileSizeHigh as u64) << 32) | info.nFileSizeLow as u64;
-    let mtime = ((info.ftLastWriteTime.dwHighDateTime as u64) << 32) | info.ftLastWriteTime.dwLowDateTime as u64;
+    let mtime = ((info.ftLastWriteTime.dwHighDateTime as u64) << 32)
+        | info.ftLastWriteTime.dwLowDateTime as u64;
     Ok(FileIdentity {
         volume_serial: info.dwVolumeSerialNumber,
         file_id,
@@ -110,7 +123,11 @@ pub fn allocated_size_from_handle(file: &std::fs::File, path: &Path) -> Result<u
 /// Free bytes available on the volume containing `path`.
 pub fn free_space(path: &Path) -> Result<u64, PlatformError> {
     let root = drive_root(path);
-    let wide: Vec<u16> = root.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let wide: Vec<u16> = root
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     let mut free: u64 = 0;
     let ok = unsafe { GetDiskFreeSpaceExW(PCWSTR(wide.as_ptr()), Some(&mut free), None, None) };
     if let Err(e) = ok {
@@ -127,7 +144,11 @@ pub fn free_space(path: &Path) -> Result<u64, PlatformError> {
 /// Total bytes on the volume containing `path`.
 pub fn total_space(path: &Path) -> Result<u64, PlatformError> {
     let root = drive_root(path);
-    let wide: Vec<u16> = root.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let wide: Vec<u16> = root
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     let mut total: u64 = 0;
     let ok = unsafe { GetDiskFreeSpaceExW(PCWSTR(wide.as_ptr()), None, Some(&mut total), None) };
     if let Err(e) = ok {
@@ -144,7 +165,11 @@ pub fn total_space(path: &Path) -> Result<u64, PlatformError> {
 /// Filesystem name of the volume containing `path` (e.g. "NTFS", "ReFS").
 pub fn filesystem_name(path: &Path) -> Result<String, PlatformError> {
     let root = drive_root(path);
-    let wide: Vec<u16> = root.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let wide: Vec<u16> = root
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     let mut fs_name = [0u16; 260];
     let mut serial: u32 = 0;
     let ok = unsafe {
@@ -165,16 +190,32 @@ pub fn filesystem_name(path: &Path) -> Result<String, PlatformError> {
             e.code().0 as u32,
         ));
     }
-    let end = fs_name.iter().position(|&c| c == 0).unwrap_or(fs_name.len());
+    let end = fs_name
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(fs_name.len());
     Ok(String::from_utf16_lossy(&fs_name[..end]))
 }
 
 /// Volume serial number of the volume containing `path`.
 pub fn volume_serial(path: &Path) -> Result<u32, PlatformError> {
     let root = drive_root(path);
-    let wide: Vec<u16> = root.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let wide: Vec<u16> = root
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     let mut serial: u32 = 0;
-    let ok = unsafe { GetVolumeInformationW(PCWSTR(wide.as_ptr()), None, Some(&mut serial), None, None, None) };
+    let ok = unsafe {
+        GetVolumeInformationW(
+            PCWSTR(wide.as_ptr()),
+            None,
+            Some(&mut serial),
+            None,
+            None,
+            None,
+        )
+    };
     if let Err(e) = ok {
         return Err(PlatformError::from_os(
             PlatformErrorKind::Win32,
@@ -225,7 +266,11 @@ pub fn drive_root(path: &Path) -> PathBuf {
 /// Cluster size of the volume containing `path`.
 pub fn cluster_size(path: &Path) -> Result<u32, PlatformError> {
     let root = drive_root(path);
-    let wide: Vec<u16> = root.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let wide: Vec<u16> = root
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     let mut sectors_per_cluster: u32 = 0;
     let mut bytes_per_sector: u32 = 0;
     let ok = unsafe {
@@ -307,8 +352,3 @@ mod tests {
         assert!(alloc >= 65536);
     }
 }
-
-
-
-
-

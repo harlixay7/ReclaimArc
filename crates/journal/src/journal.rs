@@ -1,4 +1,4 @@
-﻿//! Durable extraction journal.
+//! Durable extraction journal.
 //!
 //! A per-job SQLite database that records every durable transition of the
 //! transactional engine. Commits are `synchronous=FULL` in WAL mode, so a
@@ -56,19 +56,30 @@ impl JobJournal {
             return Err(JournalError::schema("journal has no meta table"));
         }
         let version: Option<String> = conn
-            .query_row("SELECT value FROM meta WHERE key = 'schema_version'", [], |r| r.get(0))
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |r| r.get(0),
+            )
             .optional()?;
         match version {
             None => {
                 return Err(JournalError::schema("journal has no schema version marker"));
             }
-            Some(v) if v != schema::SCHEMA_VERSION.to_string() => {
-                return Err(JournalError::schema(format!(
-                    "journal schema version {v}, expected {}",
-                    schema::SCHEMA_VERSION
-                )));
+            Some(v) => {
+                let v_num: i64 = v.parse().map_err(|_| {
+                    JournalError::schema(format!("invalid journal schema version '{v}'"))
+                })?;
+                if v_num < schema::SCHEMA_VERSION {
+                    // Supported older schema: migrate transactionally
+                    schema::migrate(&conn)?;
+                } else if v_num > schema::SCHEMA_VERSION {
+                    return Err(JournalError::schema(format!(
+                        "journal schema version {v}, expected at most {}",
+                        schema::SCHEMA_VERSION
+                    )));
+                }
             }
-            Some(_) => {}
         }
         let j = JobJournal { conn };
         let _ = j.job_meta()?; // validates job_meta row exists
@@ -89,7 +100,9 @@ impl JobJournal {
 
     /// Force a checkpoint so the WAL is folded back into the main database.
     pub fn checkpoint(&self) -> Result<()> {
-        let _ = self.conn.prepare_cached("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        let _ = self
+            .conn
+            .prepare_cached("PRAGMA wal_checkpoint(TRUNCATE)")?;
         Ok(())
     }
 
@@ -179,11 +192,13 @@ impl JobJournal {
     // ---------------- volumes ----------------
 
     pub fn add_volumes(&mut self, volumes: &[VolumeRecord]) -> Result<()> {
-        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         for (i, v) in volumes.iter().enumerate() {
             tx.execute(
-                "INSERT INTO volumes (id, path, identity_json, allocated_before, logical_size, is_first) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO volumes (id, path, identity_json, allocated_before, logical_size, is_first, structural_digest) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     (i + 1) as i64,
                     v.path.to_string_lossy(),
@@ -191,6 +206,7 @@ impl JobJournal {
                     v.allocated_before as i64,
                     v.logical_size as i64,
                     if v.is_first { 1 } else { 0 },
+                    v.structural_digest,
                 ],
             )?;
         }
@@ -200,7 +216,7 @@ impl JobJournal {
 
     pub fn volumes(&self) -> Result<Vec<VolumeRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT path, identity_json, allocated_before, logical_size, is_first FROM volumes ORDER BY id",
+            "SELECT path, identity_json, allocated_before, logical_size, is_first, structural_digest FROM volumes ORDER BY id",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok((
@@ -209,11 +225,12 @@ impl JobJournal {
                 r.get::<_, i64>(2)?,
                 r.get::<_, i64>(3)?,
                 r.get::<_, i64>(4)?,
+                r.get::<_, Option<String>>(5)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (path, ident, alloc, logical, first) = row?;
+            let (path, ident, alloc, logical, first, structural) = row?;
             out.push(VolumeRecord {
                 path: PathBuf::from(path),
                 identity: match ident {
@@ -223,9 +240,18 @@ impl JobJournal {
                 allocated_before: alloc as u64,
                 logical_size: logical as u64,
                 is_first: first != 0,
+                structural_digest: structural,
             });
         }
         Ok(out)
+    }
+
+    pub fn set_volume_structural_digest(&mut self, volume_index: u64, digest: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE volumes SET structural_digest = ?1 WHERE id = ?2",
+            params![digest, (volume_index + 1) as i64],
+        )?;
+        Ok(())
     }
 
     /// Persist the actual allocation measured after a reclaim operation, so
@@ -241,7 +267,9 @@ impl JobJournal {
     // ---------------- recovery units ----------------
 
     pub fn add_units(&mut self, units: &[RecoveryUnitRecord]) -> Result<()> {
-        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         for u in units {
             tx.execute(
                 "INSERT INTO recovery_units (seq, state, first_entry, last_entry, error, updated_at) \
@@ -291,24 +319,141 @@ impl JobJournal {
             .ok_or_else(|| JournalError::missing(format!("recovery unit {seq}")))
     }
 
-/// Transition a unit to a new state, recording the transition in the same
-    /// durable transaction.
-    pub fn set_unit_state(&mut self, seq: u64, state: UnitState) -> Result<()> {
-        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current: Option<String> = tx
-            .query_row("SELECT state FROM recovery_units WHERE seq = ?1", [seq as i64], |r| r.get(0))
-            .optional()?;
-        let current = current.ok_or_else(|| JournalError::missing(format!("recovery unit {seq}")))?;
-        tx.execute(
-            "UPDATE recovery_units SET state = ?1, updated_at = ?2 WHERE seq = ?3",
-            params![state.as_str(), crate::now_iso(), seq as i64],
+    //    // ---------------- unit state machine ----------------
+
+    /// Canonical transitions of the recovery unit state machine.
+    pub const CANONICAL_TRANSITIONS: &'static [(UnitState, UnitState)] = &[
+        (UnitState::Pending, UnitState::Extracting),
+        (UnitState::Extracting, UnitState::OutputWritten),
+        (UnitState::OutputWritten, UnitState::OutputVerified),
+        (UnitState::OutputVerified, UnitState::OutputDurable),
+        (UnitState::OutputDurable, UnitState::Committed),
+        (UnitState::Committed, UnitState::ReclaimIntent),
+        (UnitState::ReclaimIntent, UnitState::Reclaimed),
+    ];
+
+    /// Whether a state transition is legal according to the canonical state machine.
+    pub fn can_transition(from: UnitState, to: UnitState) -> bool {
+        Self::CANONICAL_TRANSITIONS
+            .iter()
+            .any(|(f, t)| *f == from && *t == to)
+    }
+
+    /// Transactionally advance a recovery unit from its expected state to a legal next state.
+    ///
+    /// Invariants enforced:
+    /// - Checks legality against canonical state machine.
+    /// - Updates ONLY WHERE current_state = expected_state.
+    /// - Requires exactly one affected row.
+    /// - Appends audit transition record in the same atomic transaction.
+    pub fn transition_unit_state(
+        &mut self,
+        seq: u64,
+        expected_state: UnitState,
+        new_state: UnitState,
+    ) -> Result<()> {
+        if !Self::can_transition(expected_state, new_state) {
+            return Err(JournalError::state(format!(
+                "illegal unit state transition for unit {seq}: {:?} -> {:?}",
+                expected_state, new_state
+            )));
+        }
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let affected = tx.execute(
+            "UPDATE recovery_units SET state = ?1, updated_at = ?2 WHERE seq = ?3 AND state = ?4",
+            params![
+                new_state.as_str(),
+                crate::now_iso(),
+                seq as i64,
+                expected_state.as_str()
+            ],
         )?;
+        if affected != 1 {
+            let actual: Option<String> = tx
+                .query_row(
+                    "SELECT state FROM recovery_units WHERE seq = ?1",
+                    [seq as i64],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let actual_str = actual.unwrap_or_else(|| "missing".into());
+            return Err(JournalError::state(format!(
+                "unit {seq} state mismatch: expected {:?}, found {actual_str}",
+                expected_state
+            )));
+        }
+
         tx.execute(
             "INSERT INTO state_transitions (unit_seq, from_state, to_state, at) VALUES (?1, ?2, ?3, ?4)",
-            params![seq as i64, current, state.as_str(), crate::now_iso()],
+            params![seq as i64, expected_state.as_str(), new_state.as_str(), crate::now_iso()],
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Recovery-specific reconciliation transition, strictly scoped for crash recovery resume.
+    pub fn reconcile_unit_state_on_resume(
+        &mut self,
+        seq: u64,
+        from_state: UnitState,
+        to_state: UnitState,
+    ) -> Result<()> {
+        let is_legal_reconciliation = matches!(
+            (from_state, to_state),
+            (UnitState::Extracting, UnitState::Pending)
+                | (UnitState::OutputWritten, UnitState::Pending)
+                | (UnitState::OutputVerified, UnitState::Pending)
+                | (UnitState::OutputDurable, UnitState::Pending)
+                | (UnitState::Committed, UnitState::Pending)
+                | (UnitState::Reclaimed, UnitState::Pending)
+                | (UnitState::ReclaimIntent, UnitState::Reclaimed)
+                | (UnitState::Extracting, UnitState::Extracting)
+                | (UnitState::Committed, UnitState::Committed)
+                | (UnitState::Reclaimed, UnitState::Reclaimed)
+        );
+        if !is_legal_reconciliation {
+            return Err(JournalError::state(format!(
+                "invalid recovery reconciliation for unit {seq}: {:?} -> {:?}",
+                from_state, to_state
+            )));
+        }
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let affected = tx.execute(
+            "UPDATE recovery_units SET state = ?1, updated_at = ?2 WHERE seq = ?3 AND state = ?4",
+            params![
+                to_state.as_str(),
+                crate::now_iso(),
+                seq as i64,
+                from_state.as_str()
+            ],
+        )?;
+        if affected != 1 {
+            return Err(JournalError::state(format!(
+                "unit {seq} recovery reconciliation failed: expected {:?}, updated 0 rows",
+                from_state
+            )));
+        }
+        tx.execute(
+            "INSERT INTO state_transitions (unit_seq, from_state, to_state, at) VALUES (?1, ?2, ?3, ?4)",
+            params![seq as i64, format!("RECOVERY_{:?}", from_state), to_state.as_str(), crate::now_iso()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Helper for legacy callers and tests: transitions from current state.
+    pub fn set_unit_state(&mut self, seq: u64, state: UnitState) -> Result<()> {
+        let current = self.unit(seq)?.state;
+        if current == state {
+            return Ok(());
+        }
+        self.transition_unit_state(seq, current, state)
     }
 
     pub fn set_unit_error(&mut self, seq: u64, error: &str) -> Result<()> {
@@ -320,9 +465,9 @@ impl JobJournal {
     }
 
     pub fn transitions(&self) -> Result<Vec<TransitionRecord>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT unit_seq, from_state, to_state, at FROM state_transitions ORDER BY id")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT unit_seq, from_state, to_state, at FROM state_transitions ORDER BY id",
+        )?;
         let rows = stmt.query_map([], |r| {
             Ok(TransitionRecord {
                 unit_seq: r.get(0)?,
@@ -341,13 +486,16 @@ impl JobJournal {
     // ---------------- entries ----------------
 
     pub fn add_entries(&mut self, entries: &[EntryRecord]) -> Result<()> {
-        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         for e in entries {
             tx.execute(
                 "INSERT INTO entries (index_in_archive, name, packed_size, unpacked_size, crc32, \
                  is_directory, is_solid, split_before, split_after, encrypted, recovery_unit, \
-                 final_path, partial_path, blake3, status) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                 final_path, partial_path, blake3, status, actual_committed_path, existed_before_job, \
+                 expected_digest, is_redirection, redirection_kind) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
                 params![
                     e.index_in_archive as i64,
                     e.name,
@@ -364,6 +512,11 @@ impl JobJournal {
                     e.partial_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
                     e.blake3,
                     e.status.as_str(),
+                    e.actual_committed_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                    if e.existed_before_job { 1 } else { 0 },
+                    e.expected_digest,
+                    if e.is_redirection { 1 } else { 0 },
+                    e.redirection_kind,
                 ],
             )?;
         }
@@ -371,7 +524,8 @@ impl JobJournal {
         Ok(())
     }
 
-    fn row_to_entry(r: &rusqlite::Row) -> rusqlite::Result<EntryRecord> {        Ok(EntryRecord {
+    fn row_to_entry(r: &rusqlite::Row) -> rusqlite::Result<EntryRecord> {
+        Ok(EntryRecord {
             index_in_archive: r.get(0)?,
             name: r.get(1)?,
             packed_size: r.get(2)?,
@@ -388,13 +542,19 @@ impl JobJournal {
             blake3: r.get(13)?,
             status: crate::models::EntryStatus::from_str(&r.get::<_, String>(14)?)
                 .unwrap_or(EntryStatus::Pending),
+            actual_committed_path: r.get::<_, Option<String>>(15)?.map(PathBuf::from),
+            existed_before_job: r.get::<_, Option<i64>>(16)?.unwrap_or(0) != 0,
+            expected_digest: r.get(17)?,
+            is_redirection: r.get::<_, Option<i64>>(18)?.unwrap_or(0) != 0,
+            redirection_kind: r.get(19)?,
         })
     }
 
     pub fn entries(&self) -> Result<Vec<EntryRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT index_in_archive, name, packed_size, unpacked_size, crc32, is_directory, is_solid, \
-             split_before, split_after, encrypted, recovery_unit, final_path, partial_path, blake3, status \
+             split_before, split_after, encrypted, recovery_unit, final_path, partial_path, blake3, status, \
+             actual_committed_path, existed_before_job, expected_digest, is_redirection, redirection_kind \
              FROM entries ORDER BY index_in_archive",
         )?;
         let rows = stmt.query_map([], Self::row_to_entry)?;
@@ -408,7 +568,8 @@ impl JobJournal {
     pub fn entries_for_unit(&self, seq: u64) -> Result<Vec<EntryRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT index_in_archive, name, packed_size, unpacked_size, crc32, is_directory, is_solid, \
-             split_before, split_after, encrypted, recovery_unit, final_path, partial_path, blake3, status \
+             split_before, split_after, encrypted, recovery_unit, final_path, partial_path, blake3, status, \
+             actual_committed_path, existed_before_job, expected_digest, is_redirection, redirection_kind \
              FROM entries WHERE recovery_unit = ?1 ORDER BY index_in_archive",
         )?;
         let rows = stmt.query_map([(seq + 1) as i64], Self::row_to_entry)?;
@@ -435,15 +596,19 @@ impl JobJournal {
         Ok(())
     }
 
-/// Batch-update partial paths for many entries in one durable
+    /// Batch-update partial paths for many entries in one durable
     /// transaction (used by the streaming extraction path).
     pub fn set_partial_paths_batch(&mut self, updates: &[(u64, String)]) -> Result<()> {
         if updates.is_empty() {
             return Ok(());
         }
-        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         {
-            let mut stmt = tx.prepare_cached("UPDATE entries SET partial_path = ?1 WHERE index_in_archive = ?2")?;
+            let mut stmt = tx.prepare_cached(
+                "UPDATE entries SET partial_path = ?1 WHERE index_in_archive = ?2",
+            )?;
             for (index, partial) in updates {
                 stmt.execute(params![partial, *index as i64])?;
             }
@@ -454,8 +619,15 @@ impl JobJournal {
 
     /// Record partial/final paths for an entry (set before extraction).
     /// Only the provided (non-None) columns are updated.
-    pub fn set_entry_paths(&mut self, index: u64, partial: Option<&Path>, final_path: Option<&Path>) -> Result<()> {
-        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    pub fn set_entry_paths(
+        &mut self,
+        index: u64,
+        partial: Option<&Path>,
+        final_path: Option<&Path>,
+    ) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(p) = partial {
             tx.execute(
                 "UPDATE entries SET partial_path = ?1 WHERE index_in_archive = ?2",
@@ -475,56 +647,98 @@ impl JobJournal {
     /// Mark an entry verified with its BLAKE3 digest (durable).
     pub fn set_entry_verified(&mut self, index: u64, blake3: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE entries SET blake3 = ?1, status = 'VERIFIED' WHERE index_in_archive = ?2",
+            "UPDATE entries SET blake3 = ?1, expected_digest = ?1, status = 'VERIFIED' WHERE index_in_archive = ?2",
             params![blake3, index as i64],
         )?;
         Ok(())
     }
 
-/// Mark an entry durably renamed into place and committed (durable).
-    pub fn set_entry_committed(&mut self, index: u64, final_path: &Path, blake3: &str) -> Result<()> {
+    /// Mark an entry durably renamed into place and committed (durable).
+    pub fn set_entry_committed(
+        &mut self,
+        index: u64,
+        actual_path: &Path,
+        blake3: &str,
+    ) -> Result<()> {
         self.conn.execute(
-            "UPDATE entries SET final_path = ?1, blake3 = ?2, status = 'COMMITTED' WHERE index_in_archive = ?3",
-            params![final_path.to_string_lossy().into_owned(), blake3, index as i64],
+            "UPDATE entries SET actual_committed_path = ?1, blake3 = ?2, expected_digest = ?2, status = 'COMMITTED' WHERE index_in_archive = ?3",
+            params![actual_path.to_string_lossy().into_owned(), blake3, index as i64],
         )?;
         Ok(())
     }
 
     /// One durable transaction covering a unit's verify→durable pipeline:
     /// OUTPUT_WRITTEN, entry VERIFIED, OUTPUT_VERIFIED, entry DURABLE and
-    /// OUTPUT_DURABLE. The intermediate states are still journaled (in the
-    /// same transaction) so crash recovery behaves identically, but the unit
-    /// pays a single WAL fsync instead of five.
+    /// OUTPUT_DURABLE. Enforces canonical state checks and atomic audit records.
     pub fn mark_unit_verified_durable(
         &mut self,
         seq: u64,
         verified: &[(u64, String)],
     ) -> Result<()> {
-        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = crate::now_iso();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         {
-            tx.execute(
-                "UPDATE recovery_units SET state = 'OUTPUT_WRITTEN', updated_at = ?1 WHERE seq = ?2",
-                params![crate::now_iso(), seq as i64],
+            // Transition 1: EXTRACTING -> OUTPUT_WRITTEN
+            let rows1 = tx.execute(
+                "UPDATE recovery_units SET state = 'OUTPUT_WRITTEN', updated_at = ?1 WHERE seq = ?2 AND state = 'EXTRACTING'",
+                params![now, seq as i64],
             )?;
+            if rows1 != 1 {
+                return Err(JournalError::state(format!(
+                    "unit {seq} not in expected state EXTRACTING for OUTPUT_WRITTEN transition"
+                )));
+            }
+            tx.execute(
+                "INSERT INTO state_transitions (unit_seq, from_state, to_state, at) VALUES (?1, 'EXTRACTING', 'OUTPUT_WRITTEN', ?2)",
+                params![seq as i64, now],
+            )?;
+
+            // Entry updates: VERIFIED
             let mut v = tx.prepare_cached(
-                "UPDATE entries SET blake3 = ?1, status = 'VERIFIED' WHERE index_in_archive = ?2",
+                "UPDATE entries SET blake3 = ?1, expected_digest = ?1, status = 'VERIFIED' WHERE index_in_archive = ?2",
             )?;
             for (index, blake3) in verified {
                 v.execute(params![blake3, *index as i64])?;
             }
-            tx.execute(
-                "UPDATE recovery_units SET state = 'OUTPUT_VERIFIED', updated_at = ?1 WHERE seq = ?2",
-                params![crate::now_iso(), seq as i64],
+
+            // Transition 2: OUTPUT_WRITTEN -> OUTPUT_VERIFIED
+            let rows2 = tx.execute(
+                "UPDATE recovery_units SET state = 'OUTPUT_VERIFIED', updated_at = ?1 WHERE seq = ?2 AND state = 'OUTPUT_WRITTEN'",
+                params![now, seq as i64],
             )?;
+            if rows2 != 1 {
+                return Err(JournalError::state(format!(
+                    "unit {seq} not in expected state OUTPUT_WRITTEN for OUTPUT_VERIFIED transition"
+                )));
+            }
+            tx.execute(
+                "INSERT INTO state_transitions (unit_seq, from_state, to_state, at) VALUES (?1, 'OUTPUT_WRITTEN', 'OUTPUT_VERIFIED', ?2)",
+                params![seq as i64, now],
+            )?;
+
+            // Entry updates: DURABLE
             let mut d = tx.prepare_cached(
                 "UPDATE entries SET status = 'DURABLE' WHERE index_in_archive = ?1",
             )?;
             for (index, _) in verified {
                 d.execute(params![*index as i64])?;
             }
+
+            // Transition 3: OUTPUT_VERIFIED -> OUTPUT_DURABLE
+            let rows3 = tx.execute(
+                "UPDATE recovery_units SET state = 'OUTPUT_DURABLE', updated_at = ?1 WHERE seq = ?2 AND state = 'OUTPUT_VERIFIED'",
+                params![now, seq as i64],
+            )?;
+            if rows3 != 1 {
+                return Err(JournalError::state(format!(
+                    "unit {seq} not in expected state OUTPUT_VERIFIED for OUTPUT_DURABLE transition"
+                )));
+            }
             tx.execute(
-                "UPDATE recovery_units SET state = 'OUTPUT_DURABLE', updated_at = ?1 WHERE seq = ?2",
-                params![crate::now_iso(), seq as i64],
+                "INSERT INTO state_transitions (unit_seq, from_state, to_state, at) VALUES (?1, 'OUTPUT_VERIFIED', 'OUTPUT_DURABLE', ?2)",
+                params![seq as i64, now],
             )?;
         }
         tx.commit()?;
@@ -534,17 +748,21 @@ impl JobJournal {
     // ---------------- packed ranges ----------------
 
     pub fn add_packed_ranges(&mut self, ranges: &[PackedRangeRecord]) -> Result<()> {
-        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         for r in ranges {
             tx.execute(
-                "INSERT INTO packed_ranges (volume_index, start, len, state, recovery_unit) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO packed_ranges (volume_index, start, len, state, recovery_unit, physically_released_bytes, blake3_digest) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     (r.volume_index + 1) as i64,
                     r.start as i64,
                     r.len as i64,
                     r.state.as_str(),
                     r.recovery_unit.map(|u| (u + 1) as i64),
+                    r.physically_released_bytes as i64,
+                    r.blake3_digest,
                 ],
             )?;
         }
@@ -554,7 +772,7 @@ impl JobJournal {
 
     pub fn packed_ranges(&self) -> Result<Vec<PackedRangeRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT volume_index, start, len, state, recovery_unit FROM packed_ranges ORDER BY id",
+            "SELECT volume_index, start, len, state, recovery_unit, physically_released_bytes, blake3_digest FROM packed_ranges ORDER BY id",
         )?;
         let rows = stmt.query_map([], |r| {
             let state_s: String = r.get(3)?;
@@ -565,6 +783,8 @@ impl JobJournal {
                 len: r.get::<_, i64>(2)? as u64,
                 state: RangeState::from_str(&state_s).unwrap_or(RangeState::Active),
                 recovery_unit: unit,
+                physically_released_bytes: r.get::<_, Option<i64>>(5)?.unwrap_or(0) as u64,
+                blake3_digest: r.get::<_, Option<String>>(6)?,
             })
         })?;
         let mut out = Vec::new();
@@ -572,6 +792,20 @@ impl JobJournal {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    pub fn set_packed_range_blake3(
+        &mut self,
+        volume_index: u64,
+        start: u64,
+        len: u64,
+        digest: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE packed_ranges SET blake3_digest = ?1 WHERE volume_index = ?2 AND start = ?3 AND len = ?4",
+            params![digest, (volume_index + 1) as i64, start as i64, len as i64],
+        )?;
+        Ok(())
     }
 
     pub fn packed_ranges_for_unit(&self, seq: u64) -> Result<Vec<PackedRangeRecord>> {
@@ -583,7 +817,12 @@ impl JobJournal {
     }
 
     /// Persist RECLAIM_INTENT for a range BEFORE punching holes (durable).
-    pub fn mark_range_reclaim_intent(&mut self, volume_index: u64, start: u64, len: u64) -> Result<()> {
+    pub fn mark_range_reclaim_intent(
+        &mut self,
+        volume_index: u64,
+        start: u64,
+        len: u64,
+    ) -> Result<()> {
         self.conn.execute(
             "UPDATE packed_ranges SET state = 'RECLAIM_INTENT' \
              WHERE volume_index = ?1 AND start = ?2 AND len = ?3 AND state = 'ACTIVE'",
@@ -592,14 +831,32 @@ impl JobJournal {
         Ok(())
     }
 
-    /// Persist RECLAIMED after verifying actual allocation (durable).
-    pub fn mark_range_reclaimed(&mut self, volume_index: u64, start: u64, len: u64) -> Result<()> {
+    /// Persist range state and physically released bytes after reclamation attempt (durable).
+    pub fn mark_range_outcome(
+        &mut self,
+        volume_index: u64,
+        start: u64,
+        len: u64,
+        state: RangeState,
+        physically_released_bytes: u64,
+    ) -> Result<()> {
         self.conn.execute(
-            "UPDATE packed_ranges SET state = 'RECLAIMED' \
-             WHERE volume_index = ?1 AND start = ?2 AND len = ?3",
-            params![(volume_index + 1) as i64, start as i64, len as i64],
+            "UPDATE packed_ranges SET state = ?1, physically_released_bytes = ?2 \
+             WHERE volume_index = ?3 AND start = ?4 AND len = ?5",
+            params![
+                state.as_str(),
+                physically_released_bytes as i64,
+                (volume_index + 1) as i64,
+                start as i64,
+                len as i64
+            ],
         )?;
         Ok(())
+    }
+
+    /// Persist RECLAIMED after verifying actual allocation (durable).
+    pub fn mark_range_reclaimed(&mut self, volume_index: u64, start: u64, len: u64) -> Result<()> {
+        self.mark_range_outcome(volume_index, start, len, RangeState::Reclaimed, len)
     }
 
     pub fn ranges_in_state(&self, state: RangeState) -> Result<Vec<PackedRangeRecord>> {
@@ -692,6 +949,9 @@ mod tests {
             }])
             .unwrap();
             j.set_unit_state(0, UnitState::Extracting).unwrap();
+            j.set_unit_state(0, UnitState::OutputWritten).unwrap();
+            j.set_unit_state(0, UnitState::OutputVerified).unwrap();
+            j.set_unit_state(0, UnitState::OutputDurable).unwrap();
             j.set_unit_state(0, UnitState::Committed).unwrap();
             j.set_job_progress(1, JobState::Active).unwrap();
         } // drop simulates a clean close
@@ -705,11 +965,11 @@ mod tests {
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].state, UnitState::Committed);
         let transitions = j.transitions().unwrap();
-        assert_eq!(transitions.len(), 2);
+        assert_eq!(transitions.len(), 5);
         assert_eq!(transitions[0].from_state, "PENDING");
         assert_eq!(transitions[0].to_state, "EXTRACTING");
-        assert_eq!(transitions[1].from_state, "EXTRACTING");
-        assert_eq!(transitions[1].to_state, "COMMITTED");
+        assert_eq!(transitions[4].from_state, "OUTPUT_DURABLE");
+        assert_eq!(transitions[4].to_state, "COMMITTED");
     }
 
     #[test]
@@ -744,6 +1004,11 @@ mod tests {
                 partial_path: None,
                 blake3: None,
                 status: EntryStatus::Pending,
+                actual_committed_path: None,
+                existed_before_job: false,
+                expected_digest: None,
+                is_redirection: false,
+                redirection_kind: None,
             },
             EntryRecord {
                 index_in_archive: 1,
@@ -761,6 +1026,11 @@ mod tests {
                 partial_path: None,
                 blake3: None,
                 status: EntryStatus::Pending,
+                actual_committed_path: None,
+                existed_before_job: false,
+                expected_digest: None,
+                is_redirection: false,
+                redirection_kind: None,
             },
         ])
         .unwrap();
@@ -770,6 +1040,7 @@ mod tests {
             allocated_before: 100,
             logical_size: 200,
             is_first: true,
+            structural_digest: None,
         }])
         .unwrap();
         j.add_packed_ranges(&[PackedRangeRecord {
@@ -778,11 +1049,14 @@ mod tests {
             len: 50,
             state: RangeState::Active,
             recovery_unit: Some(0),
+            physically_released_bytes: 0,
+            blake3_digest: None,
         }])
         .unwrap();
         j.mark_range_reclaim_intent(0, 0, 50).unwrap();
         j.set_entry_verified(0, "deadbeef").unwrap();
-        j.set_entry_committed(0, &dir.path().join("out").join("a.txt"), "deadbeef").unwrap();
+        j.set_entry_committed(0, &dir.path().join("out").join("a.txt"), "deadbeef")
+            .unwrap();
 
         drop(j);
         let mut j = JobJournal::open(&path).unwrap();
@@ -839,7 +1113,8 @@ mod tests {
             updated_at: crate::now_iso(),
         }])
         .unwrap();
-        j.set_unit_error(0, "decoder reported bad data (CRC)").unwrap();
+        j.set_unit_error(0, "decoder reported bad data (CRC)")
+            .unwrap();
         drop(j);
         let j = JobJournal::open(&path).unwrap();
         let u = j.unit(0).unwrap();
@@ -878,8 +1153,44 @@ mod tests {
         assert_eq!(transitions[6].from_state, "RECLAIM_INTENT");
         assert_eq!(transitions[6].to_state, "RECLAIMED");
     }
+
+    #[test]
+    fn test_illegal_state_jumps_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = db_path(dir.path());
+        let meta = sample_meta(dir.path());
+        let mut j = JobJournal::create(&path, &meta).unwrap();
+        j.add_units(&[RecoveryUnitRecord {
+            seq: 0,
+            state: UnitState::Pending,
+            first_entry: 0,
+            last_entry: 0,
+            error: None,
+            updated_at: crate::now_iso(),
+        }])
+        .unwrap();
+
+        // 1. Illegal jump from Pending directly to Committed must fail
+        let err = j
+            .transition_unit_state(0, UnitState::Pending, UnitState::Committed)
+            .unwrap_err();
+        assert!(
+            matches!(err, JournalError::State(_)),
+            "illegal jump must fail: {err:?}"
+        );
+
+        // 2. Expected state mismatch (actual is Pending, caller asserts Extracting) must fail
+        let err = j
+            .transition_unit_state(0, UnitState::Extracting, UnitState::OutputWritten)
+            .unwrap_err();
+        assert!(
+            matches!(err, JournalError::State(_)),
+            "state mismatch must fail: {err:?}"
+        );
+
+        // 3. Legal step works
+        j.transition_unit_state(0, UnitState::Pending, UnitState::Extracting)
+            .unwrap();
+        assert_eq!(j.unit(0).unwrap().state, UnitState::Extracting);
+    }
 }
-
-
-
-

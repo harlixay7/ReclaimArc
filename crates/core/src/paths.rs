@@ -1,4 +1,4 @@
-﻿//! Path security: archive names are hostile input.
+//! Path security: archive names are hostile input.
 //!
 //! The engine rejects any entry whose name could escape the destination or
 //! alias system resources. Only validated names reach the decoder.
@@ -48,7 +48,9 @@ impl SafeEntry {
 pub fn validate_entry(name: &str, is_directory: bool) -> Result<SafeEntry, CoreError> {
     let trimmed = name.trim_end_matches('/').trim_end_matches('\\');
     if trimmed.is_empty() {
-        return Err(CoreError::Precondition("archive contains an empty path name".to_string()));
+        return Err(CoreError::Precondition(
+            "archive contains an empty path name".to_string(),
+        ));
     }
 
     // Absolute path detection (both separator styles and drive prefixes).
@@ -67,7 +69,7 @@ pub fn validate_entry(name: &str, is_directory: bool) -> Result<SafeEntry, CoreE
         )));
     }
 
-let mut components: Vec<String> = Vec::new();
+    let mut components: Vec<String> = Vec::new();
     for raw in trimmed.split(['/', '\\']) {
         if raw.is_empty() {
             return Err(CoreError::Precondition(format!(
@@ -155,6 +157,79 @@ pub fn partial_path(final_path: &Path, job_id: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Verify that no existing directory between `dest_root` and `target` is a
+/// symlink, junction, or reparse point that could divert files outside `dest_root`.
+pub fn ensure_no_reparse_ancestors(target: &Path, dest_root: &Path) -> Result<(), CoreError> {
+    let mut current = target.to_path_buf();
+    while let Some(parent) = current.parent() {
+        if !parent.starts_with(dest_root) {
+            break;
+        }
+        if parent == dest_root {
+            break;
+        }
+        match std::fs::symlink_metadata(parent) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(CoreError::Precondition(format!(
+                        "Path component '{}' is a symlink inside destination root",
+                        parent.display()
+                    )));
+                }
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    if meta.file_attributes() & 0x400 != 0 {
+                        // FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+                        return Err(CoreError::Precondition(format!(
+                            "Path component '{}' is a reparse point/junction inside destination root",
+                            parent.display()
+                        )));
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Directory does not exist yet; will be created safely as normal dir
+            }
+            Err(e) => {
+                return Err(CoreError::Precondition(format!(
+                    "Cannot verify security of ancestor directory '{}': {e}",
+                    parent.display()
+                )));
+            }
+        }
+        current = parent.to_path_buf();
+    }
+    match std::fs::symlink_metadata(target) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(CoreError::Precondition(format!(
+                    "Target path '{}' is a symlink",
+                    target.display()
+                )));
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                if meta.file_attributes() & 0x400 != 0 {
+                    return Err(CoreError::Precondition(format!(
+                        "Target path '{}' is a reparse point/junction",
+                        target.display()
+                    )));
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(CoreError::Precondition(format!(
+                "Cannot verify security of target path '{}': {e}",
+                target.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,35 +237,57 @@ mod tests {
     #[test]
     fn rejects_traversal() {
         for evil in ["../evil", "a/../../evil", "..\\evil", "a\\..\\b"] {
-            assert!(validate_entry(evil, false).is_err(), "{evil} must be rejected");
+            assert!(
+                validate_entry(evil, false).is_err(),
+                "{evil} must be rejected"
+            );
         }
     }
 
     #[test]
     fn rejects_absolute() {
-        for evil in ["/etc/passwd", "\\windows\\system32", "C:\\evil", "C:/evil", "\\\\server\\share", "\\\\?\\C:\\x"] {
-            assert!(validate_entry(evil, false).is_err(), "{evil} must be rejected");
+        for evil in [
+            "/etc/passwd",
+            "\\windows\\system32",
+            "C:\\evil",
+            "C:/evil",
+            "\\\\server\\share",
+            "\\\\?\\C:\\x",
+        ] {
+            assert!(
+                validate_entry(evil, false).is_err(),
+                "{evil} must be rejected"
+            );
         }
     }
 
     #[test]
     fn rejects_device_names() {
         for evil in ["CON", "con.txt", "NUL", "nul.txt", "COM1", "lpt3", "PRN"] {
-            assert!(validate_entry(evil, false).is_err(), "{evil} must be rejected");
+            assert!(
+                validate_entry(evil, false).is_err(),
+                "{evil} must be rejected"
+            );
         }
     }
 
     #[test]
     fn rejects_ads() {
         for evil in ["file.txt:evil", "file.txt::$DATA", "stream:data"] {
-            assert!(validate_entry(evil, false).is_err(), "{evil} must be rejected");
+            assert!(
+                validate_entry(evil, false).is_err(),
+                "{evil} must be rejected"
+            );
         }
     }
 
     #[test]
     fn rejects_trailing_dot_space() {
         for evil in ["file.", "file ", "dir/file. "] {
-            assert!(validate_entry(evil, false).is_err(), "{evil} must be rejected");
+            assert!(
+                validate_entry(evil, false).is_err(),
+                "{evil} must be rejected"
+            );
         }
     }
 
@@ -214,14 +311,23 @@ mod tests {
 
     #[test]
     fn case_collisions_detected() {
-        let names = vec![(0usize, "A.txt".to_string()), (1, "a.TXT".to_string()), (2, "b.txt".to_string()), (3, "B.TXT".to_string())];
+        let names = vec![
+            (0usize, "A.txt".to_string()),
+            (1, "a.TXT".to_string()),
+            (2, "b.txt".to_string()),
+            (3, "B.TXT".to_string()),
+        ];
         let collisions = find_case_collisions(&names);
         assert_eq!(collisions.len(), 2);
     }
 
     #[test]
     fn no_false_collisions() {
-        let names = vec![(0usize, "a.txt".to_string()), (1, "b.txt".to_string()), (2, "ab.txt".to_string())];
+        let names = vec![
+            (0usize, "a.txt".to_string()),
+            (1, "b.txt".to_string()),
+            (2, "ab.txt".to_string()),
+        ];
         assert!(find_case_collisions(&names).is_empty());
     }
 }

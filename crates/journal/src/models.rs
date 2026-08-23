@@ -53,6 +53,7 @@ impl UnitState {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Result<UnitState> {
         match s {
             "PENDING" => Ok(UnitState::Pending),
@@ -78,6 +79,7 @@ pub enum EntryStatus {
     Verified,
     Durable,
     Committed,
+    Skipped,
     Failed,
 }
 
@@ -89,10 +91,12 @@ impl EntryStatus {
             EntryStatus::Verified => "VERIFIED",
             EntryStatus::Durable => "DURABLE",
             EntryStatus::Committed => "COMMITTED",
+            EntryStatus::Skipped => "SKIPPED",
             EntryStatus::Failed => "FAILED",
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Result<EntryStatus> {
         Ok(match s {
             "PENDING" => EntryStatus::Pending,
@@ -100,6 +104,7 @@ impl EntryStatus {
             "VERIFIED" => EntryStatus::Verified,
             "DURABLE" => EntryStatus::Durable,
             "COMMITTED" => EntryStatus::Committed,
+            "SKIPPED" => EntryStatus::Skipped,
             "FAILED" => EntryStatus::Failed,
             other => {
                 return Err(crate::error::JournalError::state(format!(
@@ -115,6 +120,7 @@ impl EntryStatus {
 pub enum RangeState {
     Active,
     ReclaimIntent,
+    Partial,
     Reclaimed,
 }
 
@@ -123,13 +129,17 @@ impl RangeState {
         match self {
             RangeState::Active => "ACTIVE",
             RangeState::ReclaimIntent => "RECLAIM_INTENT",
+            RangeState::Partial => "PARTIAL",
             RangeState::Reclaimed => "RECLAIMED",
         }
     }
+
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Result<RangeState> {
         Ok(match s {
             "ACTIVE" => RangeState::Active,
             "RECLAIM_INTENT" => RangeState::ReclaimIntent,
+            "PARTIAL" => RangeState::Partial,
             "RECLAIMED" => RangeState::Reclaimed,
             other => {
                 return Err(crate::error::JournalError::state(format!(
@@ -148,6 +158,7 @@ pub struct VolumeRecord {
     pub allocated_before: u64,
     pub logical_size: u64,
     pub is_first: bool,
+    pub structural_digest: Option<String>,
 }
 
 /// A recovery unit.
@@ -179,16 +190,23 @@ pub struct EntryRecord {
     pub partial_path: Option<PathBuf>,
     pub blake3: Option<String>,
     pub status: EntryStatus,
+    pub actual_committed_path: Option<PathBuf>,
+    pub existed_before_job: bool,
+    pub expected_digest: Option<String>,
+    pub is_redirection: bool,
+    pub redirection_kind: Option<String>,
 }
 
 /// A packed source range (tied to a volume).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PackedRangeRecord {
     pub volume_index: u64,
     pub start: u64,
     pub len: u64,
     pub state: RangeState,
     pub recovery_unit: Option<u64>,
+    pub physically_released_bytes: u64,
+    pub blake3_digest: Option<String>,
 }
 
 /// Job-level metadata.
@@ -225,6 +243,7 @@ impl JobState {
             JobState::Abandoned => "ABANDONED",
         }
     }
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Result<JobState> {
         Ok(match s {
             "ACTIVE" => JobState::Active,

@@ -1,4 +1,4 @@
-﻿//! Fault injection: crash points used by the test harness to simulate
+//! Fault injection: crash points used by the test harness to simulate
 //! process death after every durable transition.
 //!
 //! Activated via `RECLAIMARC_FAULT_AT=<name>`; when the engine reaches the
@@ -23,6 +23,8 @@ pub enum CrashPoint {
     BeforeHolePunch,
     /// During the hole-punching loop (after the first range).
     DuringHolePunch,
+    /// Immediately after physical FSCTL_SET_ZERO_DATA deallocation, before mark_range_outcome journal record.
+    AfterPhysicalHolePunch,
     /// After holes are punched, before the RECLAIMED journal record.
     BeforeReclaimedCommit,
 }
@@ -36,10 +38,12 @@ impl CrashPoint {
             CrashPoint::AfterJournalCommit => "after-journal-commit",
             CrashPoint::BeforeHolePunch => "before-hole-punch",
             CrashPoint::DuringHolePunch => "during-hole-punch",
+            CrashPoint::AfterPhysicalHolePunch => "after-physical-hole-punch",
             CrashPoint::BeforeReclaimedCommit => "before-reclaimed-commit",
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<CrashPoint> {
         match s {
             "after-partial-write" => Some(CrashPoint::AfterPartialWrite),
@@ -48,6 +52,7 @@ impl CrashPoint {
             "after-journal-commit" => Some(CrashPoint::AfterJournalCommit),
             "before-hole-punch" => Some(CrashPoint::BeforeHolePunch),
             "during-hole-punch" => Some(CrashPoint::DuringHolePunch),
+            "after-physical-hole-punch" => Some(CrashPoint::AfterPhysicalHolePunch),
             "before-reclaimed-commit" => Some(CrashPoint::BeforeReclaimedCommit),
             _ => None,
         }
@@ -116,6 +121,9 @@ mod tests {
     #[test]
     fn parse_points_handles_list() {
         let v = parse_points("after-rename,before-hole-punch");
-        assert_eq!(v, vec![CrashPoint::AfterRename, CrashPoint::BeforeHolePunch]);
+        assert_eq!(
+            v,
+            vec![CrashPoint::AfterRename, CrashPoint::BeforeHolePunch]
+        );
     }
 }

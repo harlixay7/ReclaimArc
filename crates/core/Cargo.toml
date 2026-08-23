@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "reclaimarc-core"
 version.workspace = true
 edition.workspace = true
@@ -25,5 +25,6 @@ test-hooks = []
 [dev-dependencies]
 tempfile.workspace = true
 proptest.workspace = true
+rusqlite.workspace = true
 reclaimarc-core = { path = ".", features = ["test-hooks"] }
 reclaimarc-archive = { workspace = true }

@@ -1,4 +1,4 @@
-﻿//! Filesystem capability detection.
+//! Filesystem capability detection.
 //!
 //! Rather than trusting a name lookup, `filesystem_capabilities` performs a
 //! *behavioral probe*: it creates a temporary file on the target volume,
@@ -10,7 +10,9 @@ use std::path::Path;
 
 use crate::error::{PlatformError, PlatformErrorKind};
 use crate::fs::{filesystem_name, same_storage_pool};
-use crate::sparse::{align_inward, query_allocated_ranges, reclaim_range, set_sparse, ByteRange, SparseProbe};
+use crate::sparse::{
+    align_inward, query_allocated_ranges, reclaim_range, set_sparse, ByteRange, SparseProbe,
+};
 
 /// Everything the engine needs to know about a destination volume.
 #[derive(Debug, Clone)]
@@ -77,7 +79,20 @@ pub fn filesystem_capabilities(dir: &Path) -> Result<FilesystemCapabilities, Pla
 fn probe_inner(probe_path: &Path, probe: &mut SparseProbe) -> Result<(), PlatformError> {
     use std::io::{Read, Seek, SeekFrom, Write};
 
-    let mut file = crate::sparse::open_for_reclaim(probe_path)?;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(probe_path)
+        .map_err(|e| {
+            PlatformError::from_io(
+                PlatformErrorKind::Io,
+                "create probe file",
+                Some(probe_path),
+                &e,
+            )
+        })?;
     // Write a patterned buffer (non-zero) to make allocation measurable.
     let mut buf = vec![0u8; 1 << 16];
     for (i, b) in buf.iter_mut().enumerate() {
@@ -103,7 +118,10 @@ fn probe_inner(probe_path: &Path, probe: &mut SparseProbe) -> Result<(), Platfor
     }
 
     // Verify the file is physically sparse-capable: query ranges.
-    let range = ByteRange { start: 0, len: buf.len() as u64 * 16 };
+    let range = ByteRange {
+        start: 0,
+        len: buf.len() as u64 * 16,
+    };
     let before = query_allocated_ranges(&file, probe_path, 0, range.len);
     match before {
         Ok(_) => probe.query_ok = true,
@@ -117,7 +135,10 @@ fn probe_inner(probe_path: &Path, probe: &mut SparseProbe) -> Result<(), Platfor
 
     // Zero the middle half and verify deallocation.
     let cluster = crate::fs::cluster_size(probe_path)?;
-    let middle = ByteRange { start: range.len / 4, len: range.len / 2 };
+    let middle = ByteRange {
+        start: range.len / 4,
+        len: range.len / 2,
+    };
     let aligned = align_inward(middle, cluster);
     if let Some(aligned) = aligned {
         let report = reclaim_range(&file, probe_path, aligned)?;
@@ -133,17 +154,29 @@ fn probe_inner(probe_path: &Path, probe: &mut SparseProbe) -> Result<(), Platfor
     })?;
     let mut all = Vec::new();
     file.read_to_end(&mut all).map_err(|e| {
-        PlatformError::from_io(PlatformErrorKind::Io, "probe read-back", Some(probe_path), &e)
+        PlatformError::from_io(
+            PlatformErrorKind::Io,
+            "probe read-back",
+            Some(probe_path),
+            &e,
+        )
     })?;
     if all.len() != range.len as usize {
         return Err(PlatformError::policy(
             PlatformErrorKind::Precondition,
-            format!("probe read-back size mismatch: {} != {}", all.len(), range.len),
+            format!(
+                "probe read-back size mismatch: {} != {}",
+                all.len(),
+                range.len
+            ),
         ));
     }
     for (i, b) in all.iter().enumerate() {
         let i64 = i as u64;
-        let expected = if aligned.map(|a| a.start <= i64 && i64 < a.end()).unwrap_or(false) {
+        let expected = if aligned
+            .map(|a| a.start <= i64 && i64 < a.end())
+            .unwrap_or(false)
+        {
             0
         } else {
             (i % 251) as u8
@@ -185,7 +218,11 @@ pub fn reclamation_feasible(
     } else {
         "Progressive extraction is possible on this volume.".into()
     };
-    Ok(ReclaimFeasibility { supported, same_volume: same, reason })
+    Ok(ReclaimFeasibility {
+        supported,
+        same_volume: same,
+        reason,
+    })
 }
 
 #[cfg(test)]
@@ -205,13 +242,16 @@ mod tests {
         let path = dir.path().join("reclaim.bin");
         let caps = filesystem_capabilities(dir.path()).unwrap();
         if !caps.progressive_reclaim_supported {
-            eprintln!("SKIP: volume '{}' does not support sparse reclamation: {}", caps.name, caps.probe.verdict);
+            eprintln!(
+                "SKIP: volume '{}' does not support sparse reclamation: {}",
+                caps.name, caps.probe.verdict
+            );
             return;
         }
         assert!(caps.directory_flush_supported);
 
         use std::io::{Seek, SeekFrom, Write};
-        let mut file = open_for_reclaim(&path).unwrap();
+        let mut file = std::fs::File::create(&path).unwrap();
         let mut buf = vec![0u8; 65536];
         for (i, b) in buf.iter_mut().enumerate() {
             *b = (i * 7 % 251) as u8;
@@ -220,13 +260,18 @@ mod tests {
             file.write_all(&buf).unwrap();
         }
         file.sync_all().unwrap();
+        drop(file);
+        let mut file = open_for_reclaim(&path).unwrap();
         let total = 64u64 * 65536;
 
         // A file must be marked sparse before ranges can be deallocated.
         set_sparse(&file, &path).unwrap();
 
         let cluster = cluster_size(&path).unwrap();
-        let middle = ByteRange { start: total / 4, len: total / 2 };
+        let middle = ByteRange {
+            start: total / 4,
+            len: total / 2,
+        };
         let aligned = align_inward(middle, cluster).unwrap();
         assert!(aligned.start >= middle.start && aligned.end() <= middle.end());
 
@@ -238,10 +283,23 @@ mod tests {
         let whole_after = query_allocated_ranges(&file, &path, 0, total).unwrap();
         let after_sum: u64 = whole_after.iter().map(|r| r.len).sum();
 
-        assert_eq!(before_sum, total, "fully written file should be fully allocated");
-        assert_eq!(after_sum, total - aligned.len, "only the aligned range is deallocated");
-        assert_eq!(after_alloc, after_sum, "measured allocated size must match allocation query");
-        assert!(!report.reclaimed.is_empty(), "middle range must be reclaimed");
+        assert_eq!(
+            before_sum, total,
+            "fully written file should be fully allocated"
+        );
+        assert_eq!(
+            after_sum,
+            total - aligned.len,
+            "only the aligned range is deallocated"
+        );
+        assert_eq!(
+            after_alloc, after_sum,
+            "measured allocated size must match allocation query"
+        );
+        assert!(
+            !report.reclaimed.is_empty(),
+            "middle range must be reclaimed"
+        );
         let reclaimed_sum: u64 = report.reclaimed.iter().map(|r| r.len).sum();
         assert_eq!(
             before_sum - after_sum,
@@ -249,8 +307,14 @@ mod tests {
             "deallocation must be exactly the sum of reclaimed ranges"
         );
         assert_eq!(before_alloc, before_sum);
-        assert!(report.remaining.iter().all(|r| r.len == 0 || r.start >= aligned.start && r.end() <= aligned.end()));
-        assert!(report.remaining.iter().all(|r| r.len == 0 || r.start >= aligned.start && r.end() <= aligned.end()));
+        assert!(report
+            .remaining
+            .iter()
+            .all(|r| r.len == 0 || r.start >= aligned.start && r.end() <= aligned.end()));
+        assert!(report
+            .remaining
+            .iter()
+            .all(|r| r.len == 0 || r.start >= aligned.start && r.end() <= aligned.end()));
 
         // Byte integrity: everything outside the aligned range is unchanged,
         // everything inside reads back as zero.
@@ -264,7 +328,11 @@ mod tests {
                 assert_eq!(*b, 0, "zeroed byte at {i}");
             } else {
                 // Pattern resets every 64 KiB buffer: byte = (idx_in_buffer * 7) % 251.
-                assert_eq!(*b as u64, ((i % 65536) * 7) % 251, "byte outside range at {i} must be unchanged");
+                assert_eq!(
+                    *b as u64,
+                    ((i % 65536) * 7) % 251,
+                    "byte outside range at {i} must be unchanged"
+                );
             }
         }
     }
@@ -280,4 +348,3 @@ mod tests {
         assert!(leftovers.is_empty(), "probe file must be removed");
     }
 }
-

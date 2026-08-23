@@ -29,20 +29,38 @@ impl std::error::Error for PlatformError {}
 
 impl PlatformError {
     /// Create an error from a raw Windows error code.
-    pub fn from_os(kind: PlatformErrorKind, operation: &str, path: Option<&std::path::Path>, os_error: u32) -> Self {
+    pub fn from_os(
+        kind: PlatformErrorKind,
+        operation: &str,
+        path: Option<&std::path::Path>,
+        os_error: u32,
+    ) -> Self {
         Self {
             kind,
-            message: format!("{operation} failed for '{}'", path.map(|p| p.display().to_string()).unwrap_or_else(|| "<none>".into())),
+            message: format!(
+                "{operation} failed for '{}'",
+                path.map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "<none>".into())
+            ),
             os: Some(os_error),
             path: path.map(|p| p.to_path_buf()),
         }
     }
 
     /// Create an error from a `std::io::Error`.
-    pub fn from_io(kind: PlatformErrorKind, operation: &str, path: Option<&std::path::Path>, io: &std::io::Error) -> Self {
+    pub fn from_io(
+        kind: PlatformErrorKind,
+        operation: &str,
+        path: Option<&std::path::Path>,
+        io: &std::io::Error,
+    ) -> Self {
         Self {
             kind,
-            message: format!("{operation} failed for '{}': {io}", path.map(|p| p.display().to_string()).unwrap_or_else(|| "<none>".into())),
+            message: format!(
+                "{operation} failed for '{}': {io}",
+                path.map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "<none>".into())
+            ),
             os: io.raw_os_error().map(|v| v as u32),
             path: path.map(|p| p.to_path_buf()),
         }
@@ -50,7 +68,12 @@ impl PlatformError {
 
     /// Simple non-OS error (policy violation, unsupported feature, ...).
     pub fn policy(kind: PlatformErrorKind, message: impl Into<String>) -> Self {
-        Self { kind, message: message.into(), os: None, path: None }
+        Self {
+            kind,
+            message: message.into(),
+            os: None,
+            path: None,
+        }
     }
 }
 

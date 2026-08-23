@@ -1,4 +1,4 @@
-﻿//! Safety machinery: emergency reserve, pre-flight capacity validation and
+//! Safety machinery: emergency reserve, pre-flight capacity validation and
 //! free-space monitoring during extraction.
 //!
 //! The engine never intentionally drives a volume below the reserve. If
@@ -20,7 +20,10 @@ pub fn validate_capacity_before_unit(
     reserve: u64,
 ) -> Result<(), CoreError> {
     let free = crate::engine::observed_free_space(dest_dir)?;
-    let required = unit.unpacked_bytes.saturating_add(scratch).saturating_add(reserve);
+    let required = unit
+        .unpacked_bytes
+        .saturating_add(scratch)
+        .saturating_add(reserve);
     if free < required {
         return Err(CoreError::Infeasible(format!(
             "Unit {} needs {} bytes (output {} + scratch {} + reserve {}) but only {} are free. \
@@ -50,7 +53,10 @@ pub struct SpaceMonitor {
 
 impl SpaceMonitor {
     pub fn new(reserve: u64) -> Self {
-        SpaceMonitor { reserve, last_free: None }
+        SpaceMonitor {
+            reserve,
+            last_free: None,
+        }
     }
 
     /// Check current free space on the volume containing `dir`.

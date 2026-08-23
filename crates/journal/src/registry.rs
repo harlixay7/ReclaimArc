@@ -1,4 +1,4 @@
-﻿//! Mirrored job registry in application data.
+//! Mirrored job registry in application data.
 //!
 //! A small database that remembers every job, so the app can discover
 //! interrupted jobs even when the archive's directory is opened fresh.
@@ -65,7 +65,9 @@ impl Registry {
 
     /// Register or update a job (durable).
     pub fn upsert(&mut self, e: &RegistryEntry) -> Result<()> {
-        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
             "INSERT INTO jobs (id, archive_dir, job_db_path, archive, destination, created_at, updated_at, status) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
@@ -139,7 +141,8 @@ impl Registry {
 
     /// Remove a job from the registry (used when a job is abandoned).
     pub fn remove(&mut self, job_id: &str) -> Result<()> {
-        self.conn.execute("DELETE FROM jobs WHERE id = ?1", [job_id])?;
+        self.conn
+            .execute("DELETE FROM jobs WHERE id = ?1", [job_id])?;
         Ok(())
     }
 }
@@ -155,7 +158,12 @@ mod tests {
         let e = RegistryEntry {
             job_id: "job-1".into(),
             archive_dir: dir.path().join("a"),
-            job_db_path: dir.path().join("a").join(".reclaimarc").join("job-1").join("job.db"),
+            job_db_path: dir
+                .path()
+                .join("a")
+                .join(".reclaimarc")
+                .join("job-1")
+                .join("job.db"),
             archive: dir.path().join("a").join("x.rar"),
             destination: dir.path().join("out"),
             created_at: crate::now_iso(),
@@ -178,7 +186,12 @@ mod tests {
         let e = RegistryEntry {
             job_id: "j".into(),
             archive_dir: dir.path().join("a"),
-            job_db_path: dir.path().join("a").join(".reclaimarc").join("j").join("job.db"),
+            job_db_path: dir
+                .path()
+                .join("a")
+                .join(".reclaimarc")
+                .join("j")
+                .join("job.db"),
             archive: dir.path().join("x.rar"),
             destination: dir.path().join("out"),
             created_at: crate::now_iso(),

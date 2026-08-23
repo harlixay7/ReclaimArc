@@ -1,4 +1,4 @@
-﻿//! Recovery-unit state machine.
+//! Recovery-unit state machine.
 //!
 //! The master-plan lifecycle:
 //! PENDING → EXTRACTING → OUTPUT_WRITTEN → OUTPUT_VERIFIED → OUTPUT_DURABLE

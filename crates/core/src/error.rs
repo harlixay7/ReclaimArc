@@ -1,4 +1,4 @@
-﻿//! Core engine errors. Every failure carries enough structure to be recorded
+//! Core engine errors. Every failure carries enough structure to be recorded
 //! in the journal and surfaced with a recommended action — the engine never
 //! silently swallows a filesystem error.
 
