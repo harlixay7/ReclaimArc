@@ -24,7 +24,9 @@ use reclaimarc_journal::{JobJournal, Registry, RegistryEntry};
 use reclaimarc_platform::fs::{
     allocated_size_from_handle, file_identity, free_space, same_storage_pool, total_space,
 };
-use reclaimarc_platform::sparse::{open_for_reclaim, reclaim_range, set_sparse, ByteRange};
+use reclaimarc_platform::sparse::{
+    open_for_reclaim, query_allocated_ranges, reclaim_range, set_sparse, ByteRange,
+};
 use reclaimarc_platform::{flush, longpath};
 
 use crate::config::{ConflictPolicy, EngineConfig};
@@ -135,6 +137,14 @@ impl Engine {
         destination: &Path,
         password: Option<String>,
     ) -> Result<(ArchiveInfo, crate::planner::SpacePlan), CoreError> {
+        let dest_str = destination.to_string_lossy();
+        let destination_norm = if dest_str.len() == 2 && dest_str.ends_with(':') {
+            PathBuf::from(format!("{}\\", dest_str))
+        } else {
+            destination.to_path_buf()
+        };
+        let destination = destination_norm.as_path();
+
         let mut backend = reclaimarc_archive::backend_for(archive)?;
         let info = backend.inspect(&OpenOptions { password })?;
         let free = observed_free_space(destination)?;
@@ -174,6 +184,14 @@ impl Engine {
         password: Option<String>,
         tx: Sender<Event>,
     ) -> Result<(JobHandle, ExtractionJob), CoreError> {
+        let dest_str = destination.to_string_lossy();
+        let destination_norm = if dest_str.len() == 2 && dest_str.ends_with(':') {
+            PathBuf::from(format!("{}\\", dest_str))
+        } else {
+            destination.to_path_buf()
+        };
+        let destination = destination_norm.as_path();
+
         let job_id = uuid::Uuid::new_v4().to_string();
         let mut backend = reclaimarc_archive::backend_for(archive)?;
         let info = backend.inspect(&OpenOptions {
@@ -450,6 +468,59 @@ impl Engine {
     ) -> Result<(JobHandle, ExtractionJob), CoreError> {
         let journal = crate::recovery::prepare_resume(journal_path, None)?;
         let meta = journal.job_meta().map_err(CoreError::Journal)?;
+
+        if meta.job_state == JobState::Completed {
+            let job_id = meta.job_id.clone();
+            let _ = tx.send(Event::JobFinished {
+                job_id: job_id.clone(),
+                committed_bytes: 0,
+                reclaimed_bytes: 0,
+            });
+            let info = ArchiveInfo {
+                format: "completed".into(),
+                packed_size: 0,
+                unpacked_size: 0,
+                solid_archive: false,
+                encrypted_headers: false,
+                volumes: vec![],
+                entries: vec![],
+                recovery_units: vec![],
+                capability: reclaimarc_archive::CapabilityMatrix {
+                    format: "completed".into(),
+                    supports_test_integrity: false,
+                    restartable_units: false,
+                    progressive_reclaim: false,
+                    supports_encryption: false,
+                    supports_multipart: false,
+                    notes: vec![],
+                },
+                decoder_requirements: reclaimarc_archive::DecoderRequirements {
+                    scratch_bytes: 0,
+                    redecodes_prefix: false,
+                },
+            };
+            let backend = Box::new(reclaimarc_archive::ZipBackend::new(&meta.archive_path));
+            return Ok((
+                JobHandle {
+                    job_id: job_id.clone(),
+                    pause: Arc::new(AtomicBool::new(false)),
+                    cancel: Arc::new(AtomicBool::new(false)),
+                },
+                ExtractionJob {
+                    job_id,
+                    archive: meta.archive_path.clone(),
+                    destination: meta.destination.clone(),
+                    journal,
+                    info,
+                    backend,
+                    name_map: HashMap::new(),
+                    mode: ExtractionMode::Normal,
+                    password,
+                    tx,
+                },
+            ));
+        }
+
         let mut backend = reclaimarc_archive::backend_for(&meta.archive_path)?;
         let info = backend
             .inspect(&OpenOptions {
@@ -509,6 +580,33 @@ impl Engine {
         &self,
         info: &ArchiveInfo,
     ) -> Result<(Vec<SafeEntry>, HashMap<u64, String>), CoreError> {
+        if (info.entries.len() as u64) > self.config.max_entry_count {
+            return Err(CoreError::Precondition(format!(
+                "Archive contains {} entries, exceeding the configured safety limit of {}.",
+                info.entries.len(),
+                self.config.max_entry_count
+            )));
+        }
+
+        if info.unpacked_size > self.config.max_total_unpacked_bytes {
+            return Err(CoreError::Precondition(format!(
+                "Archive declared total unpacked size of {} bytes exceeds safety limit of {} bytes.",
+                info.unpacked_size,
+                self.config.max_total_unpacked_bytes
+            )));
+        }
+
+        for e in &info.entries {
+            if e.unpacked_size > self.config.max_single_file_bytes {
+                return Err(CoreError::Precondition(format!(
+                    "Entry '{}' declared unpacked size of {} bytes exceeds single-file safety limit of {} bytes.",
+                    e.name,
+                    e.unpacked_size,
+                    self.config.max_single_file_bytes
+                )));
+            }
+        }
+
         let mut safe_entries = Vec::new();
         let mut name_map = HashMap::new();
         for e in &info.entries {
@@ -527,11 +625,55 @@ impl Engine {
             .collect();
         let collisions = find_case_collisions(&names);
         if !collisions.is_empty() {
-            let (a, b) = collisions[0];
-            return Err(CoreError::Precondition(format!(
-                "archive contains case-insensitive filename collisions: '{}' and '{}' — Windows would overwrite one with the other.",
-                safe_entries[a].original, safe_entries[b].original
-            )));
+            if self.config.conflict_policy == ConflictPolicy::RenameNew {
+                let mut seen_lower: HashMap<String, usize> = HashMap::new();
+                for (idx, entry) in safe_entries.iter_mut().enumerate() {
+                    if entry.is_directory {
+                        continue;
+                    }
+                    let key = entry.relative().to_lowercase();
+                    if let std::collections::hash_map::Entry::Vacant(e) = seen_lower.entry(key) {
+                        e.insert(idx);
+                    } else {
+                        let last_comp = entry.components.last().cloned().unwrap_or_default();
+                        let (stem, ext) = match last_comp.rfind('.') {
+                            Some(dot) if dot > 0 => (
+                                last_comp[..dot].to_string(),
+                                Some(last_comp[dot..].to_string()),
+                            ),
+                            _ => (last_comp.clone(), None),
+                        };
+                        let mut counter = 1u64;
+                        loop {
+                            let candidate_name = match &ext {
+                                Some(e) => format!("{stem} (case-collision-{counter}){e}"),
+                                None => format!("{stem} (case-collision-{counter})"),
+                            };
+                            let mut candidate_comps = entry.components.clone();
+                            if let Some(last) = candidate_comps.last_mut() {
+                                *last = candidate_name;
+                            }
+                            let candidate_rel = candidate_comps.join("\\");
+                            let candidate_key = candidate_rel.to_lowercase();
+                            if let std::collections::hash_map::Entry::Vacant(e) =
+                                seen_lower.entry(candidate_key)
+                            {
+                                entry.components = candidate_comps;
+                                e.insert(idx);
+                                name_map.insert(idx as u64, entry.relative());
+                                break;
+                            }
+                            counter += 1;
+                        }
+                    }
+                }
+            } else {
+                let (a, b) = collisions[0];
+                return Err(CoreError::Precondition(format!(
+                    "archive contains case-insensitive filename collisions: '{}' and '{}' — Windows would overwrite one with the other. Use RenameNew conflict policy to auto-rename colliding entries.",
+                    safe_entries[a].original, safe_entries[b].original
+                )));
+            }
         }
         Ok((safe_entries, name_map))
     }
@@ -583,6 +725,14 @@ impl ExtractionJob {
         pause_flag: &AtomicBool,
         cancel_flag: &AtomicBool,
     ) -> Result<JobOutcome, CoreError> {
+        let meta = self.journal.job_meta().map_err(CoreError::Journal)?;
+        if meta.job_state == JobState::Completed {
+            return Ok(JobOutcome::Completed {
+                committed_bytes: 0,
+                reclaimed_bytes: 0,
+            });
+        }
+
         let tx = self.tx.clone();
 
         // Determine units state and whether this is a resume of an in-progress job.
@@ -591,8 +741,15 @@ impl ExtractionJob {
             .iter()
             .any(|u| state::is_committed(u.state) || state::is_reclaimed(u.state));
 
-        // Pre-test for destructive extraction (only on initial start, before any source holes are punched).
-        if self.mode == ExtractionMode::LowSpace && config.pre_test && !is_resuming {
+        // Pre-test for destructive extraction (mandatory for Low-Space mode on initial start, before any source holes are punched).
+        #[cfg(feature = "test-hooks")]
+        let skip_pre_test_test_hook = std::env::var("RECLAIMARC_TEST_SKIP_PRE_TEST")
+            .ok()
+            .as_deref()
+            == Some("1");
+        #[cfg(not(feature = "test-hooks"))]
+        let skip_pre_test_test_hook = false;
+        if self.mode == ExtractionMode::LowSpace && !is_resuming && !skip_pre_test_test_hook {
             let total: u64 = self.info.packed_size;
             let _ = tx.send(Event::PreTestStarted { bytes_total: total });
             let cancel_arc = Arc::new(AtomicBool::new(false));
@@ -622,6 +779,25 @@ impl ExtractionJob {
                         .unwrap_or_default(),
                     report.failure.unwrap_or_else(|| "unknown error".into())
                 )));
+            }
+        }
+
+        // Retirement Proof Validation Gate: Enforce that every destructive PackedRange has a matching backend RetirementProof.
+        if self.mode == ExtractionMode::LowSpace {
+            let proofs = self.backend.retirement_proofs();
+            let proof_set: std::collections::HashSet<(u64, u64, u64, u64)> = proofs
+                .iter()
+                .map(|p| (p.volume_index, p.start, p.len, p.unit_seq))
+                .collect();
+            for u in &self.info.recovery_units {
+                for r in &u.packed_ranges {
+                    if !proof_set.contains(&(r.volume_index, r.start, r.len, u.seq)) {
+                        return Err(CoreError::Infeasible(format!(
+                            "Recovery unit {} packed range [{}, +{}) has no matching backend retirement proof. Destructive extraction aborted.",
+                            u.seq, r.start, r.len
+                        )));
+                    }
+                }
             }
         }
 
@@ -723,6 +899,103 @@ impl ExtractionJob {
                 .map_err(CoreError::Journal)?;
         }
 
+        let mut volume_handles: HashMap<u64, std::fs::File> = HashMap::new();
+        let volumes = self.journal.volumes().map_err(CoreError::Journal)?;
+        let journal_ranges = self.journal.packed_ranges().map_err(CoreError::Journal)?;
+
+        if destructive {
+            // Reconcile entries between live backend info and journaled plan
+            let journal_entries = self.journal.entries().map_err(CoreError::Journal)?;
+            if self.info.entries.len() != journal_entries.len() {
+                return Err(CoreError::failed(
+                    "source structural reconciliation",
+                    Some(self.archive.clone()),
+                    None,
+                    "setup",
+                    format!(
+                        "Archive entry count ({}) does not match journaled entry count ({})",
+                        self.info.entries.len(),
+                        journal_entries.len()
+                    ),
+                    "Aborting destructive extraction immediately: archive structure has changed.",
+                ));
+            }
+            for (e_info, e_jour) in self.info.entries.iter().zip(journal_entries.iter()) {
+                if e_info.name != e_jour.name
+                    || e_info.unpacked_size != e_jour.unpacked_size
+                    || e_info.is_directory != e_jour.is_directory
+                    || e_info.crc32 != e_jour.crc32
+                {
+                    return Err(CoreError::failed(
+                        "source structural reconciliation",
+                        Some(self.archive.clone()),
+                        None,
+                        "setup",
+                        format!(
+                            "Archive entry '{}' does not match journaled plan for entry '{}'",
+                            e_info.name, e_jour.name
+                        ),
+                        "Aborting destructive extraction immediately: archive structure has changed.",
+                    ));
+                }
+            }
+
+            for (idx, vol) in volumes.iter().enumerate() {
+                let f = open_for_reclaim(&vol.path).map_err(CoreError::Platform)?;
+                let ident = file_identity(&vol.path).map_err(CoreError::Platform)?;
+                if let Some(expected_id) = &vol.identity {
+                    if ident.volume_serial != expected_id.volume_serial
+                        || ident.file_id != expected_id.file_id
+                        || ident.file_size != expected_id.file_size
+                    {
+                        return Err(CoreError::failed(
+                            "source volume identity verification",
+                            Some(vol.path.clone()),
+                            None,
+                            "setup",
+                            format!(
+                                "Source volume '{}' identity changed before extraction (serial {} vs {}, id {} vs {}, size {} vs {})",
+                                vol.path.display(),
+                                ident.volume_serial, expected_id.volume_serial,
+                                ident.file_id, expected_id.file_id,
+                                ident.file_size, expected_id.file_size,
+                            ),
+                            "Aborting destructive extraction immediately to prevent data loss.",
+                        ));
+                    }
+                }
+
+                if let Some(expected_struct_digest) = &vol.structural_digest {
+                    let mut vol_ranges: Vec<(u64, u64)> = journal_ranges
+                        .iter()
+                        .filter(|r| r.volume_index as usize == idx)
+                        .map(|r| (r.start, r.len))
+                        .collect();
+                    vol_ranges.sort_by_key(|&(start, _)| start);
+                    let live_struct_hash =
+                        compute_volume_structural_digest(&vol.path, vol.logical_size, &vol_ranges)?;
+                    if &live_struct_hash != expected_struct_digest {
+                        return Err(CoreError::failed(
+                            "source volume structural verification",
+                            Some(vol.path.clone()),
+                            None,
+                            "setup",
+                            format!(
+                                "Source volume '{}' structural metadata changed after planning (expected BLAKE3 {}, live {})",
+                                vol.path.display(),
+                                expected_struct_digest,
+                                live_struct_hash
+                            ),
+                            "Aborting destructive extraction immediately: archive structure does not match journaled plan.",
+                        ));
+                    }
+                }
+
+                set_sparse(&f, &vol.path).map_err(CoreError::Platform)?;
+                volume_handles.insert(idx as u64, f);
+            }
+        }
+
         // The streaming pass skips everything before the first entry that will be
         // (re-)extracted. In destructive mode, committed-but-unreclaimed units
         // are reclaim-only and must NOT be re-extracted — their source may
@@ -748,40 +1021,16 @@ impl ExtractionJob {
                 password: self.password.clone(),
                 cancel: None,
                 name_map: self.name_map.clone(),
+                max_compression_ratio: Some(config.max_compression_ratio),
             };
             self.backend
                 .begin_extraction(&opts, stop_at)
                 .map_err(CoreError::Archive)?;
         }
 
-        let mut volume_handles: HashMap<u64, std::fs::File> = HashMap::new();
-        let volumes = self.journal.volumes().map_err(CoreError::Journal)?;
-        if destructive {
-            for (idx, vol) in volumes.iter().enumerate() {
-                let f = open_for_reclaim(&vol.path).map_err(CoreError::Platform)?;
-                let ident = file_identity(&vol.path).map_err(CoreError::Platform)?;
-                if let Some(expected_id) = &vol.identity {
-                    if ident.volume_serial != expected_id.volume_serial
-                        || ident.file_id != expected_id.file_id
-                        || ident.file_size != expected_id.file_size
-                    {
-                        return Err(CoreError::failed(
-                            "source volume identity verification",
-                            Some(vol.path.clone()),
-                            None,
-                            "setup",
-                            format!(
-                                "Source volume '{}' identity changed before extraction",
-                                vol.path.display()
-                            ),
-                            "Aborting destructive extraction immediately to prevent data loss.",
-                        ));
-                    }
-                }
-                set_sparse(&f, &vol.path).map_err(CoreError::Platform)?;
-                volume_handles.insert(idx as u64, f);
-            }
-        }
+        let mut cumulative_extracted_bytes = 0u64;
+        let mut last_space_check_bytes = 0u64;
+        let mut last_space_check_time = std::time::Instant::now();
 
         while seq < unit_count as u64 {
             let unit = self
@@ -799,6 +1048,13 @@ impl ExtractionJob {
                 .find(|u| u.seq == seq)
                 .map(|u| u.state)
                 .unwrap_or(UnitState::Pending);
+
+            // If the unit is already fully reclaimed, skip it immediately.
+            if state::is_reclaimed(unit_state) {
+                seq += 1;
+                continue;
+            }
+
             let reclaim_only =
                 destructive && state::is_committed(unit_state) && !state::is_reclaimed(unit_state);
 
@@ -807,6 +1063,14 @@ impl ExtractionJob {
                 first_entry: unit.first_entry,
                 last_entry: unit.last_entry,
             });
+            if let Some(entry) = self.info.entries.get(unit.first_entry as usize) {
+                if !entry.is_directory {
+                    let _ = tx.send(Event::EntryStarted {
+                        index: entry.index,
+                        name: entry.name.clone(),
+                    });
+                }
+            }
 
             // Safety gate: enough capacity for output + scratch + reserve.
             validate_capacity_before_unit(&self.destination, unit, scratch, reserve)?;
@@ -829,19 +1093,81 @@ impl ExtractionJob {
                     password: self.password.clone(),
                     cancel: None,
                     name_map: self.name_map.clone(),
+                    max_compression_ratio: Some(config.max_compression_ratio),
                 };
+                let mut last_entry_index: Option<u64> = None;
+                let mut last_current = 0u64;
+                let mut space_check_failed = false;
+                let mut space_check_error: Option<String> = None;
                 let mut progress_cb = |e: ProgressEvent| {
-                    let _ = tx.send(match e {
+                    match e {
                         ProgressEvent::EntryProgress {
                             entry_index,
                             current,
                             total,
-                        } => Event::EntryProgress {
-                            index: entry_index,
-                            current,
-                            total,
-                        },
-                    });
+                        } => {
+                            let is_new_entry = last_entry_index != Some(entry_index);
+                            let delta = match last_entry_index {
+                                Some(last_idx) if last_idx == entry_index => {
+                                    let d = current.saturating_sub(last_current);
+                                    last_current = current;
+                                    d
+                                }
+                                _ => {
+                                    last_entry_index = Some(entry_index);
+                                    last_current = current;
+                                    current
+                                }
+                            };
+                            if is_new_entry {
+                                let name = self
+                                    .info
+                                    .entries
+                                    .get(entry_index as usize)
+                                    .map(|e| e.name.clone())
+                                    .unwrap_or_default();
+                                let _ = tx.send(Event::EntryStarted {
+                                    index: entry_index,
+                                    name,
+                                });
+                            }
+                            cumulative_extracted_bytes =
+                                cumulative_extracted_bytes.saturating_add(delta);
+
+                            if destructive {
+                                let bytes_since_check = cumulative_extracted_bytes
+                                    .saturating_sub(last_space_check_bytes);
+                                let time_since_check = last_space_check_time.elapsed();
+                                if bytes_since_check >= 10 * 1024 * 1024
+                                    || time_since_check >= std::time::Duration::from_millis(500)
+                                {
+                                    last_space_check_bytes = cumulative_extracted_bytes;
+                                    last_space_check_time = std::time::Instant::now();
+                                    match monitor.check(&self.destination) {
+                                        Ok(SpaceCheck::BelowReserve) => {
+                                            space_check_failed = true;
+                                            return false;
+                                        }
+                                        Ok(SpaceCheck::Ok | SpaceCheck::ApproachingReserve) => {}
+                                        Err(e) => {
+                                            space_check_error =
+                                                Some(format!("Free space probe failed: {e}"));
+                                            space_check_failed = true;
+                                            return false;
+                                        }
+                                    }
+                                }
+                            }
+                            let _ = tx.send(Event::EntryProgress {
+                                index: entry_index,
+                                current,
+                                total,
+                            });
+                        }
+                    }
+                    if space_check_failed {
+                        return false;
+                    }
                     // Pause = safe abort at the next file boundary.
                     !cancel_flag.load(Ordering::SeqCst) && !pause_flag.load(Ordering::SeqCst)
                 };
@@ -911,6 +1237,17 @@ impl ExtractionJob {
                     if !entry_info.is_directory && entry_info.redirection.is_none() {
                         match self.backend.extract_next(&opts, Some(&mut progress_cb)) {
                             Err(reclaimarc_archive::ArchiveError::Cancelled)
+                                if space_check_failed =>
+                            {
+                                if let Some(err_msg) = space_check_error {
+                                    return Err(CoreError::Infeasible(err_msg));
+                                }
+                                return Err(CoreError::Infeasible(
+                                    "Free space dropped below emergency reserve during extraction. Aborting unit safely before commitment."
+                                        .into(),
+                                ));
+                            }
+                            Err(reclaimarc_archive::ArchiveError::Cancelled)
                                 if pause_flag.load(Ordering::SeqCst) =>
                             {
                                 self.journal
@@ -944,6 +1281,15 @@ impl ExtractionJob {
                         .backend
                         .extract_unit(seq, &opts, Some(&mut progress_cb));
                     if let Err(e) = extract {
+                        if space_check_failed {
+                            if let Some(err_msg) = space_check_error {
+                                return Err(CoreError::Infeasible(err_msg));
+                            }
+                            return Err(CoreError::Infeasible(
+                                "Free space dropped below emergency reserve during extraction. Aborting unit safely before commitment."
+                                    .into(),
+                            ));
+                        }
                         return match e {
                             reclaimarc_archive::ArchiveError::Cancelled
                                 if pause_flag.load(Ordering::SeqCst) =>
@@ -965,6 +1311,15 @@ impl ExtractionJob {
                             other => Err(CoreError::Archive(other)),
                         };
                     }
+                }
+                if space_check_failed {
+                    if let Some(err_msg) = space_check_error {
+                        return Err(CoreError::Infeasible(err_msg));
+                    }
+                    return Err(CoreError::Infeasible(
+                        "Free space dropped below emergency reserve during extraction. Aborting unit safely before commitment."
+                            .into(),
+                    ));
                 }
                 fault::fire(CrashPoint::AfterPartialWrite, &self.job_id);
 
@@ -1067,7 +1422,7 @@ impl ExtractionJob {
                     });
                 }
                 // Create directories that were only entries.
-                create_directory_entries(&self.destination, &entries)?;
+                create_directory_entries(&self.destination, &entries, &mut self.journal)?;
                 // Flush the destination directory periodically so renames are durable without MFT bottlenecks.
                 if seq.is_multiple_of(64) || seq + 1 == unit_count as u64 {
                     let _ = flush::flush_directory(&self.destination);
@@ -1121,6 +1476,8 @@ impl ExtractionJob {
                                 len: r.len,
                             });
                     }
+                    let mut processed_ranges = 0usize;
+
                     for (v_idx, ranges) in by_volume {
                         let vol = volumes.get(v_idx as usize).ok_or_else(|| {
                             CoreError::Precondition(format!("volume {v_idx} not found"))
@@ -1179,14 +1536,19 @@ impl ExtractionJob {
                             let released = report.released_bytes();
                             reclaimed_for_unit = reclaimed_for_unit.saturating_add(released);
                             reclaimed_bytes = reclaimed_bytes.saturating_add(released);
-                            let _ = tx.send(Event::RangeReclaimed {
-                                volume_index: v_idx,
-                                bytes: released,
-                            });
                             fault::fire(CrashPoint::AfterPhysicalHolePunch, &self.job_id);
-                            let outcome_state = if report.remaining.is_empty() {
+
+                            let current_alloc =
+                                query_allocated_ranges(file, &vol.path, range.start, range.len)
+                                    .map_err(CoreError::Platform)?;
+                            let currently_allocated: u64 =
+                                current_alloc.iter().map(|r| r.len).sum();
+                            let verified_released =
+                                range.len.saturating_sub(currently_allocated).min(range.len);
+
+                            let outcome_state = if current_alloc.is_empty() {
                                 RangeState::Reclaimed
-                            } else if released > 0 {
+                            } else if verified_released > 0 {
                                 RangeState::Partial
                             } else {
                                 RangeState::Active
@@ -1197,11 +1559,15 @@ impl ExtractionJob {
                                     range.start,
                                     range.len,
                                     outcome_state,
-                                    released,
+                                    verified_released,
                                 )
                                 .map_err(CoreError::Journal)?;
+
+                            processed_ranges += 1;
+                            if processed_ranges == 1 {
+                                fault::fire(CrashPoint::DuringHolePunch, &self.job_id);
+                            }
                         }
-                        fault::fire(CrashPoint::DuringHolePunch, &self.job_id);
                     }
                     fault::fire(CrashPoint::BeforeReclaimedCommit, &self.job_id);
                     let updated_ranges = self
@@ -1298,8 +1664,13 @@ impl ExtractionJob {
         self.backend.close();
 
         // Completion.
-        if self.mode == ExtractionMode::LowSpace && config.delete_shells_on_completion {
-            delete_archive_shells(&self.journal)?;
+        if config.delete_shells_on_completion {
+            self.journal
+                .set_job_state(JobState::Finalizing)
+                .map_err(CoreError::Journal)?;
+            fault::fire(CrashPoint::BeforeShellDeletion, &self.job_id);
+            delete_archive_shells(&self.journal, &self.job_id)?;
+            fault::fire(CrashPoint::AfterShellDeletionBeforeCompleted, &self.job_id);
         }
         self.journal
             .set_job_progress(seq, JobState::Completed)
@@ -1499,7 +1870,7 @@ fn rename_into_place(
                     match verify_against(final_path, Some(expected_size), expected_blake3) {
                         Ok(true) => {
                             // Proven byte-identical. Delete the partial and reuse existing.
-                            let _ = std::fs::remove_file(partial);
+                            let _ = longpath::remove_file_existing(partial);
                             Ok(CommitOutcome::ReusedExisting(final_path.to_path_buf()))
                         }
                         _ => {
@@ -1511,7 +1882,7 @@ fn rename_into_place(
                     }
                 } else {
                     // Normal mode: safe to skip (source will be preserved).
-                    let _ = std::fs::remove_file(partial);
+                    let _ = longpath::remove_file_existing(partial);
                     Ok(CommitOutcome::ReusedExisting(final_path.to_path_buf()))
                 }
             } else {
@@ -1548,7 +1919,11 @@ fn rename_into_place(
 }
 
 /// Create directory entries that no file created implicitly.
-fn create_directory_entries(dest: &Path, entries: &[EntryRecord]) -> Result<(), CoreError> {
+fn create_directory_entries(
+    dest: &Path,
+    entries: &[EntryRecord],
+    journal: &mut JobJournal,
+) -> Result<(), CoreError> {
     for e in entries {
         if !e.is_directory {
             continue;
@@ -1567,6 +1942,9 @@ fn create_directory_entries(dest: &Path, entries: &[EntryRecord]) -> Result<(), 
                 )
             })?;
         }
+        journal
+            .set_entry_status(e.index_in_archive, EntryStatus::Committed)
+            .map_err(CoreError::Journal)?;
     }
     Ok(())
 }
@@ -1578,13 +1956,13 @@ fn create_directory_entries(dest: &Path, entries: &[EntryRecord]) -> Result<(), 
 /// 1. Every single unit in the journal is in `Reclaimed` or `Committed` state.
 /// 2. Zero errors are recorded in the journal.
 /// 3. Every single entry in the journal is either:
-///    - `Committed` (physically exists on disk and its size matches `unpacked_size`);
+///    - `Committed` (physically exists on disk and its size matches `unpacked_size`, and digest matches);
 ///    - OR `Skipped` if and only if it is an authorized redirection policy skip (`is_redirection == true`),
 ///      and no rogue file or link was created on disk.
 ///
 /// If even a single file is missing, size-mismatched, unreadable, or in an unexpected skip state,
 /// this function returns an error and refuses to delete the source archive.
-fn delete_archive_shells(journal: &JobJournal) -> Result<(), CoreError> {
+pub fn delete_archive_shells(journal: &JobJournal, job_id: &str) -> Result<(), CoreError> {
     let units = journal.units().map_err(CoreError::Journal)?;
     if units.is_empty() {
         return Err(CoreError::Precondition(
@@ -1606,8 +1984,8 @@ fn delete_archive_shells(journal: &JobJournal) -> Result<(), CoreError> {
         }
     }
 
-    // 2. Verify zero recorded errors in the journal.
-    let errors = journal.errors().unwrap_or_default();
+    // 2. Verify zero recorded errors in the journal (fails closed on journal read failure).
+    let errors = journal.errors().map_err(CoreError::Journal)?;
     if !errors.is_empty() {
         return Err(CoreError::failed(
             "verify journal errors before shell deletion",
@@ -1630,59 +2008,79 @@ fn delete_archive_shells(journal: &JobJournal) -> Result<(), CoreError> {
     for e in &entries {
         match e.status {
             EntryStatus::Committed => {
-                let Some(final_path) = &e.final_path else {
-                    return Err(CoreError::failed(
-                        "verify entry paths before shell deletion",
-                        None,
-                        None,
-                        "COMPLETED",
-                        format!("entry {} has no final path", e.index_in_archive),
-                        "Source archive will NOT be deleted.",
-                    ));
-                };
+                if e.is_directory {
+                    let Some(final_path) = &e.final_path else {
+                        return Err(CoreError::failed(
+                            "verify entry paths before shell deletion",
+                            None,
+                            None,
+                            "COMPLETED",
+                            format!("directory entry {} has no final path", e.index_in_archive),
+                            "Source archive will NOT be deleted.",
+                        ));
+                    };
+                    if !final_path.is_dir() {
+                        return Err(CoreError::failed(
+                            "verify physical directory before shell deletion",
+                            Some(final_path.clone()),
+                            None,
+                            "COMPLETED",
+                            format!(
+                                "output directory '{}' does not exist on disk",
+                                final_path.display()
+                            ),
+                            "Source archive will NOT be deleted.",
+                        ));
+                    }
+                } else {
+                    let target_path = e
+                        .actual_committed_path
+                        .as_ref()
+                        .or(e.final_path.as_ref())
+                        .ok_or_else(|| {
+                            CoreError::failed(
+                                "verify entry paths before shell deletion",
+                                None,
+                                None,
+                                "COMPLETED",
+                                format!("entry {} has no final/committed path", e.index_in_archive),
+                                "Source archive will NOT be deleted.",
+                            )
+                        })?;
 
-                if !e.is_directory {
-                    let meta = std::fs::metadata(final_path).map_err(|err| {
+                    let live_blake3 = verify_file(target_path, Some(e.unpacked_size), 64 * 1024).map_err(|err| {
                         CoreError::failed(
                             "verify physical file before shell deletion",
-                            Some(final_path.clone()),
+                            Some(target_path.clone()),
                             err.raw_os_error().map(|c| c as u32),
                             "COMPLETED",
                             format!(
-                                "output file '{}' cannot be read on disk: {err}",
-                                final_path.display()
+                                "output file '{}' verification failed (missing or size mismatch): {err}",
+                                target_path.display()
                             ),
                             "Source archive will NOT be deleted.",
                         )
                     })?;
 
-                    if meta.len() != e.unpacked_size {
-                        return Err(CoreError::failed(
-                            "verify physical file size before shell deletion",
-                            Some(final_path.clone()),
-                            None,
-                            "COMPLETED",
-                            format!(
-                                "output file '{}' size mismatch: expected {} bytes on disk, found {} bytes",
-                                final_path.display(),
-                                e.unpacked_size,
-                                meta.len()
-                            ),
-                            "Source archive will NOT be deleted.",
-                        ));
+                    if let Some(expected_digest) =
+                        e.expected_digest.as_deref().or(e.blake3.as_deref())
+                    {
+                        if live_blake3 != expected_digest {
+                            return Err(CoreError::failed(
+                                "verify physical file digest before shell deletion",
+                                Some(target_path.clone()),
+                                None,
+                                "COMPLETED",
+                                format!(
+                                    "output file '{}' hash mismatch: expected BLAKE3 {}, computed {}",
+                                    target_path.display(),
+                                    expected_digest,
+                                    live_blake3
+                                ),
+                                "Source archive will NOT be deleted.",
+                            ));
+                        }
                     }
-                } else if !final_path.is_dir() {
-                    return Err(CoreError::failed(
-                        "verify physical directory before shell deletion",
-                        Some(final_path.clone()),
-                        None,
-                        "COMPLETED",
-                        format!(
-                            "output directory '{}' does not exist on disk",
-                            final_path.display()
-                        ),
-                        "Source archive will NOT be deleted.",
-                    ));
                 }
             }
             EntryStatus::Skipped => {
@@ -1733,9 +2131,9 @@ fn delete_archive_shells(journal: &JobJournal) -> Result<(), CoreError> {
         }
     }
 
-    // 4. All checks passed with verified completion — delete the volume files.
+    // 4. All checks passed with verified completion — delete the volume files idempotently.
     let volumes = journal.volumes().map_err(CoreError::Journal)?;
-    for v in volumes {
+    for (v_idx, v) in volumes.iter().enumerate() {
         if v.path.exists() {
             std::fs::remove_file(&v.path).map_err(|e| {
                 CoreError::failed(
@@ -1747,6 +2145,9 @@ fn delete_archive_shells(journal: &JobJournal) -> Result<(), CoreError> {
                     "The extraction completed; delete the archive manually.",
                 )
             })?;
+            if v_idx == 0 && volumes.len() > 1 {
+                fault::fire(CrashPoint::DuringMultipartShellDeletion, job_id);
+            }
         }
     }
     Ok(())

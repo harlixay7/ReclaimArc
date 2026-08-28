@@ -100,9 +100,8 @@ impl JobJournal {
 
     /// Force a checkpoint so the WAL is folded back into the main database.
     pub fn checkpoint(&self) -> Result<()> {
-        let _ = self
-            .conn
-            .prepare_cached("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        self.conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_row| Ok(()))?;
         Ok(())
     }
 
@@ -175,6 +174,16 @@ impl JobJournal {
         self.conn.execute(
             "UPDATE job_meta SET current_unit = ?1, job_state = ?2, updated_at = ?3 WHERE id = 1",
             params![current_unit as i64, job_state.as_str(), now],
+        )?;
+        Ok(())
+    }
+
+    /// Update the durable job state directly.
+    pub fn set_job_state(&mut self, job_state: JobState) -> Result<()> {
+        let now = crate::now_iso();
+        self.conn.execute(
+            "UPDATE job_meta SET job_state = ?1, updated_at = ?2 WHERE id = 1",
+            params![job_state.as_str(), now],
         )?;
         Ok(())
     }
@@ -840,12 +849,13 @@ impl JobJournal {
         state: RangeState,
         physically_released_bytes: u64,
     ) -> Result<()> {
+        let clamped = physically_released_bytes.min(len);
         self.conn.execute(
-            "UPDATE packed_ranges SET state = ?1, physically_released_bytes = ?2 \
+            "UPDATE packed_ranges SET state = ?1, physically_released_bytes = MAX(COALESCE(physically_released_bytes, 0), ?2) \
              WHERE volume_index = ?3 AND start = ?4 AND len = ?5",
             params![
                 state.as_str(),
-                physically_released_bytes as i64,
+                clamped as i64,
                 (volume_index + 1) as i64,
                 start as i64,
                 len as i64
@@ -1192,5 +1202,107 @@ mod tests {
         j.transition_unit_state(0, UnitState::Pending, UnitState::Extracting)
             .unwrap();
         assert_eq!(j.unit(0).unwrap().state, UnitState::Extracting);
+    }
+
+    #[test]
+    fn test_checkpoint_executes_wal_truncate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = db_path(dir.path());
+        let meta = sample_meta(dir.path());
+        let mut j = JobJournal::create(&path, &meta).unwrap();
+
+        // Write records to generate WAL frames
+        j.add_units(&[RecoveryUnitRecord {
+            seq: 0,
+            state: UnitState::Pending,
+            first_entry: 0,
+            last_entry: 0,
+            error: None,
+            updated_at: crate::now_iso(),
+        }])
+        .unwrap();
+
+        // Checkpoint must succeed and truncate the WAL file
+        j.checkpoint()
+            .expect("checkpoint must execute successfully");
+
+        let wal_path = dir.path().join("job.db-wal");
+        if wal_path.exists() {
+            let metadata = std::fs::metadata(&wal_path).unwrap();
+            assert_eq!(metadata.len(), 0, "WAL file should be truncated to 0 bytes");
+        }
+    }
+
+    #[test]
+    fn test_mark_range_outcome_monotonicity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = db_path(dir.path());
+        let meta = sample_meta(dir.path());
+        let mut j = JobJournal::create(&path, &meta).unwrap();
+
+        j.add_units(&[RecoveryUnitRecord {
+            seq: 0,
+            state: UnitState::Pending,
+            first_entry: 0,
+            last_entry: 0,
+            error: None,
+            updated_at: crate::now_iso(),
+        }])
+        .unwrap();
+
+        j.add_volumes(&[crate::VolumeRecord {
+            path: dir.path().join("source.zip"),
+            identity: None,
+            allocated_before: 10000,
+            logical_size: 10000,
+            is_first: true,
+            structural_digest: None,
+        }])
+        .unwrap();
+
+        j.add_packed_ranges(&[crate::PackedRangeRecord {
+            volume_index: 0,
+            start: 0,
+            len: 10000,
+            state: RangeState::Active,
+            physically_released_bytes: 0,
+            blake3_digest: None,
+            recovery_unit: Some(0),
+        }])
+        .unwrap();
+
+        // 1. Initial partial reclaim
+        j.mark_range_outcome(0, 0, 10000, RangeState::Partial, 4000)
+            .unwrap();
+        assert_eq!(
+            j.packed_ranges().unwrap()[0].physically_released_bytes,
+            4000
+        );
+
+        // 2. An attempt to store a lower value must not regress recorded released bytes
+        j.mark_range_outcome(0, 0, 10000, RangeState::Partial, 2000)
+            .unwrap();
+        assert_eq!(
+            j.packed_ranges().unwrap()[0].physically_released_bytes,
+            4000,
+            "physically_released_bytes must be monotonic"
+        );
+
+        // 3. Higher value updates correctly
+        j.mark_range_outcome(0, 0, 10000, RangeState::Reclaimed, 10000)
+            .unwrap();
+        assert_eq!(
+            j.packed_ranges().unwrap()[0].physically_released_bytes,
+            10000
+        );
+
+        // 4. Value exceeding len is clamped to len
+        j.mark_range_outcome(0, 0, 10000, RangeState::Reclaimed, 50000)
+            .unwrap();
+        assert_eq!(
+            j.packed_ranges().unwrap()[0].physically_released_bytes,
+            10000,
+            "physically_released_bytes must not exceed range len"
+        );
     }
 }

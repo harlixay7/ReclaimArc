@@ -1,5 +1,6 @@
 # Build outputs
 /target
+/dist-release
 apps/desktop/src-tauri/target
 apps/desktop/dist
 apps/desktop/node_modules

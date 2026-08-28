@@ -183,14 +183,28 @@ export async function readLogs(last: number): Promise<string> {
   return invoke("read_logs", { last });
 }
 
+export async function getPendingArchive(): Promise<string | null> {
+  return invoke("get_pending_archive");
+}
+
+export async function getContextMenuStatus(): Promise<boolean> {
+  return invoke("get_context_menu_status");
+}
+
+export async function setContextMenuStatus(enabled: boolean): Promise<void> {
+  return invoke("set_context_menu_status", { enabled });
+}
+
 export async function pickArchive(): Promise<string | null> {
   const { open } = await import("@tauri-apps/plugin-dialog");
   const picked = await open({
     title: "Choose an archive",
     multiple: false,
     filters: [
-      { name: "RAR Archives", extensions: ["rar", "cbr", "001", "r00"] },
-      { name: "All files", extensions: ["*"] },
+      { name: "Archives (*.rar, *.zip, *.cbr, *.cbz)", extensions: ["rar", "zip", "cbr", "cbz", "001", "r00"] },
+      { name: "ZIP Archives (*.zip, *.cbz)", extensions: ["zip", "cbz"] },
+      { name: "RAR Archives (*.rar, *.cbr)", extensions: ["rar", "cbr", "001", "r00"] },
+      { name: "All files (*.*)", extensions: ["*"] },
     ],
   });
   if (typeof picked === "string") return picked;

@@ -30,6 +30,8 @@ pub struct ExtractOptions {
     /// path). The backend MUST write through these names; raw archive names
     /// are hostile and never used for filesystem paths.
     pub name_map: HashMap<u64, String>,
+    /// Configured maximum observed compression ratio threshold (e.g. 1000 for 1000:1).
+    pub max_compression_ratio: Option<u64>,
 }
 
 /// Options for opening/listing an archive.

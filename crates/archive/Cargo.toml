@@ -2,6 +2,7 @@
 name = "reclaimarc-archive"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
@@ -10,6 +11,9 @@ thiserror.workspace = true
 tracing.workspace = true
 blake3.workspace = true
 unrar_sys = { package = "unrar-ng-sys", version = "0.7.7" }
+zip.workspace = true
+rawzip.workspace = true
+crc32fast.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

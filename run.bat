@@ -22,6 +22,7 @@ if errorlevel 1 (
 if "%1"=="--cli" goto launch_cli
 if "%1"=="--test" goto run_tests
 if "%1"=="--build" goto build_all
+if "%1"=="--publish" goto publish_public
 if "%1"=="--setup" goto run_setup
 if "%1"=="--help" goto show_help
 
@@ -72,7 +73,7 @@ cargo test --workspace
 exit /b %errorlevel%
 
 :build_all
-echo [*] Compiling release binaries and packaging desktop installers...
+echo [*] Compiling release binaries and packaging desktop installer...
 cargo build --release -p reclaimarc-cli
 pushd apps\desktop
 if not exist "node_modules" call npm install
@@ -82,8 +83,23 @@ echo.
 echo [OK] All release artifacts generated in "target\release\":
 echo      - CLI Binary: target\release\reclaimarc.exe
 echo      - Desktop App: target\release\reclaimarc-desktop.exe
-echo      - NSIS Installer: target\release\bundle\nsis\ReclaimArc_0.1.0_x64-setup.exe
-echo      - MSI Installer: target\release\bundle\msi\ReclaimArc_0.1.0_x64_en-US.msi
+echo      - Setup Installer: target\release\bundle\nsis\ReclaimArc_0.2.0_x64-setup.exe
+exit /b 0
+
+:publish_public
+echo [*] Running full workspace verification suite before publishing...
+cargo test --workspace
+if errorlevel 1 (
+    echo [!] Tests failed. Aborting publish.
+    exit /b 1
+)
+echo [*] Pushing verified main branch and release tags to Public repository...
+git push public main --tags
+if errorlevel 1 (
+    echo [!] Failed to push to public repository. Please inspect remote configuration.
+    exit /b 1
+)
+echo [OK] Successfully published to Public repository (https://github.com/harlixay7/ReclaimArc).
 exit /b 0
 
 :run_setup
@@ -97,6 +113,7 @@ echo   run.bat          -- Launch the Desktop GUI Application [default]
 echo   run.bat --cli    -- Open the CLI interactive console
 echo   run.bat --test   -- Run the automated verification test suite
 echo   run.bat --build  -- Build release binaries and installer packages
+echo   run.bat --publish-- Run tests and publish release to public repository
 echo   run.bat --setup  -- Run universal dependency bootstrap
 echo   run.bat --help   -- Display this reference manual
 echo.

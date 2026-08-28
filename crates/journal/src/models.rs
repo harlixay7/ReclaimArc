@@ -228,6 +228,7 @@ pub struct JobMeta {
 pub enum JobState {
     Active,
     Paused,
+    Finalizing,
     Completed,
     Failed,
     Abandoned,
@@ -238,6 +239,7 @@ impl JobState {
         match self {
             JobState::Active => "ACTIVE",
             JobState::Paused => "PAUSED",
+            JobState::Finalizing => "FINALIZING",
             JobState::Completed => "COMPLETED",
             JobState::Failed => "FAILED",
             JobState::Abandoned => "ABANDONED",
@@ -248,6 +250,7 @@ impl JobState {
         Ok(match s {
             "ACTIVE" => JobState::Active,
             "PAUSED" => JobState::Paused,
+            "FINALIZING" => JobState::Finalizing,
             "COMPLETED" => JobState::Completed,
             "FAILED" => JobState::Failed,
             "ABANDONED" => JobState::Abandoned,

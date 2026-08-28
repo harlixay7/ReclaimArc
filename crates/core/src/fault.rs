@@ -27,6 +27,12 @@ pub enum CrashPoint {
     AfterPhysicalHolePunch,
     /// After holes are punched, before the RECLAIMED journal record.
     BeforeReclaimedCommit,
+    /// Before final source shell deletion begins (in Finalizing state).
+    BeforeShellDeletion,
+    /// During multipart shell deletion, after part 1 is deleted.
+    DuringMultipartShellDeletion,
+    /// After all shells are deleted, before COMPLETED is written to journal.
+    AfterShellDeletionBeforeCompleted,
 }
 
 impl CrashPoint {
@@ -40,6 +46,11 @@ impl CrashPoint {
             CrashPoint::DuringHolePunch => "during-hole-punch",
             CrashPoint::AfterPhysicalHolePunch => "after-physical-hole-punch",
             CrashPoint::BeforeReclaimedCommit => "before-reclaimed-commit",
+            CrashPoint::BeforeShellDeletion => "before-shell-deletion",
+            CrashPoint::DuringMultipartShellDeletion => "during-multipart-shell-deletion",
+            CrashPoint::AfterShellDeletionBeforeCompleted => {
+                "after-shell-deletion-before-completed"
+            }
         }
     }
 
@@ -54,6 +65,11 @@ impl CrashPoint {
             "during-hole-punch" => Some(CrashPoint::DuringHolePunch),
             "after-physical-hole-punch" => Some(CrashPoint::AfterPhysicalHolePunch),
             "before-reclaimed-commit" => Some(CrashPoint::BeforeReclaimedCommit),
+            "before-shell-deletion" => Some(CrashPoint::BeforeShellDeletion),
+            "during-multipart-shell-deletion" => Some(CrashPoint::DuringMultipartShellDeletion),
+            "after-shell-deletion-before-completed" => {
+                Some(CrashPoint::AfterShellDeletionBeforeCompleted)
+            }
             _ => None,
         }
     }

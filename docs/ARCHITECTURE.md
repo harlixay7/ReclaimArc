@@ -1,87 +1,95 @@
-﻿# ReclaimArc — Architecture
+# ReclaimArc System Architecture
 
 ```
-┌─────────────────────────────── apps ───────────────────────────────┐
-│  apps/cli         reclaimarc  (inspect / plan / extract / resume) │
-│  apps/desktop     Tauri 2 + React + strict TypeScript              │
-└───────────────────────────────▲───────────────────────────────────┘
-                                 │ events / commands
-┌─────────────────────────── crates/core ────────────────────────────┐
-│  engine     transactional per-unit lifecycle, pause/stop/cancel    │
-│  planner    recovery-unit space simulation + feasibility verdicts  │
-│  safety     emergency reserve, capacity gates, space monitor       │
-│  paths      hostile-name validation (traversal, ADS, collisions)   │
-│  recovery   discovery, identity validation, reconciliation, resume │
-│  state      PENDING→…→RECLAIMED linear state machine               │
-│  fault      crash-point injection for the test harness             │
-└───────────────▲──────────────────┬───────────────────┬─────────────┘
-                 │                  │                   │
-      ┌──────────┴───────┐  ┌──────┴────────┐  ┌───────┴──────────┐
-      │ crates/archive   │  │ crates/journal│  │ crates/platform  │
-      │ ArchiveBackend   │  │ SQLite, WAL,  │  │ Windows: sparse  │
-      │ RAR parser       │  │ synchronous=  │  │ FSCTL_SET_ZERO_  │
-      │ unrar_sys FFI    │  │ FULL, schema  │  │ DATA, allocation │
-      │ (official UnRAR) │  │ registry      │  │ queries, flushes │
-      └──────────────────┘  └──────────────┘  └──────────────────┘
+┌─────────────────────────────── Applications ───────────────────────────────┐
+│  apps/cli         reclaimarc (inspect / plan / extract / resume / jobs)     │
+│  apps/desktop     Tauri 2 + React + TypeScript GUI                         │
+└───────────────────────────────────────▲────────────────────────────────────┘
+                                        │ events / commands
+┌──────────────────────────────── crates/core ───────────────────────────────┐
+│  engine     transactional per-unit lifecycle, pause / stop / cancel        │
+│  planner    space simulation, headroom calculation, feasibility verdicts   │
+│  safety     emergency reserve, capacity gates, live space monitor          │
+│  paths      hostile-path validation, case collision disambiguation         │
+│  recovery   discovery, source identity validation, state reconciliation    │
+│  state      PENDING -> ... -> RECLAIMED linear state machine               │
+│  fault      crash-point injection harness for fault-tolerance tests        │
+└───────────────▲───────────────────────┬──────────────────────┬─────────────┘
+                │                       │                      │
+     ┌──────────┴────────┐      ┌───────┴────────┐     ┌───────┴──────────┐
+     │  crates/archive   │      │ crates/journal │     │ crates/platform  │
+     │  ArchiveBackend   │      │ SQLite, WAL,   │     │ Windows: sparse  │
+     │  RAR (UnRAR FFI)  │      │ synchronous=   │     │ FSCTL_SET_ZERO_  │
+     │  ZIP / ZIP64      │      │ FULL, schema   │     │ DATA, allocation │
+     │  streaming engine │      │ registry,      │     │ queries, AV lock │
+     │  data descriptors │      │ checkpoint     │     │ retries, shell   │
+     └───────────────────┘      └────────────────┘     └──────────────────┘
 ```
 
-## The core does not depend on the UI
+---
 
-`crates/core` exposes the engine; both the CLI and the desktop app are thin
-drivers over it. The CLI and GUI use the same tested engine.
+## 1. Architectural Principles
 
-## Archive backends
+1. **Decoupled Core Engine**: `crates/core` contains all extraction coordination, space simulation, recovery, and safety policies. Both `apps/cli` and `apps/desktop` are thin drivers consuming engine APIs and event streams.
+2. **Fail-Closed Invariants**: If safety cannot be proven before a destructive operation, the engine halts immediately. Source sectors are never deallocated on speculative or unverified data.
+3. **Transactional Storage Migration**: Every step in the extraction process follows an ACID state machine backed by an SQLite Write-Ahead Log (WAL).
 
-`ArchiveBackend` (crates/archive) is the only way the engine talks to an
-archive:
+---
 
+## 2. Archive Backends (`crates/archive`)
+
+All archive formats implement the common `ArchiveBackend` trait:
+
+```rust
+pub trait ArchiveBackend: Send + Sync {
+    fn inspect(&mut self, options: &OpenOptions) -> Result<ArchiveInfo, ArchiveError>;
+    fn test_integrity(&mut self, options: &OpenOptions, tx: &Sender<Event>) -> Result<bool, ArchiveError>;
+    fn extract_unit(&mut self, unit: &RecoveryUnit, target_dir: &Path, tx: &Sender<Event>) -> Result<UnitExtractResult, ArchiveError>;
+    fn cancel(&mut self);
+    fn retirement_proofs(&self, unit: &RecoveryUnit) -> Result<Vec<PackedRange>, ArchiveError>;
+}
 ```
-inspect()  test_integrity()  entries()  recovery_units()  extract_unit()
-cancel()   decoder_requirements()  retirement_proofs()
-```
 
-The RAR backend (v1 target) uses the **official UnRAR source** (vendored by
-`unrar_sys`, RARLab license kept at `unrar_sys/vendor/unrar/license.txt`) for
-all decoding, plus our own header parser for exact packed ranges, solid
-chains and split-file parts. The parser is cross-validated against the C
-library's own header stream during inspection — a mismatch fails the job
-rather than guessing.
+### RAR Engine (`crates/archive/src/rar/`)
+- Uses the **official C++ UnRAR library** (`unrar-ng-sys`) for all decompression, ensuring complete fidelity with RAR4 and RAR5 formats.
+- Cross-validates proprietary header offsets against UnRAR internal structures during initial inspection.
+- Partitions archives into recovery units:
+  - **Non-Solid RAR**: Each file constitutes an independent recovery unit.
+  - **Solid RAR**: Continuous solid dictionary chains form atomic recovery units.
+  - **Multi-Part RAR**: Spanned volume parts are tracked across volume file boundaries.
 
-- `RAR_TEST` verifies checksums (integrity pre-test);
-- `RAR_EXTRACT` writes each file to the engine-validated partial path
-  (the DLL's `dest_name` contract: the caller guarantees path safety);
-- `RAR_SKIP` seeks past committed units in non-solid archives, so reclaimed
-  (zeroed) regions are never read.
+### ZIP & ZIP64 Engine (`crates/archive/src/zip/`)
+- Native Rust decoder supporting standard ZIP and ZIP64 archives with **Deflate** and **Stored** compression.
+- **Dual-Parser Data Descriptor Validation**: Handles both standard (16-byte signed/unsigned) and legacy (12-byte without signature) data descriptors, with specific disambiguation for CRC-equals-signature collision cases (`0x08074B50`).
+- **1-to-1 Streaming Deallocation**: Streams file bytes directly to verified staging files and generates exact physical retirement proofs.
+- **RAII Partial File Guards**: Automatically ensures staged `.sx-partial-*` files are deleted if extraction fails before ownership transfers to the core engine.
 
-Future formats (ZIP, 7z, tar, zstd/tar.zst) plug in behind the same trait;
-the capability matrix is per-format and honest about what progressive
-reclamation supports.
+---
 
-## Journal
+## 3. ACID Journal & State Registry (`crates/journal`)
 
-Per-job SQLite database beside the archive (`.reclaimarc/<job>/job.db`),
-WAL mode, `synchronous=FULL` for trust-critical commits, plus a mirrored
-registry in `%LOCALAPPDATA%\ReclaimArc`. Every durable transition is
-committed before the corresponding filesystem action.
+- **Per-Job SQLite Journal**: Stored beside the archive in `.reclaimarc/<job-id>/job.db`.
+- **Durability Modes**: Configured with `PRAGMA synchronous = FULL` and Write-Ahead Logging (`PRAGMA journal_mode = WAL`).
+- **Checkpoint Truncation**: ReclaimArc executes `PRAGMA wal_checkpoint(TRUNCATE)` upon job completion and safe state transitions to prevent WAL file bloating.
+- **Global Job Registry**: Tracks active and interrupted jobs in `%LOCALAPPDATA%\ReclaimArc\registry.db` for instant discovery on application startup.
+- **Monotonic Space Accounting**: Query-verified physical reclaim metrics ensure recorded physical reclamation never retroactively decreases.
 
-## Platform
+---
 
-Windows-first (NTFS/ReFS): behavioral capability probe, `FSCTL_SET_SPARSE`,
-`FSCTL_SET_ZERO_DATA` (aligned inward to the 64 KiB NTFS deallocation unit —
-verified empirically; `GetCompressedFileSizeW`/`FILE_STANDARD_INFO` are
-unreliable for sparse files and are not used), `FSCTL_QUERY_ALLOCATED_RANGES`
-for authoritative allocation measurement, `FlushFileBuffers` on files and
-directories (directory flushes require `FILE_WRITE_DATA` on the handle),
-atomic renames with `MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH`.
-Linux hole-punching slots in behind the same trait.
+## 4. Windows Platform Subsystem (`crates/platform`)
 
-## RAR header parsing
+- **Sparse File Deallocation**: Issues `FSCTL_SET_SPARSE` and `FSCTL_SET_ZERO_DATA` aligned inward to 64 KiB NTFS cluster boundaries.
+- **Authoritative Allocation Measurement**: Uses `FSCTL_QUERY_ALLOCATED_RANGES` rather than cached metadata (`GetCompressedFileSizeW`) to verify actual physical sector release.
+- **Antivirus & Minifilter Lock Resilience**: `longpath::rename_existing` and `longpath::remove_file_existing` implement exponential backoff retry loops (`0ms, 5ms, 15ms, 30ms, 60ms, 100ms, 140ms`) for transient locks (`ERROR_SHARING_VIOLATION` 32, `ERROR_LOCK_VIOLATION` 33, `ERROR_ACCESS_DENIED` 5) caused by Windows Defender (`WdFilter.sys`) or search indexers.
+- **Shell & Registry Integration (`crates/platform/src/shell.rs`)**: Manages per-user `SystemFileAssociations` in `HKCU\Software\Classes\SystemFileAssociations\<ext>\shell\ReclaimArc`, enabling right-click Explorer integration without requiring administrative elevation.
+- **Atomic File Commits**: Uses `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH` coupled with `FlushFileBuffers` on file and directory handles.
 
-The parser (format structure only — no compression) computes per-volume
-packed data ranges from RAR4/RAR5 headers, tracks split files across
-volumes, and builds recovery units:
+---
 
-- non-solid file → one unit;
-- maximal run of solid files → one unit (dictionary chain);
-- archive-level solid flag → whole archive is one unit;
-- split file → one unit across all its parts.
+## 5. Core Engine & Safety Planner (`crates/core`)
+
+- **Predictive Space Planner**: Simulates extraction unit by unit prior to starting:
+  $$\text{Available Headroom} = \text{Free Space} + \text{Reclaimable Source Bytes} - \text{Unit Output} - \text{Emergency Reserve}$$
+- **Case Collision Disambiguation**: Under `ConflictPolicy::RenameNew`, archives containing case-colliding filenames (such as `file.txt` and `FILE.TXT` from Linux systems) are automatically disambiguated to unique paths (e.g. `file (case-collision-1).txt`), allowing full extraction on NTFS without silent overwrites.
+- **Configurable Ratio Wiring**: Enforces maximum compression ratio boundaries (`max_compression_ratio`) to defend against decompression bombs.
+- **Source Identity Validation**: On resume and finalization, cryptographically confirms source file identity and volume size against journaled fingerprints before removing hollowed source files.

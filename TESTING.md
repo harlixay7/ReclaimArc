@@ -12,7 +12,7 @@ Execute the complete test suite across all workspace crates:
 cargo test --workspace --all-features
 ```
 
-### Test Suite Structure (175 Automated Tests)
+### Test Suite Structure (179 Automated Tests)
 
 | Crate / Harness | Test Count | Scope & Coverage |
 |---|---|---|
@@ -20,7 +20,7 @@ cargo test --workspace --all-features
 | **`reclaimarc-journal`** | 11 tests | SQLite WAL durability, linear unit state machines, `PRAGMA wal_checkpoint(TRUNCATE)`, monotonic reclaim metrics |
 | **`reclaimarc-archive`** | 53 tests | RAR4/5 header parser, UnRAR FFI decoder, solid chains, multi-part spans, ZIP/ZIP64 dual-parser data descriptors, streaming engine |
 | **`reclaimarc-core` (Unit)** | 24 tests | Predictive space planner, hostile path sanitation, emergency reserve calculation, ratio limits |
-| **`reclaimarc-core` (Fault Injection)** | 62 tests | Process crash simulation across 8 transaction boundaries, mid-flight interruption, resume reconciliation |
+| **`reclaimarc-core` (Fault Injection)** | 66 tests | Process crash simulation across 9 transaction boundaries, mid-flight interruption, resume reconciliation |
 | **`reclaimarc-core` (ZIP Engine)** | 5 tests | Complex ZIP directory topologies, zero-byte file handling, interleaved folder entries |
 | **`reclaimarc-core` (ZIP Stress)** | 4 tests | Multi-gigabyte real-world ZIP and ZIP64 stress tests, mid-flight process termination, physical reclaim proofs |
 | **`reclaimarc-core` (Case Collisions)**| 3 tests | Conflict-aware auto-disambiguation under `RenameNew` and fail-closed validation |

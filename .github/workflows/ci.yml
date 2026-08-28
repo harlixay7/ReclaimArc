@@ -7,6 +7,36 @@ on:
     branches: [ main ]
 
 jobs:
+  msrv-check:
+    name: MSRV Check (Rust 1.88.0)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust 1.88.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.88.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Install Desktop Frontend Dependencies
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: Build Desktop Frontend
+        working-directory: apps/desktop
+        run: npm run build
+
+      - name: Cargo Check MSRV
+        run: cargo check --workspace --all-targets --all-features
+
   build-and-test:
     name: Build, Lint & Test (Windows)
     runs-on: windows-latest
@@ -27,15 +57,6 @@ jobs:
           cache: npm
           cache-dependency-path: apps/desktop/package-lock.json
 
-      - name: Cargo Format Check
-        run: cargo fmt --check
-
-      - name: Cargo Clippy Check
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Cargo Workspace Tests
-        run: cargo test --workspace
-
       - name: Install Desktop Frontend Dependencies
         working-directory: apps/desktop
         run: npm ci
@@ -44,5 +65,15 @@ jobs:
         working-directory: apps/desktop
         run: npm run build
 
+      - name: Cargo Format Check
+        run: cargo fmt --all -- --check
+
+      - name: Cargo Clippy Check
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Cargo Workspace Tests
+        run: cargo test --workspace --all-features
+
       - name: Cargo Check Desktop Backend (Tauri)
-        run: cargo check -p reclaimarc-desktop
+        run: cargo check -p reclaimarc-desktop --all-targets --all-features
+

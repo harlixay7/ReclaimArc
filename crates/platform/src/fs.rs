@@ -9,7 +9,8 @@ use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, GetDiskFreeSpaceExW, GetDiskFreeSpaceW, GetFileInformationByHandle,
     GetVolumeInformationW, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    FILE_GENERIC_READ, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    OPEN_EXISTING,
 };
 
 use crate::error::{PlatformError, PlatformErrorKind};
@@ -55,6 +56,37 @@ pub fn open_for_identity(path: &Path) -> Result<std::fs::File, PlatformError> {
             Err(PlatformError::from_os(
                 PlatformErrorKind::NotFound,
                 "open file",
+                Some(path),
+                code,
+            ))
+        }
+    }
+}
+
+/// Open an existing file handle without `FILE_SHARE_DELETE`, preventing deletion by any process.
+pub fn lock_for_exclusive_read(path: &Path) -> Result<std::fs::File, PlatformError> {
+    let name: Vec<u16> = extend_path(path)?
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let result = unsafe {
+        CreateFileW(
+            PCWSTR(name.as_ptr()),
+            FILE_GENERIC_READ.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        )
+    };
+    match result {
+        Ok(h) => Ok(unsafe { std::fs::File::from_raw_handle(h.0) }),
+        Err(e) => {
+            let code = e.code().0 as u32;
+            Err(PlatformError::from_os(
+                PlatformErrorKind::NotFound,
+                "lock file",
                 Some(path),
                 code,
             ))

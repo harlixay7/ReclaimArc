@@ -86,16 +86,54 @@ pub struct EngineConfig {
     pub retain_previous_unit: bool,
     /// Custom reserve override (bytes). `None` = automatic.
     pub custom_reserve: Option<u64>,
-    /// Delete source archive shells after a successful destructive extraction.
+    /// Delete source archive shells after a successful extraction.
+    #[serde(default)]
     pub delete_shells_on_completion: bool,
     /// I/O buffer size for verification reads.
     pub io_buffer_size: usize,
     /// Logging level for structured logs.
     pub log_level: String,
+    /// Maximum permitted archive entry count (DOS prevention).
+    #[serde(default = "default_max_entry_count")]
+    pub max_entry_count: u64,
+    /// Maximum permitted cumulative unpacked bytes (DOS / zip bomb prevention).
+    #[serde(default = "default_max_total_unpacked_bytes")]
+    pub max_total_unpacked_bytes: u64,
+    /// Maximum permitted single file unpacked bytes.
+    #[serde(default = "default_max_single_file_bytes")]
+    pub max_single_file_bytes: u64,
+    /// Maximum allowed runtime expansion ratio (unpacked / packed) for zip bomb protection.
+    #[serde(default = "default_max_compression_ratio")]
+    pub max_compression_ratio: u64,
 }
+
+/// Maximum permitted archive entry count (DOS prevention).
+pub const DEFAULT_MAX_ENTRY_COUNT: u64 = 1_000_000;
+/// Maximum permitted total extracted bytes (DOS / zip bomb prevention: 1 TB).
+pub const DEFAULT_MAX_TOTAL_UNPACKED_BYTES: u64 = 1_000_000_000_000;
+/// Maximum permitted individual file extracted bytes (500 GB).
+pub const DEFAULT_MAX_SINGLE_FILE_BYTES: u64 = 500_000_000_000;
+/// Maximum permitted observed compression ratio (1000:1).
+pub const DEFAULT_MAX_COMPRESSION_RATIO: u64 = 1000;
 
 fn default_true() -> bool {
     true
+}
+
+fn default_max_entry_count() -> u64 {
+    DEFAULT_MAX_ENTRY_COUNT
+}
+
+fn default_max_total_unpacked_bytes() -> u64 {
+    DEFAULT_MAX_TOTAL_UNPACKED_BYTES
+}
+
+fn default_max_single_file_bytes() -> u64 {
+    DEFAULT_MAX_SINGLE_FILE_BYTES
+}
+
+fn default_max_compression_ratio() -> u64 {
+    DEFAULT_MAX_COMPRESSION_RATIO
 }
 
 impl Default for EngineConfig {
@@ -111,6 +149,10 @@ impl Default for EngineConfig {
             delete_shells_on_completion: false,
             io_buffer_size: 1 << 20,
             log_level: "info".into(),
+            max_entry_count: DEFAULT_MAX_ENTRY_COUNT,
+            max_total_unpacked_bytes: DEFAULT_MAX_TOTAL_UNPACKED_BYTES,
+            max_single_file_bytes: DEFAULT_MAX_SINGLE_FILE_BYTES,
+            max_compression_ratio: DEFAULT_MAX_COMPRESSION_RATIO,
         }
     }
 }

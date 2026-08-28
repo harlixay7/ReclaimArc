@@ -7,11 +7,40 @@ use std::path::{Path, PathBuf};
 
 use crate::error::CoreError;
 
-/// Windows device names that are reserved even with an extension.
+/// Windows device names and aliases that are reserved even with an extension.
 const DEVICE_NAMES: &[&str] = &[
-    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    "COM1",
+    "COM2",
+    "COM3",
+    "COM4",
+    "COM5",
+    "COM6",
+    "COM7",
+    "COM8",
+    "COM9",
+    "LPT1",
+    "LPT2",
+    "LPT3",
+    "LPT4",
+    "LPT5",
+    "LPT6",
+    "LPT7",
+    "LPT8",
+    "LPT9",
+    "COM\u{00B9}",
+    "COM\u{00B2}",
+    "COM\u{00B3}",
+    "LPT\u{00B9}",
+    "LPT\u{00B2}",
+    "LPT\u{00B3}",
 ];
+
+/// Prohibited Win32 filename characters.
+const PROHIBITED_CHARS: &[char] = &['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
 
 /// A validated entry path: safe to join onto the destination.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,7 +61,13 @@ impl SafeEntry {
 
     /// The path under `dest` (never escapes it).
     pub fn output_path(&self, dest: &Path) -> PathBuf {
-        dest.join(self.relative())
+        let s = dest.to_string_lossy();
+        let base = if s.len() == 2 && s.ends_with(':') {
+            PathBuf::from(format!("{}\\", s))
+        } else {
+            dest.to_path_buf()
+        };
+        base.join(self.relative())
     }
 }
 
@@ -41,8 +76,8 @@ impl SafeEntry {
 /// Rejects:
 /// - absolute paths (`/`, `\`, drive letters, UNC prefixes)
 /// - `..` and `.` components
-/// - Windows device names (with or without extension)
-/// - alternative data streams (`:`)
+/// - Windows device names and aliases (with or without extension)
+/// - prohibited Win32 characters (`<`, `>`, `:`, `"`, `|`, `?`, `*`)
 /// - trailing dots/spaces in components (normalization ambiguity)
 /// - empty components, control characters, `\0`
 pub fn validate_entry(name: &str, is_directory: bool) -> Result<SafeEntry, CoreError> {
@@ -81,14 +116,12 @@ pub fn validate_entry(name: &str, is_directory: bool) -> Result<SafeEntry, CoreE
                 "archive contains a traversal component in '{name}'"
             )));
         }
-        if raw.contains(':') {
+        if raw
+            .chars()
+            .any(|c| PROHIBITED_CHARS.contains(&c) || (c as u32) < 0x20 || c == '\0')
+        {
             return Err(CoreError::Precondition(format!(
-                "archive contains a colon (ADS) in '{name}'"
-            )));
-        }
-        if raw.chars().any(|c| (c as u32) < 0x20 || c == '\0') {
-            return Err(CoreError::Precondition(format!(
-                "archive contains control characters in '{name}'"
+                "archive contains prohibited Win32 characters or control characters in '{name}'"
             )));
         }
         if raw.ends_with('.') || raw.ends_with(' ') {
@@ -98,7 +131,10 @@ pub fn validate_entry(name: &str, is_directory: bool) -> Result<SafeEntry, CoreE
         }
         // Device names are reserved with or without extension.
         let stem = raw.split('.').next().unwrap_or(raw);
-        if DEVICE_NAMES.iter().any(|d| stem.eq_ignore_ascii_case(d)) {
+        if DEVICE_NAMES
+            .iter()
+            .any(|d| stem.eq_ignore_ascii_case(d) || stem.to_uppercase() == d.to_uppercase())
+        {
             return Err(CoreError::Precondition(format!(
                 "archive contains a reserved device name in '{name}'"
             )));
@@ -263,7 +299,42 @@ mod tests {
 
     #[test]
     fn rejects_device_names() {
-        for evil in ["CON", "con.txt", "NUL", "nul.txt", "COM1", "lpt3", "PRN"] {
+        for evil in [
+            "CON",
+            "con.txt",
+            "NUL",
+            "nul.txt",
+            "COM1",
+            "COM9",
+            "lpt3",
+            "PRN",
+            "aux.tar.gz",
+            "COM¹",
+            "com¹.dat",
+            "COM²",
+            "COM³",
+            "LPT¹",
+            "LPT²",
+            "LPT³",
+        ] {
+            assert!(
+                validate_entry(evil, false).is_err(),
+                "{evil} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_prohibited_characters() {
+        for evil in [
+            "file<name.txt",
+            "file>name.txt",
+            "file\"name.txt",
+            "file|name.txt",
+            "file?name.txt",
+            "file*name.txt",
+            "dir/file<test.bin",
+        ] {
             assert!(
                 validate_entry(evil, false).is_err(),
                 "{evil} must be rejected"

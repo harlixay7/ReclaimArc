@@ -9,11 +9,13 @@ pub mod backend;
 pub mod error;
 pub mod model;
 pub mod rar;
+pub mod zip;
 
 pub use backend::{ArchiveBackend, ExtractOptions, OpenOptions, ProgressFn};
 pub use error::ArchiveError;
 pub use model::*;
 pub use rar::RarBackend;
+pub use zip::ZipBackend;
 
 /// Detect the archive format from its signature and return the matching
 /// backend. RAR is the v1 first-class target; future formats (ZIP, 7z, tar)
@@ -29,6 +31,13 @@ pub fn backend_for(path: &std::path::Path) -> Result<Box<dyn ArchiveBackend>, Ar
     }
     if n >= 8 && sig == crate::rar::parser::RAR5_SIGNATURE {
         return Ok(Box::new(RarBackend::new(path)));
+    }
+    if n >= 4
+        && (sig[..4] == crate::zip::parser::ZIP_LOCAL_HEADER_SIG
+            || sig[..4] == crate::zip::parser::ZIP_EOCD_SIG
+            || sig[..4] == crate::zip::parser::ZIP_SPANNED_SIG)
+    {
+        return Ok(Box::new(ZipBackend::new(path)));
     }
     Err(ArchiveError::unsupported(format!(
         "'{}' is not a supported archive format",

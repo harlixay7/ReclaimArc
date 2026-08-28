@@ -116,6 +116,79 @@ pub fn prepare_resume(
     archive_fingerprint: Option<&str>,
 ) -> Result<JobJournal, CoreError> {
     let mut journal = JobJournal::open(journal_path).map_err(CoreError::Journal)?;
+    let meta = journal.job_meta().map_err(CoreError::Journal)?;
+
+    if meta.job_state == JobState::Finalizing {
+        // Extraction and output verification already finished completely before the crash.
+        // Finish deleting remaining source shells idempotently and advance to Completed.
+        // SAFETY GATE: Verify identity of all existing source volumes before removing any files.
+        let volumes = journal.volumes().map_err(CoreError::Journal)?;
+        for v in &volumes {
+            if v.path.exists() {
+                let ident = file_identity(&v.path).map_err(|e| {
+                    CoreError::failed(
+                        "validate source identity before finalizing cleanup",
+                        Some(v.path.clone()),
+                        e.os,
+                        "recovery",
+                        format!(
+                            "cannot verify source '{}' before finalizing cleanup: {}",
+                            v.path.display(),
+                            e.message
+                        ),
+                        "If the archive was replaced or moved, the job cannot finish safely.",
+                    )
+                })?;
+                if let Some(recorded) = &v.identity {
+                    if ident.volume_serial != recorded.volume_serial
+                        || ident.file_id != recorded.file_id
+                        || ident.file_size != recorded.file_size
+                    {
+                        return Err(CoreError::failed(
+                            "validate source identity before finalizing cleanup",
+                            Some(v.path.clone()),
+                            None,
+                            "recovery",
+                            format!(
+                                "source '{}' differs from the recorded identity (serial {} vs {}, id {} vs {}, size {} vs {})",
+                                v.path.display(),
+                                ident.volume_serial,
+                                recorded.volume_serial,
+                                ident.file_id,
+                                recorded.file_id,
+                                ident.file_size,
+                                recorded.file_size,
+                            ),
+                            "The source file was modified or replaced after extraction completed. Aborting cleanup to prevent data loss.",
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Only after all existing source files pass identity validation may deletion proceed.
+        for v in &volumes {
+            if v.path.exists() {
+                std::fs::remove_file(&v.path).map_err(|e| {
+                    CoreError::failed(
+                        "delete source shell during finalizing recovery",
+                        Some(v.path.clone()),
+                        e.raw_os_error().map(|code| code as u32),
+                        "recovery",
+                        format!(
+                            "cannot delete source '{}' during finalizing recovery: {e}",
+                            v.path.display()
+                        ),
+                        "Ensure the source file is not locked or read-only, then retry resume.",
+                    )
+                })?;
+            }
+        }
+        journal
+            .set_job_state(JobState::Completed)
+            .map_err(CoreError::Journal)?;
+        return Ok(journal);
+    }
 
     // 1. Validate source identity.
     let volumes = journal.volumes().map_err(CoreError::Journal)?;
@@ -152,7 +225,7 @@ pub fn prepare_resume(
                         ident.file_id,
                         recorded.file_id,
                         ident.file_size,
-                        recorded.file_size
+                        recorded.file_size,
                     ),
                     "The archive was modified since the job started. The job cannot resume safely.",
                 ));
@@ -456,15 +529,17 @@ pub fn prepare_resume(
                 }
                 let rem_alloc = query_allocated_ranges(&file, &vol.path, r.start, r.len)
                     .map_err(CoreError::Platform)?;
+                let rem_alloc_bytes: u64 = rem_alloc.iter().map(|c| c.len).sum();
+                let verified_released = r.len.saturating_sub(rem_alloc_bytes).min(r.len);
                 let state = if rem_alloc.is_empty() {
                     RangeState::Reclaimed
-                } else if total_released > 0 {
+                } else if verified_released > 0 {
                     RangeState::Partial
                 } else {
                     RangeState::Active
                 };
                 journal
-                    .mark_range_outcome(r.volume_index, r.start, r.len, state, total_released)
+                    .mark_range_outcome(r.volume_index, r.start, r.len, state, verified_released)
                     .map_err(CoreError::Journal)?;
             }
         }
@@ -519,7 +594,7 @@ fn delete_partial_attempts(recorded_partial: &Path) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().into_owned();
                 if name.starts_with(&prefix) {
-                    let _ = std::fs::remove_file(entry.path());
+                    let _ = reclaimarc_platform::longpath::remove_file_existing(&entry.path());
                 }
             }
         }

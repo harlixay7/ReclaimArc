@@ -95,6 +95,7 @@ if not errorlevel 1 (
     for /f "tokens=*" %%v in ('cargo --version 2^>nul') do set "CARGO_VER=%%v"
     echo     [*] !RUSTC_VER!
     echo     [*] !CARGO_VER!
+    echo     [*] Note: ReclaimArc requires Rust 1.88.0+ (run 'rustup update' if outdated).
     set "RUST_FOUND=1"
     echo     [OK] Rust toolchain is installed and active.
 ) else (
@@ -103,6 +104,7 @@ if not errorlevel 1 (
         set "PATH=%USERPROFILE%\.cargo\bin;!PATH!"
         set "RUST_FOUND=1"
         echo     [*] Found Cargo in %USERPROFILE%\.cargo\bin [added to session PATH].
+        echo     [*] Note: ReclaimArc requires Rust 1.88.0+ (run 'rustup update' if outdated).
         echo     [OK] Rust toolchain is ready.
     ) else (
         echo     [MISSING] Rust compiler [rustc/cargo] not detected.

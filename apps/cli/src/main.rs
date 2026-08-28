@@ -70,6 +70,8 @@ fn print_help() {
          GLOBAL OPTIONS:\n\
          \x20 --password <pwd>   password for encrypted archives\n\
          \x20 --mode <safe|balanced|maximum-space>   safety preset (default balanced)\n\
+         \x20 --delete-source    auto-delete source archive on 100% verified completion (default: enabled)\n\
+         \x20 --keep-source      preserve source archive shells after extraction\n\
          \x20 --yes               skip confirmations"
     );
 }
@@ -115,16 +117,22 @@ fn cmd_inspect(args: &[String]) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
 
     println!("Archive: {}", archive.display());
+    let is_rar = info.format.starts_with("rar");
+    let summary_solid = if is_rar {
+        if info.solid_archive {
+            " · Solid"
+        } else {
+            " · Non-solid"
+        }
+    } else {
+        ""
+    };
     println!(
-        "{} · {} packed · {} unpacked · {}",
+        "{} · {} packed · {} unpacked{}",
         info.format.to_uppercase(),
         format_bytes(info.packed_size),
         format_bytes(info.unpacked_size),
-        if info.solid_archive {
-            "Solid"
-        } else {
-            "Non-solid"
-        }
+        summary_solid
     );
     println!("Volumes: {}", info.volumes.len());
     println!("Entries: {}", info.entries.len());
@@ -145,30 +153,62 @@ fn cmd_inspect(args: &[String]) -> Result<(), String> {
                 .sum::<u64>()
         )
     );
-    println!(
-        "\n{:<6} {:<40} {:>10} {:>10}  Solid",
-        "Unit", "Name", "Packed", "Size"
-    );
-    for e in &info.entries {
-        let unit = info
-            .recovery_units
-            .iter()
-            .find(|u| e.index >= u.first_entry && e.index <= u.last_entry)
-            .map(|u| u.seq.to_string())
-            .unwrap_or_else(|| "-".into());
-        let name = if e.name.len() > 40 {
-            format!("{}…", &e.name[..39])
-        } else {
-            e.name.clone()
-        };
+    if is_rar {
         println!(
-            "{:<6} {:<40} {:>10} {:>10}  {}",
-            unit,
-            name,
-            format_bytes(e.packed_size),
-            format_bytes(e.unpacked_size),
-            if e.is_solid { "solid" } else { "" }
+            "\n{:<6} {:<40} {:>10} {:>10}  Solid",
+            "Unit", "Name", "Packed", "Size"
         );
+        for e in &info.entries {
+            let unit = info
+                .recovery_units
+                .iter()
+                .find(|u| e.index >= u.first_entry && e.index <= u.last_entry)
+                .map(|u| u.seq.to_string())
+                .unwrap_or_else(|| "-".into());
+            let name = if e.name.len() > 40 {
+                format!("{}…", &e.name[..39])
+            } else {
+                e.name.clone()
+            };
+            println!(
+                "{:<6} {:<40} {:>10} {:>10}  {}",
+                unit,
+                name,
+                format_bytes(e.packed_size),
+                format_bytes(e.unpacked_size),
+                if e.is_solid { "solid" } else { "" }
+            );
+        }
+    } else {
+        println!(
+            "\n{:<6} {:<40} {:>10} {:>10}  CRC32",
+            "Unit", "Name", "Packed", "Size"
+        );
+        for e in &info.entries {
+            let unit = info
+                .recovery_units
+                .iter()
+                .find(|u| e.index >= u.first_entry && e.index <= u.last_entry)
+                .map(|u| u.seq.to_string())
+                .unwrap_or_else(|| "-".into());
+            let name = if e.name.len() > 40 {
+                format!("{}…", &e.name[..39])
+            } else {
+                e.name.clone()
+            };
+            let crc_str = e
+                .crc32
+                .map(|c| format!("0x{c:08X}"))
+                .unwrap_or_else(|| "—".into());
+            println!(
+                "{:<6} {:<40} {:>10} {:>10}  {}",
+                unit,
+                name,
+                format_bytes(e.packed_size),
+                format_bytes(e.unpacked_size),
+                crc_str
+            );
+        }
     }
     println!("\nCapabilities:");
     println!("  format: {}", info.capability.format);
@@ -272,6 +312,18 @@ fn cmd_extract(args: &[String]) -> Result<(), String> {
     let password = parse_password(args);
     let mut config = EngineConfig::default();
     parse_mode(args, &mut config);
+    if args
+        .iter()
+        .any(|a| a == "--keep-source" || a == "--keep-shells" || a == "--no-delete-source")
+    {
+        config.delete_shells_on_completion = false;
+    }
+    if args
+        .iter()
+        .any(|a| a == "--delete-source" || a == "--delete-shells")
+    {
+        config.delete_shells_on_completion = true;
+    }
 
     if low_space && !yes {
         println!(

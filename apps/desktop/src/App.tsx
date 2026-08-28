@@ -6,6 +6,8 @@ import {
   cancelJob,
   currentJob,
   formatBytes,
+  getContextMenuStatus,
+  getPendingArchive,
   getSettings,
   listJobs,
   openFolder,
@@ -17,6 +19,7 @@ import {
   readLogs,
   recoveryView,
   resumeExtraction,
+  setContextMenuStatus,
   setSettings,
   startExtraction,
   stopJob,
@@ -94,6 +97,10 @@ function unitForIndex(analysis: AnalyzeResult, index: number): number | null {
 function getParentDirectory(filePath: string): string {
   if (!filePath) return "";
   const lastSlash = Math.max(filePath.lastIndexOf("/"), filePath.lastIndexOf("\\"));
+  if (lastSlash === 2 && filePath[1] === ":") {
+    // Root drive like "B:\" -> return "B:\"
+    return filePath.slice(0, 3);
+  }
   if (lastSlash > 0) {
     return filePath.slice(0, lastSlash);
   }
@@ -258,6 +265,28 @@ export default function App() {
     currentJob().then((id) => setRunning(!!id));
   }, [view]);
 
+  useEffect(() => {
+    getPendingArchive().then(async (cliPath) => {
+      if (cliPath) {
+        setArchive(cliPath);
+        const targetDest = getParentDirectory(cliPath);
+        setDestination(targetDest);
+        destRef.current = targetDest;
+        setAnalyzing(true);
+        setError(null);
+        try {
+          const result = await analyze(cliPath, targetDest, undefined);
+          setAnalysis(result);
+          setView("home");
+        } catch (e) {
+          setError(String(e));
+        } finally {
+          setAnalyzing(false);
+        }
+      }
+    }).catch(() => undefined);
+  }, []);
+
   const doAnalyze = async () => {
     if (!archive) return;
     setAnalyzing(true);
@@ -286,6 +315,8 @@ export default function App() {
       ? analysis.info.entries.some((e) => e.redirection !== null)
       : false;
     setProgress({ ...emptyProgress(), hadRedirections });
+    setRunning(true);
+    setView("extracting");
     try {
       const targetDest = destRef.current || destination.trim() || getParentDirectory(archive);
       const id = await startExtraction(
@@ -295,10 +326,13 @@ export default function App() {
         password || undefined,
       );
       setProgress((p) => ({ ...p, jobId: id, hadRedirections }));
-      setRunning(true);
-      setView("extracting");
     } catch (e) {
-      setError(String(e));
+      setRunning(false);
+      setProgress((p) => ({
+        ...p,
+        finished: true,
+        error: String(e),
+      }));
     }
   };
 
@@ -564,12 +598,12 @@ function ArchiveSetup({
       <h2>Source Archive and Destination</h2>
       <div className="setup-fields">
         <div className="field-row">
-          <label className="field-label">RAR Archive:</label>
+          <label className="field-label">Archive File:</label>
           <div className="path-field">
             <input
               type="text"
               value={archive}
-              placeholder="Select RAR archive (.rar, .part1.rar)"
+              placeholder="Select archive (.rar, .zip, .part1.rar)"
               onChange={(e) => onArchiveChange(e.target.value)}
             />
             <button onClick={onOpenArchive}>Browse…</button>
@@ -1163,8 +1197,13 @@ function ExtractChoiceModal({
   onConfirm: (lowSpace: boolean) => void;
 }) {
   return (
-    <div className="overlay">
-      <div className="dialog">
+    <div
+      className="overlay"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div className="dialog" onClick={(e) => e.stopPropagation()}>
         <h2>Confirm Extraction</h2>
         <div className="body">
           <p>
@@ -1182,18 +1221,28 @@ function ExtractChoiceModal({
           )}
         </div>
         <div className="actions">
-          <button onClick={onClose}>Cancel</button>
+          <button type="button" onClick={onClose}>
+            Cancel
+          </button>
           {pendingChoice === "low" ? (
             <>
-              <button className="primary" onClick={() => onConfirm(true)}>
+              <button
+                type="button"
+                className="primary"
+                onClick={() => onConfirm(true)}
+              >
                 Start Low-Space Extraction
               </button>
-              <button onClick={() => onConfirm(false)}>
+              <button type="button" onClick={() => onConfirm(false)}>
                 Normal Extraction
               </button>
             </>
           ) : (
-            <button className="primary" onClick={() => onConfirm(false)}>
+            <button
+              type="button"
+              className="primary"
+              onClick={() => onConfirm(false)}
+            >
               Start Extraction
             </button>
           )}
@@ -1205,8 +1254,11 @@ function ExtractChoiceModal({
 
 function SettingsDialog({ onClose }: { onClose: () => void }) {
   const [settings, setSettingsState] = useState<SettingsDto | null>(null);
+  const [contextMenu, setContextMenu] = useState<boolean>(false);
+
   useEffect(() => {
     getSettings().then(setSettingsState).catch(() => undefined);
+    getContextMenuStatus().then(setContextMenu).catch(() => undefined);
   }, []);
 
   if (!settings) return null;
@@ -1214,6 +1266,7 @@ function SettingsDialog({ onClose }: { onClose: () => void }) {
   const save = async () => {
     try {
       await setSettings(settings);
+      await setContextMenuStatus(contextMenu);
       onClose();
     } catch (e) {
       alert(`Failed to save settings: ${e}`);
@@ -1221,8 +1274,13 @@ function SettingsDialog({ onClose }: { onClose: () => void }) {
   };
 
   return (
-    <div className="overlay">
-      <div className="dialog">
+    <div
+      className="overlay"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div className="dialog" onClick={(e) => e.stopPropagation()}>
         <h2>Settings</h2>
         <div className="body">
           <div className="settings-grid">
@@ -1245,13 +1303,13 @@ function SettingsDialog({ onClose }: { onClose: () => void }) {
               <option value="rename-new">Rename new</option>
               <option value="ask">Ask</option>
             </select>
-            <span>Pre-test archive before destructive extraction</span>
+            <span>Pre-test integrity (Mandatory for Low-Space)</span>
             <input
               type="checkbox"
               checked={settings.pre_test}
               onChange={(e) => setSettingsState({ ...settings, pre_test: e.target.checked })}
             />
-            <span>Delete source shells on completion</span>
+            <span>Auto-delete archive on verified completion</span>
             <input
               type="checkbox"
               checked={settings.delete_shells_on_completion}
@@ -1259,6 +1317,17 @@ function SettingsDialog({ onClose }: { onClose: () => void }) {
                 setSettingsState({ ...settings, delete_shells_on_completion: e.target.checked })
               }
             />
+            <span>Windows Explorer Integration</span>
+            <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+              <input
+                type="checkbox"
+                checked={contextMenu}
+                onChange={(e) => setContextMenu(e.target.checked)}
+              />
+              <span style={{ fontSize: 12, color: "var(--text-dim)" }}>
+                Right-click menu: "Analyze with ReclaimArc"
+              </span>
+            </label>
             <span>Logging level</span>
             <select
               value={settings.log_level}
@@ -1272,8 +1341,10 @@ function SettingsDialog({ onClose }: { onClose: () => void }) {
           </div>
         </div>
         <div className="actions">
-          <button onClick={onClose}>Cancel</button>
-          <button className="primary" onClick={() => void save()}>
+          <button type="button" onClick={onClose}>
+            Cancel
+          </button>
+          <button type="button" className="primary" onClick={() => void save()}>
             Save
           </button>
         </div>
@@ -1288,15 +1359,22 @@ function LogsDialog({ onClose }: { onClose: () => void }) {
     readLogs(200).then(setLogs).catch(() => undefined);
   }, []);
   return (
-    <div className="overlay">
-      <div className="dialog" style={{ width: 720 }}>
+    <div
+      className="overlay"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div className="dialog" style={{ width: 720 }} onClick={(e) => e.stopPropagation()}>
         <h2>Logs</h2>
         <div className="body">
           <div className="logs mono">{logs}</div>
         </div>
         <div className="actions">
-          <button onClick={() => void openLogsDir()}>Open Logs Folder</button>
-          <button className="primary" onClick={onClose}>
+          <button type="button" onClick={() => void openLogsDir()}>
+            Open Logs Folder
+          </button>
+          <button type="button" className="primary" onClick={onClose}>
             Close
           </button>
         </div>

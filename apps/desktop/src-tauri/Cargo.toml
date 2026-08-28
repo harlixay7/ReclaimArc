@@ -2,6 +2,7 @@
 name = "reclaimarc-desktop"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [lib]
@@ -9,9 +10,7 @@ name = "reclaimarc_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
-# Enabled by the Tauri CLI for production builds (`tauri build`): embeds the
-# frontend dist instead of loading devUrl. Building without it produces an
-# exe that expects the vite dev server on localhost:1420.
+default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
 
 [build-dependencies]

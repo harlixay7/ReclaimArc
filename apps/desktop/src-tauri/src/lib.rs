@@ -1,6 +1,6 @@
 //! ReclaimArc desktop backend: Tauri commands over the shared engine.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -119,6 +119,7 @@ pub struct AppState {
     engine: Mutex<Engine>,
     config: Mutex<EngineConfig>,
     active: Mutex<Option<ActiveJob>>,
+    initial_archive: Mutex<Option<String>>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -178,6 +179,23 @@ fn err_msg(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
+fn normalize_destination(archive_path: &Path, destination: &str) -> PathBuf {
+    let trimmed = destination.trim();
+    let mut p = if trimmed.is_empty() {
+        archive_path
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+    } else {
+        PathBuf::from(trimmed)
+    };
+    let s = p.to_string_lossy();
+    if s.len() == 2 && s.ends_with(':') {
+        p = PathBuf::from(format!("{}\\", s));
+    }
+    p
+}
+
 /// Command: analyze an archive for a destination.
 ///
 /// Runs off the main thread: inspect() walks every header twice and would
@@ -191,14 +209,7 @@ fn analyze(
     password: Option<String>,
 ) -> Result<AnalyzeResult, String> {
     let archive_path = PathBuf::from(&archive);
-    let dest_path = if destination.trim().is_empty() {
-        archive_path
-            .parent()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."))
-    } else {
-        PathBuf::from(&destination)
-    };
+    let dest_path = normalize_destination(&archive_path, &destination);
     let config = state.config.lock().unwrap().clone();
     let engine = Engine::new(config);
     let (info, plan) = engine
@@ -225,18 +236,18 @@ fn start_extraction(
     low_space: bool,
     password: Option<String>,
 ) -> Result<String, String> {
-    if state.active.lock().unwrap().is_some() {
-        return Err("an extraction is already running".into());
+    let mut active_lock = state.active.lock().unwrap();
+    if let Some(j) = active_lock.as_ref() {
+        if j.outcome.lock().unwrap().is_some() {
+            *active_lock = None;
+        } else {
+            return Err("an extraction is already running".into());
+        }
     }
+    drop(active_lock);
+
     let archive_path = PathBuf::from(&archive);
-    let dest_path = if destination.trim().is_empty() {
-        archive_path
-            .parent()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."))
-    } else {
-        PathBuf::from(&destination)
-    };
+    let dest_path = normalize_destination(&archive_path, &destination);
     let config = state.config.lock().unwrap().clone();
     let engine = Engine::new(config);
     let (tx, rx) = mpsc::channel::<Event>();
@@ -249,16 +260,6 @@ fn start_extraction(
         }
     });
     let _ = forwarder;
-
-    let mut active_lock = state.active.lock().unwrap();
-    if let Some(j) = active_lock.as_ref() {
-        if j.outcome.lock().unwrap().is_some() {
-            *active_lock = None;
-        } else {
-            return Err("an extraction is already running".into());
-        }
-    }
-    drop(active_lock);
 
     let mode = if low_space {
         ExtractionMode::LowSpace
@@ -283,9 +284,17 @@ fn start_extraction(
         };
         let o = match result {
             Ok(o) => o,
-            Err(e) => JobOutcome::Failed {
-                failure: reclaimarc_core::FailureInfo::from(&e),
-            },
+            Err(e) => {
+                let fail = reclaimarc_core::FailureInfo::from(&e);
+                let _ = tx2.send(Event::JobFailed {
+                    operation: fail.operation.clone(),
+                    path: fail.path.clone(),
+                    os_error: fail.os_error,
+                    message: fail.message.clone(),
+                    recommended_action: fail.recommended_action.clone(),
+                });
+                JobOutcome::Failed { failure: fail }
+            }
         };
         *outcome2.lock().unwrap() = Some(o);
         let _ = tx2.send(Event::FreeSpace { bytes: 0 });
@@ -310,9 +319,16 @@ fn resume_extraction(
     archive: String,
     password: Option<String>,
 ) -> Result<String, String> {
-    if state.active.lock().unwrap().is_some() {
-        return Err("an extraction is already running".into());
+    let mut active_lock = state.active.lock().unwrap();
+    if let Some(j) = active_lock.as_ref() {
+        if j.outcome.lock().unwrap().is_some() {
+            *active_lock = None;
+        } else {
+            return Err("an extraction is already running".into());
+        }
     }
+    drop(active_lock);
+
     // Locate the journal beside the archive.
     let journal_path = find_journal(&PathBuf::from(&archive))?;
     let config = state.config.lock().unwrap().clone();
@@ -340,9 +356,17 @@ fn resume_extraction(
         };
         let o = match result {
             Ok(o) => o,
-            Err(e) => JobOutcome::Failed {
-                failure: reclaimarc_core::FailureInfo::from(&e),
-            },
+            Err(e) => {
+                let fail = reclaimarc_core::FailureInfo::from(&e);
+                let _ = tx2.send(Event::JobFailed {
+                    operation: fail.operation.clone(),
+                    path: fail.path.clone(),
+                    os_error: fail.os_error,
+                    message: fail.message.clone(),
+                    recommended_action: fail.recommended_action.clone(),
+                });
+                JobOutcome::Failed { failure: fail }
+            }
         };
         *outcome2.lock().unwrap() = Some(o);
         drop(tx2);
@@ -463,7 +487,10 @@ fn load_persisted_config() -> EngineConfig {
             return config;
         }
     }
-    EngineConfig::default()
+    EngineConfig {
+        delete_shells_on_completion: true,
+        ..Default::default()
+    }
 }
 
 fn persist_config(config: &EngineConfig) -> Result<(), String> {
@@ -540,6 +567,24 @@ fn read_logs(last: usize) -> Result<String, String> {
     Ok(out.join("\n"))
 }
 
+/// Command: get any initial archive path passed via CLI args (e.g. from Explorer context menu).
+#[tauri::command]
+fn get_pending_archive(state: tauri::State<'_, AppState>) -> Option<String> {
+    state.initial_archive.lock().unwrap().take()
+}
+
+/// Command: check whether Windows Explorer context menu integration is active.
+#[tauri::command]
+fn get_context_menu_status() -> bool {
+    reclaimarc_platform::shell::is_context_menu_enabled()
+}
+
+/// Command: enable or disable Windows Explorer context menu integration.
+#[tauri::command]
+fn set_context_menu_status(enabled: bool) -> Result<(), String> {
+    reclaimarc_platform::shell::set_context_menu_enabled(enabled).map_err(err_msg)
+}
+
 fn log_dir() -> PathBuf {
     std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
@@ -611,6 +656,14 @@ pub fn init_logging() {
 pub fn run() {
     init_logging();
     let initial_config = load_persisted_config();
+    let initial_archive = std::env::args().skip(1).find(|arg| {
+        !arg.starts_with('-')
+            && (std::path::Path::new(arg).exists()
+                || reclaimarc_platform::shell::ARCHIVE_EXTENSIONS
+                    .iter()
+                    .any(|ext| arg.to_lowercase().ends_with(ext)))
+    });
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
@@ -618,6 +671,7 @@ pub fn run() {
             engine: Mutex::new(Engine::new(initial_config.clone())),
             config: Mutex::new(initial_config),
             active: Mutex::new(None),
+            initial_archive: Mutex::new(initial_archive),
         })
         .invoke_handler(tauri::generate_handler![
             analyze,
@@ -635,6 +689,9 @@ pub fn run() {
             open_folder,
             open_logs_dir,
             read_logs,
+            get_pending_archive,
+            get_context_menu_status,
+            set_context_menu_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ReclaimArc");
@@ -662,6 +719,7 @@ mod tests {
             engine: Mutex::new(Engine::new(EngineConfig::default())),
             config: Mutex::new(EngineConfig::default()),
             active: Mutex::new(None),
+            initial_archive: Mutex::new(None),
         };
 
         // Test fallback resolution logic

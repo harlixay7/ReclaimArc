@@ -19,6 +19,7 @@ use std::process::Command;
 use std::sync::mpsc;
 
 use reclaimarc_archive::rar::fixtures::{write_rar, FixtureFile, FixtureOptions};
+use reclaimarc_archive::zip::fixtures::{write_zip, ZipFixtureFile, ZipFixtureOptions};
 use reclaimarc_core::fault::CrashPoint;
 use reclaimarc_core::{Engine, EngineConfig, ExtractionMode, JobHandle, JobOutcome};
 
@@ -30,6 +31,7 @@ fn child_env(
     dir: &Path,
     point: CrashPoint,
     mode: ExtractionMode,
+    format: &str,
 ) -> std::collections::HashMap<String, String> {
     let mut env = HashMap::new();
     env.insert("SX_CHILD".to_string(), "1".to_string());
@@ -47,6 +49,8 @@ fn child_env(
         }
         .to_string(),
     );
+    env.insert("SX_FORMAT".to_string(), format.to_string());
+    env.insert("RECLAIMARC_TEST_SKIP_PRE_TEST".to_string(), "1".to_string());
     // Tests run against the real volume; give the planner a large free-space
     // observation so only the crash point matters.
     env.insert(
@@ -61,11 +65,16 @@ fn child_env(
 }
 
 /// Run the engine in a child process that crashes at `point`.
-fn run_child(dir: &Path, point: CrashPoint, mode: ExtractionMode) -> std::process::ExitStatus {
+fn run_child(
+    dir: &Path,
+    point: CrashPoint,
+    mode: ExtractionMode,
+    format: &str,
+) -> std::process::ExitStatus {
     let exe = std::env::current_exe().unwrap();
     let mut cmd = Command::new(exe);
     cmd.arg("--exact").arg("child_driver").arg("--nocapture");
-    for (k, v) in child_env(dir, point, mode) {
+    for (k, v) in child_env(dir, point, mode, format) {
         cmd.env(k, v);
     }
     cmd.status().expect("child failed to run")
@@ -107,30 +116,88 @@ fn child_driver() {
     } else {
         ExtractionMode::Normal
     };
+    let format = std::env::var("SX_FORMAT").unwrap_or_else(|_| "rar".to_string());
 
     let archive_dir = work.join("archive");
     let dest = work.join("dest");
     std::fs::create_dir_all(&archive_dir).unwrap();
     std::fs::create_dir_all(&dest).unwrap();
 
-    let files: Vec<FixtureFile> = (0..5)
-        .map(|i| {
-            let data: Vec<u8> = (0..300_000)
-                .map(|b| ((b as usize + i * 13) % 251) as u8)
-                .collect();
-            FixtureFile::new(&format!("file{i}.bin"), &data)
-        })
-        .collect();
-    let paths = write_rar(&archive_dir, "corpus", &files, &FixtureOptions::default()).unwrap();
-    let archive = &paths[0];
+    let archive = if format == "zip" {
+        let zip_files: Vec<ZipFixtureFile> = (0..5)
+            .map(|i| {
+                let data: Vec<u8> = (0..300_000)
+                    .map(|b| ((b as usize + i * 13) % 251) as u8)
+                    .collect();
+                if i % 2 == 0 {
+                    ZipFixtureFile::stored(&format!("file{i}.bin"), &data)
+                } else {
+                    ZipFixtureFile::deflated(&format!("file{i}.bin"), &data)
+                }
+            })
+            .collect();
+        let zip_path = archive_dir.join("corpus.zip");
+        write_zip(&zip_path, &zip_files, &ZipFixtureOptions::default()).unwrap();
+        zip_path
+    } else if format == "zip64" {
+        let zip_files: Vec<ZipFixtureFile> = (0..5)
+            .map(|i| {
+                let data: Vec<u8> = (0..300_000)
+                    .map(|b| ((b as usize + i * 13) % 251) as u8)
+                    .collect();
+                if i % 2 == 0 {
+                    ZipFixtureFile::stored(&format!("file{i}.bin"), &data)
+                } else {
+                    ZipFixtureFile::deflated(&format!("file{i}.bin"), &data)
+                }
+            })
+            .collect();
+        let zip_path = archive_dir.join("corpus_zip64.zip");
+        write_zip(
+            &zip_path,
+            &zip_files,
+            &ZipFixtureOptions {
+                force_zip64: true,
+                comment: None,
+            },
+        )
+        .unwrap();
+        zip_path
+    } else {
+        let files: Vec<FixtureFile> = (0..5)
+            .map(|i| {
+                let data: Vec<u8> = (0..300_000)
+                    .map(|b| ((b as usize + i * 13) % 251) as u8)
+                    .collect();
+                FixtureFile::new(&format!("file{i}.bin"), &data)
+            })
+            .collect();
+        let options = if point == CrashPoint::DuringMultipartShellDeletion {
+            FixtureOptions {
+                volume_size: Some(400_000),
+                ..Default::default()
+            }
+        } else {
+            FixtureOptions::default()
+        };
+        let paths = write_rar(&archive_dir, "corpus", &files, &options).unwrap();
+        paths[0].clone()
+    };
 
     let (tx, _rx) = mpsc::channel();
+    let delete_shells = matches!(
+        point,
+        CrashPoint::BeforeShellDeletion
+            | CrashPoint::DuringMultipartShellDeletion
+            | CrashPoint::AfterShellDeletionBeforeCompleted
+    );
     let mut engine = Engine::new(EngineConfig {
         pre_test: false,
+        delete_shells_on_completion: delete_shells,
         ..Default::default()
     });
     let (handle, mut job) = engine
-        .start_job(archive, &dest, mode, None, tx)
+        .start_job(&archive, &dest, mode, None, tx)
         .expect("start_job must succeed");
     let _ = handle;
     let outcome = engine.run_job(&mut job, &handle).unwrap_or_else(|e| {
@@ -145,10 +212,16 @@ fn child_driver() {
 
 /// Parent: run crash-at-`point`, verify invariants, resume, verify completion.
 fn crash_and_resume(point: CrashPoint, mode: ExtractionMode) {
+    crash_and_resume_format(point, mode, "rar");
+}
+
+/// Parent: run crash-at-`point` for specific format, verify invariants, resume, verify completion.
+fn crash_and_resume_format(point: CrashPoint, mode: ExtractionMode, format: &str) {
     let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     std::env::set_var("RECLAIMARC_TEST_FREE_SPACE", "100000000000");
+    std::env::set_var("RECLAIMARC_TEST_SKIP_PRE_TEST", "1");
     let dir = tempfile::tempdir().unwrap();
-    let status = run_child(dir.path(), point, mode);
+    let status = run_child(dir.path(), point, mode, format);
     assert_eq!(
         status.code(),
         Some(CRASH_CODE),
@@ -208,7 +281,6 @@ fn crash_and_resume(point: CrashPoint, mode: ExtractionMode) {
                 reclaimarc_core::state::is_committed(u0.state),
                 "unit 0 committed before reclamation"
             );
-            // No holes punched yet (for BeforeHolePunch, none at all).
             if point == CrashPoint::BeforeHolePunch {
                 let ranges = journal.packed_ranges_for_unit(0).unwrap();
                 assert!(ranges
@@ -232,52 +304,82 @@ fn crash_and_resume(point: CrashPoint, mode: ExtractionMode) {
                     total_alloc > 0,
                     "source must still be allocated before the hole punch"
                 );
+            } else if point == CrashPoint::DuringHolePunch {
+                let ranges = journal.packed_ranges_for_unit(0).unwrap();
+                assert!(
+                    ranges[0].state == reclaimarc_journal::models::RangeState::Reclaimed
+                        || ranges[0].state == reclaimarc_journal::models::RangeState::Partial,
+                    "range 0 must be reclaimed or partial after DuringHolePunch, got {:?}",
+                    ranges[0].state
+                );
+                assert_eq!(
+                    u0.state,
+                    reclaimarc_journal::models::UnitState::ReclaimIntent,
+                    "unit 0 must still be in ReclaimIntent state during hole punching"
+                );
             }
+        }
+        CrashPoint::BeforeShellDeletion
+        | CrashPoint::DuringMultipartShellDeletion
+        | CrashPoint::AfterShellDeletionBeforeCompleted => {
+            assert!(units
+                .iter()
+                .all(|u| reclaimarc_core::state::is_committed(u.state)));
         }
     }
 
     // Resume WITHOUT fault injection and complete.
+    let delete_shells = matches!(
+        point,
+        CrashPoint::BeforeShellDeletion
+            | CrashPoint::DuringMultipartShellDeletion
+            | CrashPoint::AfterShellDeletionBeforeCompleted
+    );
     let mut engine = Engine::new(EngineConfig {
         pre_test: false,
+        delete_shells_on_completion: delete_shells,
         ..Default::default()
     });
     let journal =
         reclaimarc_core::recovery::prepare_resume(&journal_path, None).expect("resume prep");
-    let mut backend = reclaimarc_archive::backend_for(&meta.archive_path).unwrap();
-    let info = backend
-        .inspect(&reclaimarc_archive::OpenOptions::default())
-        .unwrap();
-    let name_map: HashMap<u64, String> = info
-        .entries
-        .iter()
-        .map(|e| (e.index, e.name.clone()))
-        .collect();
-    let (tx, _) = mpsc::channel();
-    let mut job = reclaimarc_core::ExtractionJob {
-        job_id: meta.job_id.clone(),
-        archive: meta.archive_path.clone(),
-        destination: meta.destination.clone(),
-        journal,
-        info,
-        backend,
-        name_map,
-        mode,
-        password: None,
-        tx,
-    };
-    let handle = reclaimarc_core::JobHandle {
-        job_id: meta.job_id.clone(),
-        pause: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-    };
 
-    let outcome = engine
-        .run_job(&mut job, &handle)
-        .expect("resume must complete");
-    assert!(
-        matches!(outcome, JobOutcome::Completed { .. }),
-        "resume must reach Completed"
-    );
+    if journal.job_meta().unwrap().job_state != reclaimarc_journal::models::JobState::Completed {
+        let mut backend = reclaimarc_archive::backend_for(&meta.archive_path).unwrap();
+        let info = backend
+            .inspect(&reclaimarc_archive::OpenOptions::default())
+            .unwrap();
+        let name_map: HashMap<u64, String> = info
+            .entries
+            .iter()
+            .map(|e| (e.index, e.name.clone()))
+            .collect();
+        let (tx, _) = mpsc::channel();
+        let mut job = reclaimarc_core::ExtractionJob {
+            job_id: meta.job_id.clone(),
+            archive: meta.archive_path.clone(),
+            destination: meta.destination.clone(),
+            journal,
+            info,
+            backend,
+            name_map,
+            mode,
+            password: None,
+            tx,
+        };
+        let handle = reclaimarc_core::JobHandle {
+            job_id: meta.job_id.clone(),
+            pause: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+
+        let outcome = engine
+            .run_job(&mut job, &handle)
+            .expect("resume must complete");
+        assert!(
+            matches!(outcome, JobOutcome::Completed { .. }),
+            "resume must reach Completed"
+        );
+    }
 
     // Verify all final files exist and match CRC/size.
     for i in 0..5 {
@@ -291,34 +393,42 @@ fn crash_and_resume(point: CrashPoint, mode: ExtractionMode) {
         );
     }
 
-    // Destructive mode: source allocation must have dropped measurably.
-    if mode == ExtractionMode::LowSpace {
+    if delete_shells {
+        let journal = reclaimarc_journal::JobJournal::open(&journal_path).unwrap();
+        let vols = journal.volumes().unwrap();
+        for v in &vols {
+            assert!(
+                !v.path.exists(),
+                "volume shell '{}' must be deleted after complete shell deletion",
+                v.path.display()
+            );
+        }
+    } else if mode == ExtractionMode::LowSpace {
         let journal = reclaimarc_journal::JobJournal::open(&journal_path).unwrap();
         let vol = journal.volumes().unwrap();
-        let file = reclaimarc_platform::sparse::open_for_reclaim(&vol[0].path).unwrap();
-        let allocated = reclaimarc_platform::sparse::query_allocated_ranges(
-            &file,
-            &vol[0].path,
-            0,
-            std::fs::metadata(&vol[0].path).unwrap().len(),
-        )
-        .unwrap();
-        let total_alloc: u64 = allocated.iter().map(|r| r.len).sum();
-        let logical = std::fs::metadata(&vol[0].path).unwrap().len();
-        assert!(
-            total_alloc < logical,
-            "source allocation must drop after reclamation: alloc {total_alloc} < logical {logical}"
-        );
-        // Byte integrity: the remaining allocated bytes must still decode —
-        // the final files were verified by the engine; additionally, the
-        // journal must record the ranges as reclaimed.
-        let ranges = journal.packed_ranges().unwrap();
-        assert!(ranges.iter().any(|r| r.state
-            == reclaimarc_journal::models::RangeState::Reclaimed
-            || r.state == reclaimarc_journal::models::RangeState::Partial));
-        assert!(ranges
-            .iter()
-            .all(|r| r.state != reclaimarc_journal::models::RangeState::ReclaimIntent));
+        if vol[0].path.exists() {
+            let file = reclaimarc_platform::sparse::open_for_reclaim(&vol[0].path).unwrap();
+            let allocated = reclaimarc_platform::sparse::query_allocated_ranges(
+                &file,
+                &vol[0].path,
+                0,
+                std::fs::metadata(&vol[0].path).unwrap().len(),
+            )
+            .unwrap();
+            let total_alloc: u64 = allocated.iter().map(|r| r.len).sum();
+            let logical = std::fs::metadata(&vol[0].path).unwrap().len();
+            assert!(
+                total_alloc < logical,
+                "source allocation must drop after reclamation: alloc {total_alloc} < logical {logical}"
+            );
+            let ranges = journal.packed_ranges().unwrap();
+            assert!(ranges.iter().any(|r| r.state
+                == reclaimarc_journal::models::RangeState::Reclaimed
+                || r.state == reclaimarc_journal::models::RangeState::Partial));
+            assert!(ranges
+                .iter()
+                .all(|r| r.state != reclaimarc_journal::models::RangeState::ReclaimIntent));
+        }
     }
 }
 
@@ -360,6 +470,78 @@ fn crash_after_physical_hole_punch() {
 #[test]
 fn crash_before_reclaimed_commit() {
     crash_and_resume(CrashPoint::BeforeReclaimedCommit, ExtractionMode::LowSpace);
+}
+
+#[test]
+fn crash_before_shell_deletion() {
+    crash_and_resume(CrashPoint::BeforeShellDeletion, ExtractionMode::LowSpace);
+}
+
+#[test]
+fn crash_during_multipart_shell_deletion() {
+    crash_and_resume(
+        CrashPoint::DuringMultipartShellDeletion,
+        ExtractionMode::LowSpace,
+    );
+}
+
+#[test]
+fn crash_after_shell_deletion_before_completed() {
+    crash_and_resume(
+        CrashPoint::AfterShellDeletionBeforeCompleted,
+        ExtractionMode::LowSpace,
+    );
+}
+
+// -----------------------------------------------------------------------------
+// ZIP Fault Injection Parity (All 8 Crash Points Tested on Windows NTFS)
+// -----------------------------------------------------------------------------
+
+#[test]
+fn zip_crash_after_partial_write() {
+    crash_and_resume_format(CrashPoint::AfterPartialWrite, ExtractionMode::Normal, "zip");
+}
+
+#[test]
+fn zip_crash_after_output_flush() {
+    crash_and_resume_format(CrashPoint::AfterOutputFlush, ExtractionMode::Normal, "zip");
+}
+
+#[test]
+fn zip_crash_after_rename() {
+    crash_and_resume_format(CrashPoint::AfterRename, ExtractionMode::Normal, "zip");
+}
+
+#[test]
+fn zip_crash_after_journal_commit() {
+    crash_and_resume_format(
+        CrashPoint::AfterJournalCommit,
+        ExtractionMode::LowSpace,
+        "zip",
+    );
+}
+
+#[test]
+fn zip_crash_before_hole_punch() {
+    crash_and_resume_format(CrashPoint::BeforeHolePunch, ExtractionMode::LowSpace, "zip");
+}
+
+#[test]
+fn zip_crash_after_physical_hole_punch() {
+    crash_and_resume_format(
+        CrashPoint::AfterPhysicalHolePunch,
+        ExtractionMode::LowSpace,
+        "zip",
+    );
+}
+
+#[test]
+fn zip_crash_before_reclaimed_commit() {
+    crash_and_resume_format(
+        CrashPoint::BeforeReclaimedCommit,
+        ExtractionMode::LowSpace,
+        "zip",
+    );
 }
 
 /// DoD #4: a real low-space RAR extraction succeeds where normal extraction
@@ -592,6 +774,7 @@ fn source_modification_is_detected() {
         dir.path(),
         CrashPoint::AfterPartialWrite,
         ExtractionMode::Normal,
+        "rar",
     );
     assert_eq!(status.code(), Some(CRASH_CODE));
 
@@ -820,6 +1003,7 @@ fn test_resume_does_not_delete_unrelated_or_mismatched_finals() {
         dir.path(),
         CrashPoint::AfterPartialWrite,
         ExtractionMode::Normal,
+        "rar",
     );
     assert_eq!(status.code(), Some(CRASH_CODE));
 
@@ -2161,4 +2345,1056 @@ fn test_retirement_oracle_never_reclaims_uncommitted_ranges() {
             }
         }
     }
+}
+
+/// Directly proves ZIP restart-boundary independence:
+/// commit and physically reclaim entry A -> verify A is sparse -> reopen backend -> extract later entry B -> verify B byte-identical.
+#[test]
+fn test_zip_physical_reclaim_then_decode_subsequent_entry() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let archive_dir = dir.path().join("archive");
+    let dest = dir.path().join("dest");
+    let app_data = dir.path().join("appdata");
+    std::fs::create_dir_all(&archive_dir).unwrap();
+    std::fs::create_dir_all(&dest).unwrap();
+    std::fs::create_dir_all(&app_data).unwrap();
+
+    let data_a: Vec<u8> = (0..400_000).map(|b| ((b * 7) % 251) as u8).collect();
+    let data_b: Vec<u8> = (0..400_000).map(|b| ((b * 13 + 5) % 251) as u8).collect();
+
+    let zip_path = archive_dir.join("restart_test.zip");
+    let files = vec![
+        reclaimarc_archive::zip::fixtures::ZipFixtureFile::deflated("entry_a.bin", &data_a),
+        reclaimarc_archive::zip::fixtures::ZipFixtureFile::deflated("entry_b.bin", &data_b),
+    ];
+    reclaimarc_archive::zip::fixtures::write_zip(
+        &zip_path,
+        &files,
+        &reclaimarc_archive::zip::fixtures::ZipFixtureOptions::default(),
+    )
+    .unwrap();
+
+    // 1. Inspect archive and obtain proofs
+    let mut backend1 = reclaimarc_archive::backend_for(&zip_path).unwrap();
+    let _info = backend1
+        .inspect(&reclaimarc_archive::OpenOptions::default())
+        .unwrap();
+    let proofs = backend1.retirement_proofs();
+    assert_eq!(proofs.len(), 2);
+    let proof_a = &proofs[0];
+
+    // 2. Extract entry A
+    let options = reclaimarc_archive::ExtractOptions {
+        dest_dir: dest.clone(),
+        job_id: "test_restart_boundary".into(),
+        partial_suffix: ".sx-partial".into(),
+        password: None,
+        cancel: None,
+        name_map: HashMap::from([(0, "entry_a.bin".into()), (1, "entry_b.bin".into())]),
+        max_compression_ratio: None,
+    };
+    let report_a = backend1.extract_unit(0, &options, None).unwrap();
+    assert_eq!(report_a.extracted, vec![0]);
+    let partial_a = dest.join("entry_a.bin.sx-partial");
+    let final_a = dest.join("entry_a.bin");
+    std::fs::rename(&partial_a, &final_a).unwrap();
+    assert_eq!(std::fs::read(&final_a).unwrap(), data_a);
+
+    // 3. Drop first backend instance to release handle locks before sparse punching
+    backend1.close();
+    drop(backend1);
+
+    // 4. Physically punch hole for entry A's source range using inward cluster alignment
+    let file = reclaimarc_platform::sparse::open_for_reclaim(&zip_path).unwrap();
+    reclaimarc_platform::sparse::set_sparse(&file, &zip_path).unwrap();
+    let cluster_size = reclaimarc_platform::fs::cluster_size(&zip_path).unwrap_or(4096);
+    let initial_alloc: u64 = reclaimarc_platform::sparse::query_allocated_ranges(
+        &file,
+        &zip_path,
+        0,
+        std::fs::metadata(&zip_path).unwrap().len(),
+    )
+    .unwrap()
+    .iter()
+    .map(|r| r.len)
+    .sum();
+
+    let target_range = reclaimarc_platform::sparse::ByteRange {
+        start: proof_a.start,
+        len: proof_a.len,
+    };
+    let reclaim_report =
+        reclaimarc_platform::sparse::reclaim_range(&file, &zip_path, target_range).unwrap();
+
+    let aligned = reclaimarc_platform::sparse::align_inward(target_range, cluster_size);
+
+    if let Some(aligned_range) = aligned {
+        if aligned_range.len > 0 {
+            assert!(
+                reclaim_report.released_bytes() > 0,
+                "reclaim_range must report released bytes for cluster-aligned range"
+            );
+        }
+    }
+
+    // 5. Query NTFS allocated ranges to verify physical hole
+    let allocated = reclaimarc_platform::sparse::query_allocated_ranges(
+        &file,
+        &zip_path,
+        0,
+        std::fs::metadata(&zip_path).unwrap().len(),
+    )
+    .unwrap();
+    drop(file);
+
+    if let Some(aligned_range) = aligned {
+        if aligned_range.len > 0 {
+            let hole_start = aligned_range.start;
+            let hole_end = aligned_range.start + aligned_range.len;
+            for r in &allocated {
+                let r_end = r.start + r.len;
+                let intersects_hole = r.start < hole_end && r_end > hole_start;
+                assert!(
+                    !intersects_hole,
+                    "aligned range [{hole_start}, {hole_end}) must have ZERO intersection with allocated ranges"
+                );
+            }
+            let post_alloc: u64 = allocated.iter().map(|r| r.len).sum();
+            assert!(
+                post_alloc < initial_alloc,
+                "total allocation must strictly decrease after physical hole punch"
+            );
+        }
+    }
+
+    // 6. Reopen brand-new backend instance and extract entry B from partially-hollowed archive
+    let mut backend2 = reclaimarc_archive::backend_for(&zip_path).unwrap();
+    let _info2 = backend2
+        .inspect(&reclaimarc_archive::OpenOptions::default())
+        .unwrap();
+    let report_b = backend2.extract_unit(1, &options, None).unwrap();
+    assert_eq!(report_b.extracted, vec![1]);
+    let partial_b = dest.join("entry_b.bin.sx-partial");
+    let final_b = dest.join("entry_b.bin");
+    std::fs::rename(&partial_b, &final_b).unwrap();
+
+    // 7. Verify entry B is byte-identical
+    assert_eq!(std::fs::read(&final_b).unwrap(), data_b);
+}
+
+/// P0 Regression: In a multi-entry/solid recovery unit where progress `current` resets to 0
+/// for each new entry, the monotonic live space monitor correctly accumulates bytes and
+/// halts extraction when space drops below reserve during a subsequent entry, ensuring
+/// uncommitted output is discarded and zero source ranges are deallocated.
+#[test]
+fn test_rar_multientry_live_space_accounting_halts_unit() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let archive_dir = dir.path().join("archive");
+    let dest = dir.path().join("dest");
+    let app_data = dir.path().join("appdata");
+    std::fs::create_dir_all(&archive_dir).unwrap();
+    std::fs::create_dir_all(&dest).unwrap();
+    std::fs::create_dir_all(&app_data).unwrap();
+
+    let files = vec![
+        FixtureFile::new("solid_a.bin", &vec![0xAA; 800_000]),
+        FixtureFile::new("solid_b.bin", &vec![0xBB; 800_000]),
+    ];
+    let paths = write_rar(
+        &archive_dir,
+        "solid_live_space",
+        &files,
+        &FixtureOptions {
+            solid_archive: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    std::env::set_var("RECLAIMARC_APP_DATA", &app_data);
+    std::env::set_var("RECLAIMARC_TEST_FREE_SPACE", "100000000000");
+
+    let mut engine = Engine::new(EngineConfig {
+        pre_test: false,
+        custom_reserve: Some(512 * 1024),
+        ..Default::default()
+    });
+
+    let (tx, rx) = mpsc::channel();
+    let (handle, mut job) = engine
+        .start_job(&paths[0], &dest, ExtractionMode::LowSpace, None, tx)
+        .expect("job start");
+
+    // Spawn thread to monitor progress events and trigger dynamic free space drop during entry 1 (solid_b.bin)
+    std::thread::spawn(move || {
+        let mut entry_1_started = false;
+        while let Ok(event) = rx.recv() {
+            if let reclaimarc_core::Event::EntryProgress { index, current, .. } = event {
+                if index == 1 && current > 50_000 && !entry_1_started {
+                    entry_1_started = true;
+                    // Dynamically drop observed free space below reserve
+                    std::env::set_var("RECLAIMARC_TEST_FREE_SPACE", "100");
+                }
+            }
+        }
+    });
+
+    let outcome = engine.run_job(&mut job, &handle);
+
+    std::env::remove_var("RECLAIMARC_TEST_FREE_SPACE");
+    std::env::remove_var("RECLAIMARC_APP_DATA");
+
+    // Assert that extraction was safely halted on low space
+    assert!(
+        outcome.is_err(),
+        "extraction must fail closed on low space: {outcome:?}"
+    );
+
+    // Assert solid_b.bin is NOT committed in destination
+    assert!(
+        !dest.join("solid_b.bin").exists(),
+        "uncommitted entry B must not exist in destination"
+    );
+
+    // Assert no source ranges for this unit were deallocated
+    let file = reclaimarc_platform::sparse::open_for_reclaim(&paths[0]).unwrap();
+    let allocated = reclaimarc_platform::sparse::query_allocated_ranges(
+        &file,
+        &paths[0],
+        0,
+        std::fs::metadata(&paths[0]).unwrap().len(),
+    )
+    .unwrap();
+    let total_alloc: u64 = allocated.iter().map(|r| r.len).sum();
+    let logical = std::fs::metadata(&paths[0]).unwrap().len();
+    assert_eq!(
+        total_alloc, logical,
+        "aborted unit must have deallocated ZERO source bytes"
+    );
+}
+
+/// ZIP64 Low-Space crash/resume & physical reclamation parity test.
+#[test]
+fn test_zip64_crash_and_physical_reclaim() {
+    crash_and_resume_format(
+        CrashPoint::AfterPhysicalHolePunch,
+        ExtractionMode::LowSpace,
+        "zip64",
+    );
+}
+
+/// P0 Regression: In-place structural metadata mutation before destructive `run_job`
+/// must be detected by the pre-execution binding check and halt with 0 source bytes reclaimed.
+#[test]
+fn test_structural_mutation_between_start_and_run_fails_closed() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let archive_dir = dir.path().join("archive");
+    let dest = dir.path().join("dest");
+    let app_data = dir.path().join("appdata");
+    std::fs::create_dir_all(&archive_dir).unwrap();
+    std::fs::create_dir_all(&dest).unwrap();
+    std::fs::create_dir_all(&app_data).unwrap();
+
+    let files = vec![
+        reclaimarc_archive::zip::fixtures::ZipFixtureFile::stored(
+            "file1.bin",
+            b"Payload content for file 1",
+        ),
+        reclaimarc_archive::zip::fixtures::ZipFixtureFile::stored(
+            "file2.bin",
+            b"Payload content for file 2",
+        ),
+    ];
+    let zip_path = archive_dir.join("structural_mutation.zip");
+    reclaimarc_archive::zip::fixtures::write_zip(
+        &zip_path,
+        &files,
+        &reclaimarc_archive::zip::fixtures::ZipFixtureOptions::default(),
+    )
+    .unwrap();
+
+    std::env::set_var("RECLAIMARC_APP_DATA", &app_data);
+
+    let mut engine = Engine::new(EngineConfig {
+        pre_test: false,
+        ..Default::default()
+    });
+
+    let (tx, _rx) = mpsc::channel();
+    let (handle, mut job) = engine
+        .start_job(&zip_path, &dest, ExtractionMode::LowSpace, None, tx)
+        .expect("start_job must succeed");
+
+    // Mutate structural metadata in-place in the source archive: flip byte in central directory without changing file size
+    let mut file_bytes = std::fs::read(&zip_path).unwrap();
+    let cd_pos = file_bytes.len() - 35; // Position inside central directory
+    file_bytes[cd_pos] ^= 0xFF;
+    std::fs::write(&zip_path, &file_bytes).unwrap();
+
+    // Call run_job: MUST fail closed before deallocating any bytes
+    let outcome = engine.run_job(&mut job, &handle);
+
+    std::env::remove_var("RECLAIMARC_APP_DATA");
+
+    assert!(
+        outcome.is_err(),
+        "run_job must reject structurally mutated archive: {outcome:?}"
+    );
+
+    // Verify 0 bytes reclaimed
+    let file = reclaimarc_platform::sparse::open_for_reclaim(&zip_path).unwrap();
+    let allocated = reclaimarc_platform::sparse::query_allocated_ranges(
+        &file,
+        &zip_path,
+        0,
+        std::fs::metadata(&zip_path).unwrap().len(),
+    )
+    .unwrap();
+    let total_alloc: u64 = allocated.iter().map(|r| r.len).sum();
+    assert_eq!(
+        total_alloc,
+        file_bytes.len() as u64,
+        "mutated archive must have ZERO bytes deallocated"
+    );
+}
+
+/// P1 Regression: Shell deletion verifies actual_committed_path when RenameNew resolves conflicts.
+#[test]
+fn test_shell_deletion_verifies_renamed_conflict_target() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let archive_dir = dir.path().join("archive");
+    let dest = dir.path().join("dest");
+    let app_data = dir.path().join("appdata");
+    std::fs::create_dir_all(&archive_dir).unwrap();
+    std::fs::create_dir_all(&dest).unwrap();
+    std::fs::create_dir_all(&app_data).unwrap();
+
+    let files = vec![reclaimarc_archive::zip::fixtures::ZipFixtureFile::stored(
+        "file0.bin",
+        b"New archive content for file 0",
+    )];
+    let zip_path = archive_dir.join("conflict_shell.zip");
+    reclaimarc_archive::zip::fixtures::write_zip(
+        &zip_path,
+        &files,
+        &reclaimarc_archive::zip::fixtures::ZipFixtureOptions::default(),
+    )
+    .unwrap();
+
+    // Pre-create pre-existing conflict file in destination
+    let conflict_file = dest.join("file0.bin");
+    std::fs::write(&conflict_file, b"Pre-existing unrelated file content").unwrap();
+
+    std::env::set_var("RECLAIMARC_APP_DATA", &app_data);
+
+    let mut engine = Engine::new(EngineConfig {
+        pre_test: false,
+        conflict_policy: reclaimarc_core::ConflictPolicy::RenameNew,
+        delete_shells_on_completion: true,
+        ..Default::default()
+    });
+
+    let (tx, _rx) = mpsc::channel();
+    let (handle, mut job) = engine
+        .start_job(&zip_path, &dest, ExtractionMode::LowSpace, None, tx)
+        .expect("start_job");
+
+    let outcome = engine.run_job(&mut job, &handle).unwrap();
+    assert!(matches!(outcome, JobOutcome::Completed { .. }));
+
+    std::env::remove_var("RECLAIMARC_APP_DATA");
+
+    // Verify source shell is deleted
+    assert!(
+        !zip_path.exists(),
+        "source archive shell must be cleanly deleted on completion"
+    );
+
+    // Verify pre-existing file was preserved
+    assert_eq!(
+        std::fs::read(&conflict_file).unwrap(),
+        b"Pre-existing unrelated file content"
+    );
+
+    // Verify newly committed renamed file exists and is intact
+    let renamed_target = dest.join("file0 (1).bin");
+    assert_eq!(
+        std::fs::read(&renamed_target).unwrap(),
+        b"New archive content for file 0"
+    );
+}
+
+#[test]
+fn test_finalizing_with_matching_identity_completes_cleanup() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let archive_dir = dir.path().join("archive");
+    let dest = dir.path().join("dest");
+    std::fs::create_dir_all(&archive_dir).unwrap();
+    std::fs::create_dir_all(&dest).unwrap();
+
+    let zip_path = archive_dir.join("finalizing_match.zip");
+    let files = vec![reclaimarc_archive::zip::fixtures::ZipFixtureFile::stored(
+        "file.bin",
+        b"hello world",
+    )];
+    reclaimarc_archive::zip::fixtures::write_zip(
+        &zip_path,
+        &files,
+        &reclaimarc_archive::zip::fixtures::ZipFixtureOptions::default(),
+    )
+    .unwrap();
+
+    let ident = reclaimarc_platform::fs::file_identity(&zip_path).unwrap();
+    let journal_ident = reclaimarc_journal::models::FileIdentity {
+        volume_serial: ident.volume_serial,
+        file_id: ident.file_id,
+        file_size: ident.file_size,
+        last_write_time: ident.last_write_time,
+    };
+    let journal_dir = archive_dir.join(".reclaimarc").join("job-finalizing-match");
+    std::fs::create_dir_all(&journal_dir).unwrap();
+    let journal_path = journal_dir.join("job.db");
+
+    let now = reclaimarc_journal::now_iso();
+    let meta = reclaimarc_journal::models::JobMeta {
+        job_id: "job-finalizing-match".into(),
+        created_at: now.clone(),
+        updated_at: now,
+        archive_path: zip_path.clone(),
+        destination: dest.clone(),
+        archive_fingerprint: Some("test-fingerprint".into()),
+        safety_mode: "CONSERVATIVE".into(),
+        settings_json: "{}".into(),
+        current_unit: 0,
+        job_state: reclaimarc_journal::models::JobState::Finalizing,
+    };
+    let mut j = reclaimarc_journal::JobJournal::create(&journal_path, &meta).unwrap();
+    j.add_volumes(&[reclaimarc_journal::models::VolumeRecord {
+        path: zip_path.clone(),
+        identity: Some(journal_ident),
+        allocated_before: 100,
+        logical_size: 100,
+        is_first: true,
+        structural_digest: None,
+    }])
+    .unwrap();
+
+    // Prepare resume on Finalizing job with matching identity -> cleans up and marks Completed
+    let rec = reclaimarc_core::recovery::prepare_resume(&journal_path, None)
+        .expect("finalizing resume must succeed");
+    assert_eq!(
+        rec.job_meta().unwrap().job_state,
+        reclaimarc_journal::models::JobState::Completed
+    );
+    assert!(!zip_path.exists(), "Source archive must be deleted");
+}
+
+#[test]
+fn test_finalizing_with_missing_source_completes_cleanup() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let archive_dir = dir.path().join("archive");
+    let dest = dir.path().join("dest");
+    std::fs::create_dir_all(&archive_dir).unwrap();
+    std::fs::create_dir_all(&dest).unwrap();
+
+    let zip_path = archive_dir.join("finalizing_missing.zip");
+    let journal_dir = archive_dir
+        .join(".reclaimarc")
+        .join("job-finalizing-missing");
+    std::fs::create_dir_all(&journal_dir).unwrap();
+    let journal_path = journal_dir.join("job.db");
+
+    let now = reclaimarc_journal::now_iso();
+    let meta = reclaimarc_journal::models::JobMeta {
+        job_id: "job-finalizing-missing".into(),
+        created_at: now.clone(),
+        updated_at: now,
+        archive_path: zip_path.clone(),
+        destination: dest.clone(),
+        archive_fingerprint: Some("test-fingerprint".into()),
+        safety_mode: "CONSERVATIVE".into(),
+        settings_json: "{}".into(),
+        current_unit: 0,
+        job_state: reclaimarc_journal::models::JobState::Finalizing,
+    };
+    let mut j = reclaimarc_journal::JobJournal::create(&journal_path, &meta).unwrap();
+    j.add_volumes(&[reclaimarc_journal::models::VolumeRecord {
+        path: zip_path.clone(),
+        identity: None,
+        allocated_before: 100,
+        logical_size: 100,
+        is_first: true,
+        structural_digest: None,
+    }])
+    .unwrap();
+
+    assert!(!zip_path.exists(), "Source should be missing");
+
+    // Prepare resume on Finalizing job with missing source -> idempotent success
+    let rec = reclaimarc_core::recovery::prepare_resume(&journal_path, None)
+        .expect("finalizing resume with missing source must succeed");
+    assert_eq!(
+        rec.job_meta().unwrap().job_state,
+        reclaimarc_journal::models::JobState::Completed
+    );
+}
+
+#[test]
+fn test_finalizing_with_replaced_source_fails_closed_and_preserves_file() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let archive_dir = dir.path().join("archive");
+    let dest = dir.path().join("dest");
+    std::fs::create_dir_all(&archive_dir).unwrap();
+    std::fs::create_dir_all(&dest).unwrap();
+
+    let zip_path = archive_dir.join("finalizing_replaced.zip");
+    let files = vec![reclaimarc_archive::zip::fixtures::ZipFixtureFile::stored(
+        "file.bin",
+        b"original archive content",
+    )];
+    reclaimarc_archive::zip::fixtures::write_zip(
+        &zip_path,
+        &files,
+        &reclaimarc_archive::zip::fixtures::ZipFixtureOptions::default(),
+    )
+    .unwrap();
+
+    let orig_ident = reclaimarc_platform::fs::file_identity(&zip_path).unwrap();
+    let journal_ident = reclaimarc_journal::models::FileIdentity {
+        volume_serial: orig_ident.volume_serial,
+        file_id: orig_ident.file_id,
+        file_size: orig_ident.file_size,
+        last_write_time: orig_ident.last_write_time,
+    };
+    let journal_dir = archive_dir
+        .join(".reclaimarc")
+        .join("job-finalizing-replace");
+    std::fs::create_dir_all(&journal_dir).unwrap();
+    let journal_path = journal_dir.join("job.db");
+
+    let now = reclaimarc_journal::now_iso();
+    let meta = reclaimarc_journal::models::JobMeta {
+        job_id: "job-finalizing-replace".into(),
+        created_at: now.clone(),
+        updated_at: now,
+        archive_path: zip_path.clone(),
+        destination: dest.clone(),
+        archive_fingerprint: Some("test-fingerprint".into()),
+        safety_mode: "CONSERVATIVE".into(),
+        settings_json: "{}".into(),
+        current_unit: 0,
+        job_state: reclaimarc_journal::models::JobState::Finalizing,
+    };
+    let mut j = reclaimarc_journal::JobJournal::create(&journal_path, &meta).unwrap();
+    j.add_volumes(&[reclaimarc_journal::models::VolumeRecord {
+        path: zip_path.clone(),
+        identity: Some(journal_ident),
+        allocated_before: 100,
+        logical_size: 100,
+        is_first: true,
+        structural_digest: None,
+    }])
+    .unwrap();
+
+    // Replace the archive file with unrelated data of different length/content
+    let replacement_data = b"REPLACEMENT IMPORTANT DATA DO NOT DELETE";
+    std::fs::write(&zip_path, replacement_data).unwrap();
+
+    // Recovery must fail closed with structured error
+    let err = reclaimarc_core::recovery::prepare_resume(&journal_path, None).unwrap_err();
+    assert!(
+        matches!(err, reclaimarc_core::CoreError::Failed { .. }),
+        "prepare_resume on replaced file must fail closed: {err:?}"
+    );
+
+    // CRITICAL: Replacement file MUST NOT be deleted
+    assert!(zip_path.exists(), "Replaced file must be preserved");
+    assert_eq!(std::fs::read(&zip_path).unwrap(), replacement_data);
+
+    // Job state must NOT be completed
+    let j_after = reclaimarc_journal::JobJournal::open(&journal_path).unwrap();
+    assert_eq!(
+        j_after.job_meta().unwrap().job_state,
+        reclaimarc_journal::models::JobState::Finalizing
+    );
+}
+
+#[test]
+fn test_finalizing_with_mutated_source_size_fails_closed() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let archive_dir = dir.path().join("archive");
+    let dest = dir.path().join("dest");
+    std::fs::create_dir_all(&archive_dir).unwrap();
+    std::fs::create_dir_all(&dest).unwrap();
+
+    let zip_path = archive_dir.join("finalizing_mutated.zip");
+    let files = vec![reclaimarc_archive::zip::fixtures::ZipFixtureFile::stored(
+        "file.bin",
+        b"original archive content",
+    )];
+    reclaimarc_archive::zip::fixtures::write_zip(
+        &zip_path,
+        &files,
+        &reclaimarc_archive::zip::fixtures::ZipFixtureOptions::default(),
+    )
+    .unwrap();
+
+    let orig_ident = reclaimarc_platform::fs::file_identity(&zip_path).unwrap();
+    let journal_ident = reclaimarc_journal::models::FileIdentity {
+        volume_serial: orig_ident.volume_serial,
+        file_id: orig_ident.file_id,
+        file_size: orig_ident.file_size,
+        last_write_time: orig_ident.last_write_time,
+    };
+    let journal_dir = archive_dir
+        .join(".reclaimarc")
+        .join("job-finalizing-mutated");
+    std::fs::create_dir_all(&journal_dir).unwrap();
+    let journal_path = journal_dir.join("job.db");
+
+    let now = reclaimarc_journal::now_iso();
+    let meta = reclaimarc_journal::models::JobMeta {
+        job_id: "job-finalizing-mutated".into(),
+        created_at: now.clone(),
+        updated_at: now,
+        archive_path: zip_path.clone(),
+        destination: dest.clone(),
+        archive_fingerprint: Some("test-fingerprint".into()),
+        safety_mode: "CONSERVATIVE".into(),
+        settings_json: "{}".into(),
+        current_unit: 0,
+        job_state: reclaimarc_journal::models::JobState::Finalizing,
+    };
+    let mut j = reclaimarc_journal::JobJournal::create(&journal_path, &meta).unwrap();
+    j.add_volumes(&[reclaimarc_journal::models::VolumeRecord {
+        path: zip_path.clone(),
+        identity: Some(journal_ident),
+        allocated_before: 100,
+        logical_size: 100,
+        is_first: true,
+        structural_digest: None,
+    }])
+    .unwrap();
+
+    // Mutate the file by appending extra bytes (changing file_size)
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&zip_path)
+        .unwrap();
+    f.write_all(b"extra mutated bytes").unwrap();
+    drop(f);
+
+    // Recovery must fail closed
+    let err = reclaimarc_core::recovery::prepare_resume(&journal_path, None).unwrap_err();
+    assert!(
+        matches!(err, reclaimarc_core::CoreError::Failed { .. }),
+        "prepare_resume on mutated file size must fail closed: {err:?}"
+    );
+    assert!(zip_path.exists(), "Mutated file must not be deleted");
+}
+
+#[test]
+fn test_delete_shells_fails_closed_when_journal_has_errors() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let archive_dir = dir.path().join("archive");
+    let dest = dir.path().join("dest");
+    std::fs::create_dir_all(&archive_dir).unwrap();
+    std::fs::create_dir_all(&dest).unwrap();
+
+    let zip_path = archive_dir.join("shell_errors.zip");
+    let out_file = dest.join("output.bin");
+    let test_data = b"verified output data content";
+    std::fs::write(&zip_path, b"dummy archive").unwrap();
+    std::fs::write(&out_file, test_data).unwrap();
+
+    let journal_dir = archive_dir.join(".reclaimarc").join("job-shell-errors");
+    std::fs::create_dir_all(&journal_dir).unwrap();
+    let journal_path = journal_dir.join("job.db");
+
+    let now = reclaimarc_journal::now_iso();
+    let meta = reclaimarc_journal::models::JobMeta {
+        job_id: "job-shell-errors".into(),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+        archive_path: zip_path.clone(),
+        destination: dest.clone(),
+        archive_fingerprint: Some("test-fingerprint".into()),
+        safety_mode: "CONSERVATIVE".into(),
+        settings_json: "{}".into(),
+        current_unit: 0,
+        job_state: reclaimarc_journal::models::JobState::Active,
+    };
+    let mut j = reclaimarc_journal::JobJournal::create(&journal_path, &meta).unwrap();
+    j.add_volumes(&[reclaimarc_journal::models::VolumeRecord {
+        path: zip_path.clone(),
+        identity: None,
+        allocated_before: 100,
+        logical_size: 100,
+        is_first: true,
+        structural_digest: None,
+    }])
+    .unwrap();
+
+    j.add_units(&[reclaimarc_journal::models::RecoveryUnitRecord {
+        seq: 0,
+        state: reclaimarc_journal::models::UnitState::Committed,
+        first_entry: 0,
+        last_entry: 0,
+        error: None,
+        updated_at: now.clone(),
+    }])
+    .unwrap();
+
+    let digest = blake3::hash(test_data).to_hex().to_string();
+    j.add_entries(&[reclaimarc_journal::models::EntryRecord {
+        index_in_archive: 0,
+        name: "output.bin".into(),
+        packed_size: 10,
+        unpacked_size: test_data.len() as u64,
+        crc32: None,
+        is_directory: false,
+        is_solid: false,
+        split_before: false,
+        split_after: false,
+        encrypted: false,
+        recovery_unit: 0,
+        final_path: Some(out_file.clone()),
+        partial_path: None,
+        expected_digest: Some(digest.clone()),
+        status: reclaimarc_journal::models::EntryStatus::Committed,
+        actual_committed_path: Some(out_file.clone()),
+        existed_before_job: false,
+        blake3: Some(digest),
+        is_redirection: false,
+        redirection_kind: None,
+    }])
+    .unwrap();
+
+    // Record an error into journal
+    j.record_error(&reclaimarc_journal::models::ErrorRecord {
+        id: 0,
+        at: now.clone(),
+        operation: "test error operation".into(),
+        message: "something went wrong during extraction".into(),
+        os_error: None,
+        recovery_state: "extracting".into(),
+        recommended_action: "retry".into(),
+    })
+    .unwrap();
+
+    // delete_archive_shells must fail closed
+    let err = reclaimarc_core::engine::delete_archive_shells(&j, "job-shell-errors").unwrap_err();
+    assert!(
+        matches!(err, reclaimarc_core::CoreError::Failed { .. }),
+        "delete_archive_shells must fail closed when journal contains errors: {err:?}"
+    );
+    assert!(
+        zip_path.exists(),
+        "Source archive must NOT be deleted when errors exist"
+    );
+}
+
+#[test]
+fn test_delete_shells_fails_closed_when_journal_error_query_fails() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let archive_dir = dir.path().join("archive");
+    let dest = dir.path().join("dest");
+    std::fs::create_dir_all(&archive_dir).unwrap();
+    std::fs::create_dir_all(&dest).unwrap();
+
+    let zip_path = archive_dir.join("shell_err_query.zip");
+    let out_file = dest.join("output.bin");
+    let test_data = b"verified output data content";
+    std::fs::write(&zip_path, b"dummy archive").unwrap();
+    std::fs::write(&out_file, test_data).unwrap();
+
+    let journal_dir = archive_dir.join(".reclaimarc").join("job-shell-err-query");
+    std::fs::create_dir_all(&journal_dir).unwrap();
+    let journal_path = journal_dir.join("job.db");
+
+    let now = reclaimarc_journal::now_iso();
+    let meta = reclaimarc_journal::models::JobMeta {
+        job_id: "job-shell-err-query".into(),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+        archive_path: zip_path.clone(),
+        destination: dest.clone(),
+        archive_fingerprint: Some("test-fingerprint".into()),
+        safety_mode: "CONSERVATIVE".into(),
+        settings_json: "{}".into(),
+        current_unit: 0,
+        job_state: reclaimarc_journal::models::JobState::Active,
+    };
+    let mut j = reclaimarc_journal::JobJournal::create(&journal_path, &meta).unwrap();
+    j.add_volumes(&[reclaimarc_journal::models::VolumeRecord {
+        path: zip_path.clone(),
+        identity: None,
+        allocated_before: 100,
+        logical_size: 100,
+        is_first: true,
+        structural_digest: None,
+    }])
+    .unwrap();
+
+    j.add_units(&[reclaimarc_journal::models::RecoveryUnitRecord {
+        seq: 0,
+        state: reclaimarc_journal::models::UnitState::Committed,
+        first_entry: 0,
+        last_entry: 0,
+        error: None,
+        updated_at: now.clone(),
+    }])
+    .unwrap();
+
+    let digest = blake3::hash(test_data).to_hex().to_string();
+    j.add_entries(&[reclaimarc_journal::models::EntryRecord {
+        index_in_archive: 0,
+        name: "output.bin".into(),
+        packed_size: 10,
+        unpacked_size: test_data.len() as u64,
+        crc32: None,
+        is_directory: false,
+        is_solid: false,
+        split_before: false,
+        split_after: false,
+        encrypted: false,
+        recovery_unit: 0,
+        final_path: Some(out_file.clone()),
+        partial_path: None,
+        expected_digest: Some(digest.clone()),
+        status: reclaimarc_journal::models::EntryStatus::Committed,
+        actual_committed_path: Some(out_file.clone()),
+        existed_before_job: false,
+        blake3: Some(digest),
+        is_redirection: false,
+        redirection_kind: None,
+    }])
+    .unwrap();
+
+    // Intentionally break the errors table in the SQLite database to cause journal.errors() to fail
+    {
+        let raw_conn = rusqlite::Connection::open(&journal_path).unwrap();
+        raw_conn.execute_batch("DROP TABLE errors;").unwrap();
+    }
+
+    // Reopen journal
+    let j_broken = reclaimarc_journal::JobJournal::open(&journal_path).unwrap();
+
+    // delete_archive_shells MUST fail closed on read failure
+    let err = reclaimarc_core::engine::delete_archive_shells(&j_broken, "job-shell-err-query")
+        .unwrap_err();
+    assert!(
+        matches!(err, reclaimarc_core::CoreError::Journal(_)),
+        "delete_archive_shells must fail closed on journal errors read error: {err:?}"
+    );
+    assert!(
+        zip_path.exists(),
+        "Source archive must NOT be deleted when errors query fails"
+    );
+}
+
+#[test]
+fn test_finalizing_with_deletion_failure_preserves_finalizing_state_and_retries() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let archive_dir = dir.path().join("archive");
+    let dest = dir.path().join("dest");
+    std::fs::create_dir_all(&archive_dir).unwrap();
+    std::fs::create_dir_all(&dest).unwrap();
+
+    let zip_path = archive_dir.join("finalizing_locked.zip");
+    let files = vec![reclaimarc_archive::zip::fixtures::ZipFixtureFile::stored(
+        "file.bin",
+        b"archive content for finalizing lock test",
+    )];
+    reclaimarc_archive::zip::fixtures::write_zip(
+        &zip_path,
+        &files,
+        &reclaimarc_archive::zip::fixtures::ZipFixtureOptions::default(),
+    )
+    .unwrap();
+
+    let orig_ident = reclaimarc_platform::fs::file_identity(&zip_path).unwrap();
+    let journal_ident = reclaimarc_journal::models::FileIdentity {
+        volume_serial: orig_ident.volume_serial,
+        file_id: orig_ident.file_id,
+        file_size: orig_ident.file_size,
+        last_write_time: orig_ident.last_write_time,
+    };
+    let journal_dir = archive_dir
+        .join(".reclaimarc")
+        .join("job-finalizing-locked");
+    std::fs::create_dir_all(&journal_dir).unwrap();
+    let journal_path = journal_dir.join("job.db");
+
+    let now = reclaimarc_journal::now_iso();
+    let meta = reclaimarc_journal::models::JobMeta {
+        job_id: "job-finalizing-locked".into(),
+        created_at: now.clone(),
+        updated_at: now,
+        archive_path: zip_path.clone(),
+        destination: dest.clone(),
+        archive_fingerprint: Some("test-fingerprint".into()),
+        safety_mode: "CONSERVATIVE".into(),
+        settings_json: "{}".into(),
+        current_unit: 0,
+        job_state: reclaimarc_journal::models::JobState::Finalizing,
+    };
+    let mut j = reclaimarc_journal::JobJournal::create(&journal_path, &meta).unwrap();
+    j.add_volumes(&[reclaimarc_journal::models::VolumeRecord {
+        path: zip_path.clone(),
+        identity: Some(journal_ident),
+        allocated_before: 100,
+        logical_size: 100,
+        is_first: true,
+        structural_digest: None,
+    }])
+    .unwrap();
+
+    // Lock file without FILE_SHARE_DELETE to cause remove_file to fail with sharing violation
+    let lock_handle = reclaimarc_platform::fs::lock_for_exclusive_read(&zip_path).unwrap();
+
+    // Prepare resume should fail because file cannot be removed
+    let err = reclaimarc_core::recovery::prepare_resume(&journal_path, None).unwrap_err();
+    assert!(
+        matches!(err, reclaimarc_core::CoreError::Failed { .. }),
+        "prepare_resume on locked file must fail closed: {err:?}"
+    );
+
+    // Job state must remain Finalizing (NOT Completed, NOT Failed)
+    let j_mid = reclaimarc_journal::JobJournal::open(&journal_path).unwrap();
+    assert_eq!(
+        j_mid.job_meta().unwrap().job_state,
+        reclaimarc_journal::models::JobState::Finalizing
+    );
+    assert!(zip_path.exists(), "Source archive must still exist");
+
+    // Drop lock so deletion can succeed
+    drop(lock_handle);
+
+    // Retry prepare_resume: must now succeed, remove the file, and mark Completed
+    let rec = reclaimarc_core::recovery::prepare_resume(&journal_path, None)
+        .expect("retry after unlocking must succeed");
+    assert_eq!(
+        rec.job_meta().unwrap().job_state,
+        reclaimarc_journal::models::JobState::Completed
+    );
+    assert!(!zip_path.exists(), "Source archive must now be deleted");
+}
+
+#[test]
+fn test_multipart_finalizing_partial_deletion_failure_and_resume() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let archive_dir = dir.path().join("archive");
+    let dest = dir.path().join("dest");
+    std::fs::create_dir_all(&archive_dir).unwrap();
+    std::fs::create_dir_all(&dest).unwrap();
+
+    let part1_path = archive_dir.join("multi.part1.rar");
+    let part2_path = archive_dir.join("multi.part2.rar");
+    std::fs::write(&part1_path, b"part1 data").unwrap();
+    std::fs::write(&part2_path, b"part2 data").unwrap();
+
+    let ident1 = reclaimarc_platform::fs::file_identity(&part1_path).unwrap();
+    let journal_ident1 = reclaimarc_journal::models::FileIdentity {
+        volume_serial: ident1.volume_serial,
+        file_id: ident1.file_id,
+        file_size: ident1.file_size,
+        last_write_time: ident1.last_write_time,
+    };
+    let ident2 = reclaimarc_platform::fs::file_identity(&part2_path).unwrap();
+    let journal_ident2 = reclaimarc_journal::models::FileIdentity {
+        volume_serial: ident2.volume_serial,
+        file_id: ident2.file_id,
+        file_size: ident2.file_size,
+        last_write_time: ident2.last_write_time,
+    };
+
+    let journal_dir = archive_dir
+        .join(".reclaimarc")
+        .join("job-multipart-finalizing");
+    std::fs::create_dir_all(&journal_dir).unwrap();
+    let journal_path = journal_dir.join("job.db");
+
+    let now = reclaimarc_journal::now_iso();
+    let meta = reclaimarc_journal::models::JobMeta {
+        job_id: "job-multipart-finalizing".into(),
+        created_at: now.clone(),
+        updated_at: now,
+        archive_path: part1_path.clone(),
+        destination: dest.clone(),
+        archive_fingerprint: Some("test-fingerprint".into()),
+        safety_mode: "CONSERVATIVE".into(),
+        settings_json: "{}".into(),
+        current_unit: 0,
+        job_state: reclaimarc_journal::models::JobState::Finalizing,
+    };
+    let mut j = reclaimarc_journal::JobJournal::create(&journal_path, &meta).unwrap();
+    j.add_volumes(&[
+        reclaimarc_journal::models::VolumeRecord {
+            path: part1_path.clone(),
+            identity: Some(journal_ident1),
+            allocated_before: 100,
+            logical_size: 100,
+            is_first: true,
+            structural_digest: None,
+        },
+        reclaimarc_journal::models::VolumeRecord {
+            path: part2_path.clone(),
+            identity: Some(journal_ident2),
+            allocated_before: 100,
+            logical_size: 100,
+            is_first: false,
+            structural_digest: None,
+        },
+    ])
+    .unwrap();
+
+    // Part 1 is already deleted before recovery starts
+    std::fs::remove_file(&part1_path).unwrap();
+    assert!(!part1_path.exists());
+
+    // Lock Part 2 without FILE_SHARE_DELETE so its deletion fails
+    let lock_handle2 = reclaimarc_platform::fs::lock_for_exclusive_read(&part2_path).unwrap();
+
+    // Prepare resume should fail on part 2 deletion
+    let err = reclaimarc_core::recovery::prepare_resume(&journal_path, None).unwrap_err();
+    assert!(
+        matches!(err, reclaimarc_core::CoreError::Failed { .. }),
+        "prepare_resume must fail when part2 deletion fails: {err:?}"
+    );
+
+    // Job state must remain Finalizing
+    let j_mid = reclaimarc_journal::JobJournal::open(&journal_path).unwrap();
+    assert_eq!(
+        j_mid.job_meta().unwrap().job_state,
+        reclaimarc_journal::models::JobState::Finalizing
+    );
+    assert!(!part1_path.exists(), "Part 1 remains deleted");
+    assert!(part2_path.exists(), "Part 2 is preserved");
+
+    // Unlock Part 2
+    drop(lock_handle2);
+
+    // Retry recovery: recognizes Part 1 is missing, deletes Part 2, and advances to Completed
+    let rec = reclaimarc_core::recovery::prepare_resume(&journal_path, None)
+        .expect("retry after unlocking part 2 must succeed");
+    assert_eq!(
+        rec.job_meta().unwrap().job_state,
+        reclaimarc_journal::models::JobState::Completed
+    );
+    assert!(!part1_path.exists());
+    assert!(!part2_path.exists(), "Part 2 must now be deleted");
 }

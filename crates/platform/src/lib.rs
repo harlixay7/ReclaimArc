@@ -1,4 +1,4 @@
-﻿#![deny(unsafe_op_in_unsafe_fn)]
+#![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
 //! ReclaimArc platform layer.
@@ -17,6 +17,7 @@ pub mod error;
 pub mod flush;
 pub mod fs;
 pub mod longpath;
+pub mod shell;
 pub mod sparse;
 
 pub use error::{PlatformError, PlatformErrorKind};

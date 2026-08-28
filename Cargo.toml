@@ -10,8 +10,9 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/harlixay7/ReclaimArc"
 
@@ -37,11 +38,15 @@ windows = { version = "0.61", features = [
     "Win32_Security",
     "Win32_System_Console",
     "Win32_System_Diagnostics_Debug",
+    "Win32_System_Registry",
 ] }
 proptest = "1"
 tempfile = "3"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+rawzip = { version = "0.5.1", default-features = false, features = ["std"] }
+crc32fast = "1.4"
 
 [profile.release]
 lto = "thin"

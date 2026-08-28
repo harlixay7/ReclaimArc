@@ -32,8 +32,12 @@ jobs:
         working-directory: apps/desktop
         run: npm ci
 
+      - name: Build Desktop Frontend
+        working-directory: apps/desktop
+        run: npm run build
+
       - name: Run Workspace Tests
-        run: cargo test --workspace
+        run: cargo test --workspace --all-features
 
       - name: Build Desktop Application & Installer (Tauri)
         working-directory: apps/desktop

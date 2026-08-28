@@ -728,6 +728,7 @@ mod tests {
             cancel: Some(cancel),
             partial_suffix: String::new(),
             name_map: std::collections::HashMap::new(),
+            max_compression_ratio: None,
         };
         opts.name_map.insert(0, "one.txt".to_string());
         opts.name_map.insert(1, "sub\\two.txt".to_string());
@@ -765,6 +766,7 @@ mod tests {
             cancel: Some(cancel),
             partial_suffix: String::new(),
             name_map: std::collections::HashMap::new(),
+            max_compression_ratio: None,
         };
         opts.name_map.insert(0, "a.txt".to_string());
         let result = backend.extract_unit(0, &opts, None);
@@ -805,6 +807,7 @@ mod tests {
             cancel: Some(cancel),
             partial_suffix: String::new(),
             name_map: std::collections::HashMap::new(),
+            max_compression_ratio: None,
         };
         opts.name_map.insert(0, "a.bin".to_string());
         opts.name_map.insert(1, "b.bin".to_string());
@@ -862,6 +865,7 @@ mod tests {
             cancel: Some(cancel),
             partial_suffix: String::new(),
             name_map: std::collections::HashMap::new(),
+            max_compression_ratio: None,
         };
         opts.name_map.insert(0, "one.bin".to_string());
         opts.name_map.insert(1, "two.bin".to_string());
@@ -910,6 +914,7 @@ mod tests {
             cancel: Some(cancel),
             partial_suffix: String::new(),
             name_map: std::collections::HashMap::new(),
+            max_compression_ratio: None,
         };
         opts.name_map.insert(0, "one.bin".to_string());
         opts.name_map.insert(1, "two.bin".to_string());
@@ -979,6 +984,7 @@ mod tests {
             cancel: Some(cancel),
             partial_suffix: String::new(),
             name_map: std::collections::HashMap::new(),
+            max_compression_ratio: None,
         };
         opts.name_map.insert(0, "a.bin".to_string());
         opts.name_map.insert(1, "big.bin".to_string());
@@ -1030,6 +1036,7 @@ mod tests {
             cancel: Some(cancel),
             partial_suffix: String::new(),
             name_map: std::collections::HashMap::new(),
+            max_compression_ratio: None,
         };
         opts.name_map.insert(0, "a.bin".to_string());
         opts.name_map.insert(1, "big.bin".to_string());
@@ -1080,6 +1087,7 @@ mod tests {
             cancel: Some(cancel),
             partial_suffix: String::new(),
             name_map,
+            max_compression_ratio: None,
         };
         for seq in [0u64, 500, 1499, 2500, 2999] {
             let report = backend.extract_unit(seq, &opts, None).unwrap();
